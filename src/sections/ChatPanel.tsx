@@ -4,6 +4,8 @@ import {
   Play, SendHorizonal, Square, TerminalSquare, X,
 } from "lucide-react";
 import type { Message, NanoModel, Patch, ToolCall } from "@/types";
+import { AGENT_SYSTEM_PROMPT } from "@/lib/catalog";
+import { estimateTokens } from "@/lib/context";
 import { RichText } from "@/components/RichText";
 
 interface Props {
@@ -24,6 +26,11 @@ const TOOL_ICON: Record<ToolCall["kind"], typeof Brain> = {
   search: FileSearch,
 };
 
+/** Compact "3.2k" / "256k" formatting for the context meter. */
+function fmtK(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+}
+
 export function ChatPanel({ messages, running, model, connected, onSend, onStop, onPatchDecision }: Props) {
   const [draft, setDraft] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -39,6 +46,16 @@ export function ChatPanel({ messages, running, model, connected, onSend, onStop,
     setDraft("");
     onSend(text);
   };
+
+  // Task 1.2: live context meter — estimate over the same system+history the
+  // send path packs (via buildContext), plus the current draft since it
+  // becomes the next user message on send.
+  const budgetTokens = model ? model.contextK * 1000 : 0;
+  const usedTokens =
+    estimateTokens(AGENT_SYSTEM_PROMPT) +
+    messages.reduce((sum, m) => (m.role === "system" || !m.content ? sum : sum + estimateTokens(m.content)), 0) +
+    estimateTokens(draft);
+  const usedPct = budgetTokens > 0 ? (usedTokens / budgetTokens) * 100 : 0;
 
   return (
     <section className="flex min-w-0 flex-1 flex-col bg-background">
@@ -77,6 +94,19 @@ export function ChatPanel({ messages, running, model, connected, onSend, onStop,
             <span className="micro-label normal-case tracking-normal">
               {connected ? "live · nano-gpt.com/api/v1" : "demo script · no tokens burned"}
             </span>
+            {budgetTokens > 0 && (
+              <span className="flex items-center gap-1.5" title="estimated context usage vs model window">
+                <span className="h-1 w-16 overflow-hidden rounded-full bg-secondary sm:w-24">
+                  <span
+                    className={`block h-full transition-all ${usedPct > 85 ? "bg-destructive" : "bg-primary"}`}
+                    style={{ width: `${Math.min(100, usedPct)}%` }}
+                  />
+                </span>
+                <span className="hidden font-mono text-[10px] text-muted-foreground md:block">
+                  {fmtK(usedTokens)} / {fmtK(budgetTokens)}
+                </span>
+              </span>
+            )}
             <div className="flex-1" />
             <span className="micro-label hidden sm:block">⏎ send · ⇧⏎ newline</span>
             {running ? (

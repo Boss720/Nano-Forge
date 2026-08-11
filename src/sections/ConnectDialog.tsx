@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ExternalLink, Eye, EyeOff, KeyRound, Loader2, PlugZap, Unplug, X } from "lucide-react";
 import type { ConnectionState } from "@/types";
 
@@ -15,6 +15,15 @@ export function ConnectDialog({ open, onClose, connection, onConnect, onDisconne
   const [base, setBase] = useState(connection.baseUrl);
   const [show, setShow] = useState(false);
   const checking = connection.status === "checking";
+
+  // Task 0.3 (defect #3): re-sync local fields from the live connection every
+  // time the dialog opens, so a disconnected/stale key never reappears.
+  useEffect(() => {
+    if (open) {
+      setKey(connection.apiKey);
+      setBase(connection.baseUrl);
+    }
+  }, [open, connection.apiKey, connection.baseUrl]);
 
   if (!open) return null;
 

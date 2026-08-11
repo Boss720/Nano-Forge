@@ -1,9 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { X } from "lucide-react";
-import type { ConnectionState, Message, Patch, Session, ToolCall, UsageTotals } from "@/types";
+import type { ConnectionState, Message, Patch, Session, ToolCall, UsageTotals, VirtualFile } from "@/types";
 import { FALLBACK_MODELS, AGENT_SYSTEM_PROMPT, VIRTUAL_PROJECT } from "@/lib/catalog";
 import { DEFAULT_BASE_URL, fetchModels, streamChat, validateKey } from "@/lib/nanogpt";
 import { runDemoAgent } from "@/lib/demoAgent";
+import { patchSessionMessage } from "@/lib/sessionReducer";
+import { applyRunUsage, runCost } from "@/lib/usage";
+import { applyPatch, revertPatch } from "@/lib/vfs";
+import { buildContext } from "@/lib/context";
 import { TopBar } from "@/sections/TopBar";
 import { Sidebar } from "@/sections/Sidebar";
 import { ChatPanel } from "@/sections/ChatPanel";
@@ -45,6 +49,9 @@ export default function App() {
   const [usage, setUsage] = useState<UsageTotals>({ input: 0, output: 0, costUsd: 0, requests: 0 });
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [viewerFile, setViewerFile] = useState<string | null>(null);
+  // Task 1.1: the virtual workspace lives in state so applied patches are
+  // visible in the sidebar / file viewer.
+  const [files, setFiles] = useState<VirtualFile[]>(VIRTUAL_PROJECT);
 
   const abortRef = useRef<AbortController | null>(null);
   const demoCancelledRef = useRef(false);
@@ -64,33 +71,29 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connected, connection.apiKey, connection.baseUrl]);
 
+  // Task 0.2: callers MUST pass the session id captured at send time — never
+  // `activeId` — so streaming deltas can't leak into a session the user
+  // switched to mid-run.
   const patchMessage = useCallback(
-    (msgId: string, fn: (m: Message) => Message) => {
-      setSessions((prev) =>
-        prev.map((s) =>
-          s.id !== activeId ? s : { ...s, messages: s.messages.map((m) => (m.id === msgId ? fn(m) : m)) },
-        ),
-      );
+    (sessionId: string, msgId: string, fn: (m: Message) => Message) => {
+      setSessions((prev) => patchSessionMessage(prev, sessionId, msgId, fn));
     },
-    [activeId],
+    [],
   );
 
+  // Task 0.3: errored runs (`{ errored: true }`) do not increment
+  // `usage.requests`.
   const finishRun = useCallback(
-    (msgId: string, out: { input: number; output: number }) => {
+    (sessionId: string, msgId: string, out: { input: number; output: number }, opts?: { errored?: boolean }) => {
       const m = model;
-      const cost = m ? (out.input / 1e6) * m.inputPrice + (out.output / 1e6) * m.outputPrice : 0;
-      patchMessage(msgId, (msg) => ({
+      const cost = runCost(m, out.input, out.output);
+      patchMessage(sessionId, msgId, (msg) => ({
         ...msg,
         streaming: false,
         usage: { input: out.input, output: out.output, costUsd: cost },
         model: m?.name ?? selectedModel,
       }));
-      setUsage((u) => ({
-        input: u.input + out.input,
-        output: u.output + out.output,
-        costUsd: u.costUsd + cost,
-        requests: u.requests + 1,
-      }));
+      setUsage((u) => applyRunUsage(u, { input: out.input, output: out.output, costUsd: cost }, opts));
       setRunning(false);
     },
     [model, selectedModel, patchMessage],
@@ -99,11 +102,15 @@ export default function App() {
   const handleSend = useCallback(
     (text: string) => {
       if (running || !session) return;
+      // Task 0.2: capture the SENDING session's id — every streaming patch
+      // below targets this id, so switching sessions mid-run cannot leak
+      // deltas into the newly active session.
+      const sid = session.id;
       const userMsg: Message = { id: uid(), role: "user", content: text, ts: Date.now() };
       const agentMsg: Message = { id: uid(), role: "assistant", content: "", streaming: true, ts: Date.now() };
       setSessions((prev) =>
         prev.map((s) =>
-          s.id !== session.id
+          s.id !== sid
             ? s
             : {
                 ...s,
@@ -121,48 +128,49 @@ export default function App() {
           text,
           {
             onToolCall: (t: ToolCall) =>
-              patchMessage(agentMsg.id, (m) => ({ ...m, toolCalls: [...(m.toolCalls ?? []), t] })),
+              patchMessage(sid, agentMsg.id, (m) => ({ ...m, toolCalls: [...(m.toolCalls ?? []), t] })),
             onToolUpdate: (id, status, durationMs) =>
-              patchMessage(agentMsg.id, (m) => ({
+              patchMessage(sid, agentMsg.id, (m) => ({
                 ...m,
                 toolCalls: m.toolCalls?.map((t) => (t.id === id ? { ...t, status, durationMs } : t)),
               })),
-            onPatch: (p: Patch) => patchMessage(agentMsg.id, (m) => ({ ...m, patch: p })),
-            onDelta: (d) => patchMessage(agentMsg.id, (m) => ({ ...m, content: m.content + d })),
-            onDone: (u) => finishRun(agentMsg.id, u),
+            onPatch: (p: Patch) => patchMessage(sid, agentMsg.id, (m) => ({ ...m, patch: p })),
+            onDelta: (d) => patchMessage(sid, agentMsg.id, (m) => ({ ...m, content: m.content + d })),
+            onDone: (u) => finishRun(sid, agentMsg.id, u),
           },
           () => demoCancelledRef.current,
         );
         return;
       }
 
-      const history = session.messages
-        .filter((m) => m.role !== "system" && m.content)
-        .slice(-12)
-        .map((m) => ({ role: m.role, content: m.content }));
+      // Task 1.2: budget-aware context — system prompt always first, 25% of
+      // the model's window reserved for output, history packed newest→oldest.
+      const history = session.messages.filter((m) => m.role !== "system" && m.content);
+      const budgetTokens = (model?.contextK ?? 128) * 1000;
+      const wire = buildContext([...history, userMsg], AGENT_SYSTEM_PROMPT, budgetTokens);
       const controller = new AbortController();
       abortRef.current = controller;
       streamChat(
         connection.baseUrl,
         connection.apiKey,
         selectedModel,
-        [{ role: "system", content: AGENT_SYSTEM_PROMPT }, ...history, { role: "user", content: text }],
+        wire,
         {
-          onDelta: (d) => patchMessage(agentMsg.id, (m) => ({ ...m, content: m.content + d })),
+          onDelta: (d) => patchMessage(sid, agentMsg.id, (m) => ({ ...m, content: m.content + d })),
           onDone: (u) => {
             abortRef.current = null;
-            finishRun(agentMsg.id, u);
+            finishRun(sid, agentMsg.id, u);
           },
           onError: (err) => {
             abortRef.current = null;
-            patchMessage(agentMsg.id, (m) => ({ ...m, content: m.content + `\n\n**Error:** ${err}` }));
-            finishRun(agentMsg.id, { input: 0, output: 0 });
+            patchMessage(sid, agentMsg.id, (m) => ({ ...m, content: m.content + `\n\n**Error:** ${err}` }));
+            finishRun(sid, agentMsg.id, { input: 0, output: 0 }, { errored: true });
           },
         },
         controller.signal,
       );
     },
-    [running, session, connected, selectedModel, connection, patchMessage, finishRun],
+    [running, session, connected, selectedModel, model, connection, patchMessage, finishRun],
   );
 
   const handleStop = useCallback(() => {
@@ -200,14 +208,32 @@ export default function App() {
     setActiveId(s.id);
   }, [selectedModel]);
 
+  // Task 1.1: Apply/Reject mutates the virtual filesystem for real.
+  // The vfs transition is derived from the patch's CURRENT status, so
+  // double-clicks / repeat decisions are no-ops and can never corrupt files:
+  //   pending  → applied : applyPatch
+  //   applied  → rejected: revertPatch
+  //   pending  → rejected: status only (files untouched)
   const handlePatchDecision = useCallback(
     (messageId: string, decision: "applied" | "rejected") => {
-      patchMessage(messageId, (m) => (m.patch ? { ...m, patch: { ...m.patch, status: decision } } : m));
+      if (!session) return;
+      const patch = session.messages.find((m) => m.id === messageId)?.patch;
+      if (!patch || patch.status === decision) return;
+      if (decision === "applied") {
+        setFiles((prev) => applyPatch(prev, patch));
+      } else if (patch.status === "applied") {
+        setFiles((prev) => revertPatch(prev, patch));
+      }
+      setSessions((prev) =>
+        patchSessionMessage(prev, session.id, messageId, (m) =>
+          m.patch ? { ...m, patch: { ...m.patch, status: decision } } : m,
+        ),
+      );
     },
-    [patchMessage],
+    [session],
   );
 
-  const activeViewer = VIRTUAL_PROJECT.find((f) => f.path === viewerFile);
+  const activeViewer = files.find((f) => f.path === viewerFile);
 
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-background">
@@ -218,7 +244,7 @@ export default function App() {
           activeId={session?.id ?? ""}
           onSelect={setActiveId}
           onNew={handleNewSession}
-          files={VIRTUAL_PROJECT}
+          files={files}
           activeFile={viewerFile ?? ""}
           onFileSelect={(p) => setViewerFile(p)}
         />
