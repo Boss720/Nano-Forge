@@ -33,6 +33,21 @@ import { ChatPanel } from "@/sections/ChatPanel";
 import { ModelPanel } from "@/sections/ModelPanel";
 import { ConnectDialog } from "@/sections/ConnectDialog";
 import { CostDashboard } from "@/sections/CostDashboard";
+// Agent platform wiring (Tasks 3/7/10/14/17): every host-driven surface is
+// derived from useHostSession and stays null/empty while the host is absent
+// (default), so the demo/direct-NanoGPT UI is byte-identical to before.
+import { PlanPanel } from "@/sections/PlanPanel";
+import { BrowserPermissionDialog } from "@/sections/BrowserPermissionDialog";
+import { IntegrationsPanel } from "@/sections/IntegrationsPanel";
+import { VisualEvidenceCard } from "@/sections/VisualEvidenceCard";
+import { useHostSession, type UseHostSessionOptions } from "@/lib/hostSession";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 
 // Final phase (Task A): the image panel is lazy-loaded so it stays out of the
 // already-large main bundle (recharts). The chunk loads on first open.
@@ -109,7 +124,12 @@ function hydratePersisted(): { sessions: Session[]; usage: UsageTotals; files: V
   return { sessions, usage: state.usage, files: state.files, runs: state.runs ?? [] };
 }
 
-export default function App() {
+export default function App({ hostSession }: { hostSession?: UseHostSessionOptions } = {}) {
+  // Agent platform: host session state. `hostSession` is a wiring seam for
+  // tests / the future plan composer — production callers pass nothing and
+  // the persisted settings (default: disabled) apply.
+  const host = useHostSession(hostSession);
+  const [integrationsOpen, setIntegrationsOpen] = useState(false);
   const [connection, setConnection] = useState<ConnectionState>(loadConnection);
   const [models, setModels] = useState(FALLBACK_MODELS);
   const [selectedModel, setSelectedModel] = useState(FALLBACK_MODELS[3].id); // kimi-k2-0905
@@ -564,13 +584,39 @@ export default function App() {
           onPatchDecision={handlePatchDecision}
           genPrefs={genPrefs}
           onGenPrefsChange={handleGenPrefsChange}
+          toolRuns={host.toolRuns}
+          onToolStop={host.stopToolRun}
         />
+        {/* Agent platform (Tasks 3 + 9): plan inspector side rail, mounted
+            only while a plan (or run evidence) exists — host-driven, so the
+            default host-absent UI never renders it. PlanPanel keeps its own
+            approval ledger; App only forwards its explicit callbacks. */}
+        {(host.plan || host.evidence) && (
+          <aside data-testid="plan-rail" className="hidden min-h-0 w-80 shrink-0 flex-col lg:flex">
+            {host.plan && (
+              <PlanPanel
+                plan={host.plan}
+                className="min-h-0 flex-1"
+                onApproveStep={host.approveStep}
+                onRunApproved={host.runApproved}
+                onPause={host.pause}
+                onCancel={host.cancel}
+              />
+            )}
+            {host.evidence && (
+              <div className="scrollbar-thin max-h-[45%] shrink-0 overflow-y-auto border-l border-t border-border bg-card/40 p-2">
+                <VisualEvidenceCard assertions={host.evidence.assertions} diff={host.evidence.diff} />
+              </div>
+            )}
+          </aside>
+        )}
         <ModelPanel
           className="hidden lg:flex"
           models={models}
           selected={selectedModel}
           onSelect={setSelectedModel}
           live={connection.liveModels}
+          routeDecision={host.routeDecision ?? undefined}
         />
       </div>
 
@@ -619,6 +665,7 @@ export default function App() {
               setModelsOpen(false);
             }}
             live={connection.liveModels}
+            routeDecision={host.routeDecision ?? undefined}
           />
         </SheetContent>
       </Sheet>
@@ -630,7 +677,34 @@ export default function App() {
         onConnect={handleConnect}
         onDisconnect={handleDisconnect}
         onClearHistory={handleClearHistory}
+        onOpenIntegrations={() => setIntegrationsOpen(true)}
       />
+
+      {/* Agent platform (Task 14): rules packs / skills / MCP servers. Rows
+          come from the host session (empty → "none configured" until the host
+          protocol grows integration frames). */}
+      <Dialog open={integrationsOpen} onOpenChange={setIntegrationsOpen}>
+        <DialogContent className="scrollbar-thin max-h-[85vh] overflow-y-auto border-border bg-card sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle className="font-mono text-[13px] tracking-wide">Integrations</DialogTitle>
+            <DialogDescription className="font-mono text-[11px]">
+              Rules packs, skills, and MCP servers managed by the local agent host.
+            </DialogDescription>
+          </DialogHeader>
+          <IntegrationsPanel
+            rulesPacks={host.integrations.rulesPacks}
+            skills={host.integrations.skills}
+            mcpServers={host.integrations.mcpServers}
+            onToggleRulesPack={host.toggleRulesPack}
+            onToggleSkill={host.toggleSkill}
+            onToggleMcpServer={host.toggleMcpServer}
+          />
+        </DialogContent>
+      </Dialog>
+
+      {/* Agent platform (Task 10): two-level browser permission prompts,
+          driven by the host session bridge. Renders nothing while idle. */}
+      <BrowserPermissionDialog request={host.permissionPending} onDecide={host.decidePermission} />
 
       {/* Task 3.3: Ctrl/Cmd+K model quick-switcher — same catalog data and
           provider grouping as ModelPanel; cmdk provides the fuzzy filter.
