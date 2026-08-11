@@ -1,0 +1,91 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 30 8% 4%;
+    --foreground: 36 12% 90%;
+    --card: 30 9% 6%;
+    --card-foreground: 36 12% 90%;
+    --popover: 30 10% 7%;
+    --popover-foreground: 36 12% 90%;
+    --primary: 32 100% 55%;
+    --primary-foreground: 30 10% 6%;
+    --secondary: 30 7% 12%;
+    --secondary-foreground: 36 12% 88%;
+    --muted: 30 6% 11%;
+    --muted-foreground: 32 6% 52%;
+    --accent: 30 8% 13%;
+    --accent-foreground: 32 100% 60%;
+    --destructive: 4 74% 55%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 32 8% 14%;
+    --input: 32 8% 16%;
+    --ring: 32 100% 55%;
+    --radius: 0.5rem;
+    --sidebar-background: 30 9% 5%;
+    --sidebar-foreground: 36 10% 84%;
+    --sidebar-primary: 32 100% 55%;
+    --sidebar-primary-foreground: 30 10% 6%;
+    --sidebar-accent: 30 7% 11%;
+    --sidebar-accent-foreground: 36 12% 88%;
+    --sidebar-border: 32 8% 12%;
+    --sidebar-ring: 32 100% 55%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  html {
+    color-scheme: dark;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  .font-mono,
+  code,
+  pre,
+  kbd {
+    font-family: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Consolas, "Liberation Mono", monospace;
+  }
+}
+
+@layer utilities {
+  .micro-label {
+    @apply font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground;
+  }
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background: hsl(32 8% 18%);
+    border-radius: 4px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .ember-glow {
+    box-shadow: 0 0 24px -6px hsl(22 100% 55% / 0.35);
+  }
+}
+
+@keyframes caret-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+.caret-blink {
+  animation: caret-blink 1s step-end infinite;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.8); }
+}
+.pulse-dot {
+  animation: pulse-dot 1.4s ease-in-out infinite;
+}
