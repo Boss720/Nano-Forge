@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fetchModels, toPerMillion } from "../nanogpt";
+import { fetchModels, streamChat, toPerMillion } from "../nanogpt";
 
 describe("toPerMillion", () => {
   it("treats exactly 0.01 as already per-million (boundary)", () => {
@@ -76,5 +76,75 @@ describe("fetchModels pricing", () => {
     expect(models[0].inputPrice).toBe(1);
     expect(models[0].outputPrice).toBe(8);
     expect(models[0].priceEstimated).toBe(true);
+  });
+});
+
+/** SSE body that streams one delta plus a usage frame, then terminates. */
+function sseBody(): string {
+  return [
+    `data: ${JSON.stringify({ choices: [{ delta: { content: "hi" } }] })}`,
+    `data: ${JSON.stringify({ usage: { prompt_tokens: 3, completion_tokens: 2 } })}`,
+    "data: [DONE]",
+    "",
+  ].join("\n\n");
+}
+
+function stubStreamResponse() {
+  const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+    new Response(sseBody(), { status: 200 }),
+  );
+  vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
+}
+
+function requestBody(fetchMock: ReturnType<typeof stubStreamResponse>): Record<string, unknown> {
+  return JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+}
+
+function silentHandlers() {
+  return { onDelta: () => {}, onDone: () => {}, onError: () => {} };
+}
+
+describe("streamChat generation options (Task 2.3)", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("omits temperature/max_tokens when no options are passed (backwards compatible)", async () => {
+    const fetchMock = stubStreamResponse();
+    await streamChat("http://example.test", "key", "model-x", [{ role: "user", content: "hi" }], silentHandlers());
+    const body = requestBody(fetchMock);
+    expect(body).toMatchObject({ model: "model-x", stream: true });
+    expect(body).not.toHaveProperty("temperature");
+    expect(body).not.toHaveProperty("max_tokens");
+  });
+
+  it("passes temperature and maxTokens into the request body", async () => {
+    const fetchMock = stubStreamResponse();
+    await streamChat(
+      "http://example.test",
+      "key",
+      "model-x",
+      [{ role: "user", content: "hi" }],
+      silentHandlers(),
+      undefined,
+      { temperature: 0.3, maxTokens: 4096 },
+    );
+    const body = requestBody(fetchMock);
+    expect(body.temperature).toBe(0.3);
+    expect(body.max_tokens).toBe(4096);
+  });
+
+  it("streams deltas and reports usage to the handlers", async () => {
+    stubStreamResponse();
+    const deltas: string[] = [];
+    let usage: { input: number; output: number } | null = null;
+    await streamChat(
+      "http://example.test",
+      "key",
+      "model-x",
+      [{ role: "user", content: "hi" }],
+      { onDelta: (d) => deltas.push(d), onDone: (u) => (usage = u), onError: () => {} },
+    );
+    expect(deltas.join("")).toBe("hi");
+    expect(usage).toEqual({ input: 3, output: 2 });
   });
 });

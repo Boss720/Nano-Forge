@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { X } from "lucide-react";
-import type { ConnectionState, Message, Patch, Session, ToolCall, UsageTotals, VirtualFile } from "@/types";
+import type { ConnectionState, GenerationPrefs, Message, Patch, Session, ToolCall, UsageTotals, VirtualFile } from "@/types";
+import { DEFAULT_GEN_PREFS } from "@/types";
 import { FALLBACK_MODELS, AGENT_SYSTEM_PROMPT, VIRTUAL_PROJECT } from "@/lib/catalog";
 import { DEFAULT_BASE_URL, fetchModels, streamChat, validateKey } from "@/lib/nanogpt";
 import { runDemoAgent } from "@/lib/demoAgent";
@@ -8,6 +9,8 @@ import { patchSessionMessage } from "@/lib/sessionReducer";
 import { applyRunUsage, runCost } from "@/lib/usage";
 import { applyPatch, revertPatch } from "@/lib/vfs";
 import { buildContext } from "@/lib/context";
+import { extractPatch } from "@/lib/patchParse";
+import { countAutoTurns, shouldAutoVerify, verificationPrompt } from "@/lib/agentLoop";
 import { TopBar } from "@/sections/TopBar";
 import { Sidebar } from "@/sections/Sidebar";
 import { ChatPanel } from "@/sections/ChatPanel";
@@ -16,6 +19,7 @@ import { ConnectDialog } from "@/sections/ConnectDialog";
 
 const uid = () => Math.random().toString(36).slice(2, 10);
 const LS_KEY = "nanoforge.connection";
+const LS_GENPREFS_KEY = "nanoforge.genprefs";
 
 function loadConnection(): ConnectionState {
   try {
@@ -39,6 +43,25 @@ function newSession(model: string): Session {
   return { id: uid(), title: "new run", messages: [], model, createdAt: Date.now() };
 }
 
+/** Task 2.3: per-model generation prefs, shape `{ [modelId]: { temperature, maxTokens } }`. */
+function loadGenPrefs(): Record<string, GenerationPrefs> {
+  try {
+    const raw = localStorage.getItem(LS_GENPREFS_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, Partial<GenerationPrefs>>;
+    if (typeof parsed !== "object" || parsed === null) return {};
+    const out: Record<string, GenerationPrefs> = {};
+    for (const [modelId, p] of Object.entries(parsed)) {
+      if (p && typeof p.temperature === "number" && typeof p.maxTokens === "number") {
+        out[modelId] = { temperature: p.temperature, maxTokens: p.maxTokens };
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
 export default function App() {
   const [connection, setConnection] = useState<ConnectionState>(loadConnection);
   const [models, setModels] = useState(FALLBACK_MODELS);
@@ -52,6 +75,26 @@ export default function App() {
   // Task 1.1: the virtual workspace lives in state so applied patches are
   // visible in the sidebar / file viewer.
   const [files, setFiles] = useState<VirtualFile[]>(VIRTUAL_PROJECT);
+  // Task 2.3: per-model generation prefs (temperature / maxTokens), persisted
+  // to localStorage under `nanoforge.genprefs`. The active model's prefs are a
+  // plain lookup, so switching models instantly restores its saved settings.
+  const [genPrefsMap, setGenPrefsMap] = useState<Record<string, GenerationPrefs>>(loadGenPrefs);
+  const genPrefs = genPrefsMap[selectedModel] ?? DEFAULT_GEN_PREFS;
+
+  const handleGenPrefsChange = useCallback(
+    (p: GenerationPrefs) => {
+      setGenPrefsMap((prev) => {
+        const next = { ...prev, [selectedModel]: p };
+        try {
+          localStorage.setItem(LS_GENPREFS_KEY, JSON.stringify(next));
+        } catch {
+          /* quota / blocked storage — prefs just won't persist */
+        }
+        return next;
+      });
+    },
+    [selectedModel],
+  );
 
   const abortRef = useRef<AbortController | null>(null);
   const demoCancelledRef = useRef(false);
@@ -100,14 +143,24 @@ export default function App() {
   );
 
   const handleSend = useCallback(
-    (text: string) => {
+    (text: string, opts?: { auto?: boolean }) => {
       if (running || !session) return;
       // Task 0.2: capture the SENDING session's id — every streaming patch
       // below targets this id, so switching sessions mid-run cannot leak
       // deltas into the newly active session.
       const sid = session.id;
-      const userMsg: Message = { id: uid(), role: "user", content: text, ts: Date.now() };
-      const agentMsg: Message = { id: uid(), role: "assistant", content: "", streaming: true, ts: Date.now() };
+      // Task 2.2: auto (edit-verify) turns keep role user/assistant — NOT
+      // "system" — so the history filter below keeps them in the wire context.
+      const auto = opts?.auto === true;
+      const userMsg: Message = { id: uid(), role: "user", content: text, ts: Date.now(), ...(auto ? { auto } : {}) };
+      const agentMsg: Message = {
+        id: uid(),
+        role: "assistant",
+        content: "",
+        streaming: true,
+        ts: Date.now(),
+        ...(auto ? { auto } : {}),
+      };
       setSessions((prev) =>
         prev.map((s) =>
           s.id !== sid
@@ -150,15 +203,30 @@ export default function App() {
       const wire = buildContext([...history, userMsg], AGENT_SYSTEM_PROMPT, budgetTokens);
       const controller = new AbortController();
       abortRef.current = controller;
+      // Task 2.1: accumulate the full reply so `onDone` can scan it for a
+      // ```diff fence (message state holds the same text, but reading it here
+      // would need a round-trip through React state).
+      let streamed = "";
       streamChat(
         connection.baseUrl,
         connection.apiKey,
         selectedModel,
         wire,
         {
-          onDelta: (d) => patchMessage(sid, agentMsg.id, (m) => ({ ...m, content: m.content + d })),
+          onDelta: (d) => {
+            streamed += d;
+            patchMessage(sid, agentMsg.id, (m) => ({ ...m, content: m.content + d }));
+          },
           onDone: (u) => {
             abortRef.current = null;
+            // Task 2.1 / 2.2: attach an extracted patch so PatchCard renders
+            // with working Apply/Reject. A follow-up diff from a verification
+            // reply arrives as a NEW pending patch; the loop then pauses until
+            // the user applies it again (see agentLoop.ts).
+            const patch = extractPatch(streamed);
+            if (patch) {
+              patchMessage(sid, agentMsg.id, (m) => ({ ...m, patch }));
+            }
             finishRun(sid, agentMsg.id, u);
           },
           onError: (err) => {
@@ -168,9 +236,10 @@ export default function App() {
           },
         },
         controller.signal,
+        { temperature: genPrefs.temperature, maxTokens: genPrefs.maxTokens },
       );
     },
-    [running, session, connected, selectedModel, model, connection, patchMessage, finishRun],
+    [running, session, connected, selectedModel, model, connection, patchMessage, finishRun, genPrefs],
   );
 
   const handleStop = useCallback(() => {
@@ -214,13 +283,19 @@ export default function App() {
   //   pending  → applied : applyPatch
   //   applied  → rejected: revertPatch
   //   pending  → rejected: status only (files untouched)
+  //
+  // Task 2.2: applying a patch in LIVE mode fires an automatic verification
+  // turn (capped by MAX_AUTO_TURNS via countAutoTurns). Never fires in demo
+  // mode or on reject — both gated by shouldAutoVerify.
   const handlePatchDecision = useCallback(
     (messageId: string, decision: "applied" | "rejected") => {
       if (!session) return;
       const patch = session.messages.find((m) => m.id === messageId)?.patch;
       if (!patch || patch.status === decision) return;
+      let nextFiles: VirtualFile[] | null = null;
       if (decision === "applied") {
-        setFiles((prev) => applyPatch(prev, patch));
+        nextFiles = applyPatch(files, patch);
+        setFiles(nextFiles);
       } else if (patch.status === "applied") {
         setFiles((prev) => revertPatch(prev, patch));
       }
@@ -229,8 +304,15 @@ export default function App() {
           m.patch ? { ...m, patch: { ...m.patch, status: decision } } : m,
         ),
       );
+
+      const mode = connected ? "live" : "demo";
+      const autoTurnsUsed = countAutoTurns(session.messages);
+      if (nextFiles && shouldAutoVerify("applied", mode, autoTurnsUsed)) {
+        const content = nextFiles.find((f) => f.path === patch.file)?.content ?? "";
+        handleSend(verificationPrompt(patch.file, content), { auto: true });
+      }
     },
-    [session],
+    [session, files, connected, handleSend],
   );
 
   const activeViewer = files.find((f) => f.path === viewerFile);
@@ -256,6 +338,8 @@ export default function App() {
           onSend={handleSend}
           onStop={handleStop}
           onPatchDecision={handlePatchDecision}
+          genPrefs={genPrefs}
+          onGenPrefsChange={handleGenPrefsChange}
         />
         <ModelPanel models={models} selected={selectedModel} onSelect={setSelectedModel} live={connection.liveModels} />
       </div>

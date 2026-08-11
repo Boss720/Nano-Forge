@@ -1,12 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import {
-  Brain, Check, ChevronDown, ChevronRight, CircleDollarSign, FileEdit, FileSearch,
-  Play, SendHorizonal, Square, TerminalSquare, X,
+  Bot, Brain, Check, ChevronDown, ChevronRight, CircleDollarSign, FileEdit, FileSearch,
+  Play, SendHorizonal, Settings2, Square, TerminalSquare, X,
 } from "lucide-react";
-import type { Message, NanoModel, Patch, ToolCall } from "@/types";
+import type { GenerationPrefs, Message, NanoModel, Patch, ToolCall } from "@/types";
 import { AGENT_SYSTEM_PROMPT } from "@/lib/catalog";
 import { estimateTokens } from "@/lib/context";
 import { RichText } from "@/components/RichText";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Slider } from "@/components/ui/slider";
 
 interface Props {
   messages: Message[];
@@ -16,6 +18,8 @@ interface Props {
   onSend: (text: string) => void;
   onStop: () => void;
   onPatchDecision: (messageId: string, decision: "applied" | "rejected") => void;
+  genPrefs: GenerationPrefs;
+  onGenPrefsChange: (prefs: GenerationPrefs) => void;
 }
 
 const TOOL_ICON: Record<ToolCall["kind"], typeof Brain> = {
@@ -31,7 +35,7 @@ function fmtK(n: number): string {
   return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
 }
 
-export function ChatPanel({ messages, running, model, connected, onSend, onStop, onPatchDecision }: Props) {
+export function ChatPanel({ messages, running, model, connected, onSend, onStop, onPatchDecision, genPrefs, onGenPrefsChange }: Props) {
   const [draft, setDraft] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -108,6 +112,7 @@ export function ChatPanel({ messages, running, model, connected, onSend, onStop,
               </span>
             )}
             <div className="flex-1" />
+            <GenSettings genPrefs={genPrefs} onChange={onGenPrefsChange} />
             <span className="micro-label hidden sm:block">⏎ send · ⇧⏎ newline</span>
             {running ? (
               <button
@@ -168,6 +173,10 @@ function EmptyState({ onPick, connected }: { onPick: (t: string) => void; connec
 }
 
 function MessageView({ m, onPatchDecision }: { m: Message; onPatchDecision: Props["onPatchDecision"] }) {
+  // Task 2.2: edit-verify auto-turns render collapsed; a pending patch (if the
+  // verification reply emitted a follow-up diff) stays fully visible with
+  // working Apply/Reject.
+  if (m.auto) return <AutoTurnView m={m} onPatchDecision={onPatchDecision} />;
   if (m.role === "user") {
     return (
       <div className="flex justify-end">
@@ -197,8 +206,109 @@ function MessageView({ m, onPatchDecision }: { m: Message; onPatchDecision: Prop
   );
 }
 
-function ToolCard({ t }: { t: ToolCall }) {
+/** Task 2.3: generation-settings popover (temperature + max-tokens cap). */
+function GenSettings({ genPrefs, onChange }: { genPrefs: GenerationPrefs; onChange: (p: GenerationPrefs) => void }) {
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <button
+          aria-label="Generation settings"
+          title={`temperature ${genPrefs.temperature.toFixed(2)} · max ${genPrefs.maxTokens} tokens`}
+          className="rounded p-1 text-muted-foreground transition-colors hover:text-foreground"
+        >
+          <Settings2 className="h-3.5 w-3.5" />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent side="top" align="end" className="w-64 border-border bg-card p-3.5">
+        <div className="space-y-4">
+          <div>
+            <div className="mb-2 flex items-center justify-between">
+              <span className="micro-label">temperature</span>
+              <span className="font-mono text-[11px] text-foreground">{genPrefs.temperature.toFixed(2)}</span>
+            </div>
+            <Slider
+              value={[genPrefs.temperature]}
+              min={0}
+              max={1.5}
+              step={0.05}
+              onValueChange={([v]) => onChange({ ...genPrefs, temperature: v })}
+              aria-label="Temperature"
+            />
+            <div className="mt-1 flex justify-between font-mono text-[9.5px] text-muted-foreground">
+              <span>precise</span>
+              <span>creative</span>
+            </div>
+          </div>
+          <div>
+            <div className="mb-2 flex items-center justify-between">
+              <span className="micro-label">max tokens</span>
+              <span className="font-mono text-[11px] text-foreground">{genPrefs.maxTokens.toLocaleString()}</span>
+            </div>
+            <Slider
+              value={[genPrefs.maxTokens]}
+              min={256}
+              max={8192}
+              step={256}
+              onValueChange={([v]) => onChange({ ...genPrefs, maxTokens: v })}
+              aria-label="Max tokens"
+            />
+            <div className="mt-1 flex justify-between font-mono text-[9.5px] text-muted-foreground">
+              <span>256</span>
+              <span>8,192</span>
+            </div>
+          </div>
+          <p className="text-[10.5px] leading-relaxed text-muted-foreground">
+            Saved per model · applied to the next live request.
+          </p>
+        </div>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+/**
+ * Task 2.2: a collapsed, system-style transcript row for an edit-verify
+ * auto-turn. The prompt/reply text hides behind an expander; a pending
+ * follow-up patch is always rendered in full so the user can Apply/Reject.
+ */
+function AutoTurnView({ m, onPatchDecision }: { m: Message; onPatchDecision: Props["onPatchDecision"] }) {
   const [open, setOpen] = useState(false);
+  const snippet = m.content.replace(/\s+/g, " ").trim().slice(0, 72);
+  return (
+    <div className="max-w-[85%] space-y-2">
+      <div className="rounded-md border border-border/60 bg-card/40">
+        <button onClick={() => setOpen(!open)} className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left">
+          <Bot className={`h-3.5 w-3.5 ${m.streaming ? "pulse-dot text-primary" : "text-muted-foreground"}`} />
+          <span className="micro-label">auto-verify · {m.role === "user" ? "prompt" : "reply"}</span>
+          {snippet && (
+            <span className="min-w-0 flex-1 truncate font-mono text-[10.5px] text-muted-foreground/70">{snippet}</span>
+          )}
+          {!snippet && <div className="flex-1" />}
+          {m.streaming && <span className="h-2 w-2 rounded-full bg-primary pulse-dot" />}
+          {open ? (
+            <ChevronDown className="h-3 w-3 text-muted-foreground" />
+          ) : (
+            <ChevronRight className="h-3 w-3 text-muted-foreground" />
+          )}
+        </button>
+        {open && m.content && (
+          <div className="border-t border-border/60 px-3 py-2 text-[12px] leading-relaxed text-muted-foreground">
+            {m.role === "user" ? <pre className="whitespace-pre-wrap font-mono">{m.content}</pre> : <RichText text={m.content} />}
+          </div>
+        )}
+      </div>
+      {m.patch && <PatchCard p={m.patch} onDecision={(d) => onPatchDecision(m.id, d)} />}
+      {m.usage && (
+        <div className="flex items-center gap-1.5 pt-0.5 font-mono text-[10.5px] text-muted-foreground">
+          <CircleDollarSign className="h-3 w-3" />
+          {m.model} · {m.usage.input.toLocaleString()} in / {m.usage.output.toLocaleString()} out · ≈ ${m.usage.costUsd.toFixed(5)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ToolCard({ t }: { t: ToolCall }) {  const [open, setOpen] = useState(false);
   const Icon = TOOL_ICON[t.kind];
   return (
     <div className="rounded-md border border-border bg-card/70">

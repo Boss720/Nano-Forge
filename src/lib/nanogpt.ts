@@ -105,6 +105,12 @@ export interface StreamHandlers {
   onError: (message: string) => void;
 }
 
+/** Task 2.3: optional generation controls, mapped into the request body. */
+export interface StreamOptions {
+  temperature?: number;
+  maxTokens?: number;
+}
+
 /** OpenAI-compatible streaming chat completion against nano-gpt.com. */
 export async function streamChat(
   baseUrl: string,
@@ -113,6 +119,7 @@ export async function streamChat(
   messages: Array<{ role: string; content: string }>,
   h: StreamHandlers,
   signal?: AbortSignal,
+  options: StreamOptions = {},
 ): Promise<void> {
   let res: Response;
   try {
@@ -120,7 +127,14 @@ export async function streamChat(
       method: "POST",
       headers: headers(apiKey),
       signal,
-      body: JSON.stringify({ model, messages, stream: true, stream_options: { include_usage: true } }),
+      body: JSON.stringify({
+        model,
+        messages,
+        stream: true,
+        stream_options: { include_usage: true },
+        ...(options.temperature !== undefined ? { temperature: options.temperature } : {}),
+        ...(options.maxTokens !== undefined ? { max_tokens: options.maxTokens } : {}),
+      }),
     });
   } catch (e) {
     h.onError(e instanceof DOMException && e.name === "AbortError" ? "Stopped." : "Network/CORS error reaching nano-gpt.com. Try Demo mode or a local proxy.");

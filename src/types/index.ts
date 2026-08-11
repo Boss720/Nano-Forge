@@ -46,8 +46,24 @@ export interface Message {
   patch?: Patch;
   usage?: { input: number; output: number; costUsd: number };
   model?: string;
+  /**
+   * Task 2.2: marks messages produced by the edit-verify auto-loop
+   * (verification prompt + the model's reply). Stored with role
+   * "user"/"assistant" (NOT "system") so they stay in the wire context built
+   * by `handleSend`, which filters out role === "system". The transcript
+   * renders them collapsed.
+   */
+  auto?: boolean;
   ts: number;
 }
+
+/** Task 2.3: per-model generation settings, persisted in localStorage. */
+export interface GenerationPrefs {
+  temperature: number;
+  maxTokens: number;
+}
+
+export const DEFAULT_GEN_PREFS: GenerationPrefs = { temperature: 0.3, maxTokens: 4096 };
 
 export interface Session {
   id: string;
