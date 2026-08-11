@@ -12,6 +12,11 @@ dist
 dist-ssr
 *.local
 
+# Agent platform runtime artifacts
+.nanoforge/runs/
+test-results/
+playwright-report/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
