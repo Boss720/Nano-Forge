@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { X } from "lucide-react";
+import { Check, X } from "lucide-react";
 import type { ConnectionState, GenerationPrefs, Message, Patch, Session, ToolCall, UsageTotals, VirtualFile } from "@/types";
 import { DEFAULT_GEN_PREFS } from "@/types";
 import { FALLBACK_MODELS, AGENT_SYSTEM_PROMPT, VIRTUAL_PROJECT } from "@/lib/catalog";
@@ -11,6 +11,20 @@ import { applyPatch, revertPatch } from "@/lib/vfs";
 import { buildContext } from "@/lib/context";
 import { extractPatch } from "@/lib/patchParse";
 import { countAutoTurns, shouldAutoVerify, verificationPrompt } from "@/lib/agentLoop";
+import { createDebouncedSaver, loadState, STORAGE_KEY } from "@/lib/persist";
+import { downloadSessionMarkdown } from "@/lib/exporter";
+import { useMediaQuery } from "@/hooks/use-media-query";
+import { HighlightedCode } from "@/components/RichText";
+import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import {
+  CommandDialog,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+  CommandShortcut,
+} from "@/components/ui/command";
 import { TopBar } from "@/sections/TopBar";
 import { Sidebar } from "@/sections/Sidebar";
 import { ChatPanel } from "@/sections/ChatPanel";
@@ -62,24 +76,60 @@ function loadGenPrefs(): Record<string, GenerationPrefs> {
   }
 }
 
+/**
+ * Task 3.1 hydration caveats:
+ * - hydrated `files` REPLACE `VIRTUAL_PROJECT` wholesale (no merge) — the
+ *   persisted vfs already reflects every applied patch.
+ * - `streaming: true` flags are stripped: a mid-stream reload has no live
+ *   producer, and a stuck flag would pin the transcript in "running" visuals.
+ * - patches are NOT re-applied on load — their persisted statuses are
+ *   display-only truth (`Patch.lines` are self-contained, so revert still
+ *   works after hydration).
+ * - `countAutoTurns` derives the auto-turn budget from the message list, so
+ *   hydrated transcripts keep their edit-verify history for free.
+ */
+function hydratePersisted(): { sessions: Session[]; usage: UsageTotals; files: VirtualFile[] } | null {
+  const state = loadState();
+  if (!state) return null;
+  const sessions = state.sessions.map((s) => ({
+    ...s,
+    messages: s.messages.map((m) => (m.streaming ? { ...m, streaming: false } : m)),
+  }));
+  return { sessions, usage: state.usage, files: state.files };
+}
+
 export default function App() {
   const [connection, setConnection] = useState<ConnectionState>(loadConnection);
   const [models, setModels] = useState(FALLBACK_MODELS);
   const [selectedModel, setSelectedModel] = useState(FALLBACK_MODELS[3].id); // kimi-k2-0905
-  const [sessions, setSessions] = useState<Session[]>(() => [newSession(FALLBACK_MODELS[3].id)]);
+  // Task 3.1: lazy initializers hydrate from `nanoforge.v1` with fallbacks.
+  const [hydrated] = useState(hydratePersisted);
+  const [sessions, setSessions] = useState<Session[]>(() =>
+    hydrated && hydrated.sessions.length > 0 ? hydrated.sessions : [newSession(FALLBACK_MODELS[3].id)],
+  );
+  // activeId is not persisted; validate against the hydrated session list and
+  // fall back to the first session.
   const [activeId, setActiveId] = useState(() => sessions[0]?.id ?? "");
   const [running, setRunning] = useState(false);
-  const [usage, setUsage] = useState<UsageTotals>({ input: 0, output: 0, costUsd: 0, requests: 0 });
+  const [usage, setUsage] = useState<UsageTotals>(() => hydrated?.usage ?? { input: 0, output: 0, costUsd: 0, requests: 0 });
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [viewerFile, setViewerFile] = useState<string | null>(null);
   // Task 1.1: the virtual workspace lives in state so applied patches are
   // visible in the sidebar / file viewer.
-  const [files, setFiles] = useState<VirtualFile[]>(VIRTUAL_PROJECT);
+  const [files, setFiles] = useState<VirtualFile[]>(() => hydrated?.files ?? VIRTUAL_PROJECT);
   // Task 2.3: per-model generation prefs (temperature / maxTokens), persisted
   // to localStorage under `nanoforge.genprefs`. The active model's prefs are a
   // plain lookup, so switching models instantly restores its saved settings.
   const [genPrefsMap, setGenPrefsMap] = useState<Record<string, GenerationPrefs>>(loadGenPrefs);
   const genPrefs = genPrefsMap[selectedModel] ?? DEFAULT_GEN_PREFS;
+
+  // Task 3.2: below `lg` (1024px) the two rails become overlay drawers.
+  // `(max-width: 1023px)` mirrors Tailwind's lg breakpoint exactly.
+  const isNarrow = useMediaQuery("(max-width: 1023px)");
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [modelsOpen, setModelsOpen] = useState(false);
+  // Task 3.3: Ctrl/Cmd+K model quick-switcher.
+  const [switcherOpen, setSwitcherOpen] = useState(false);
 
   const handleGenPrefsChange = useCallback(
     (p: GenerationPrefs) => {
@@ -103,6 +153,21 @@ export default function App() {
   const model = useMemo(() => models.find((m) => m.id === selectedModel), [models, selectedModel]);
   const connected = connection.status === "connected";
 
+  // Task 3.1: ONE debounced saver for the app lifetime. Any change to
+  // sessions/usage/files coalesces into a single write 500ms later.
+  const [saver] = useState(() => createDebouncedSaver(500));
+  useEffect(() => {
+    saver({ sessions, usage, files });
+  }, [saver, sessions, usage, files]);
+  // Flush pending state on tab close / unmount so the last edit is never lost.
+  useEffect(() => {
+    window.addEventListener("beforeunload", saver.flush);
+    return () => {
+      window.removeEventListener("beforeunload", saver.flush);
+      saver.flush();
+    };
+  }, [saver]);
+
   // Pull the live catalog whenever a key is active.
   useEffect(() => {
     if (!connected) return;
@@ -113,6 +178,27 @@ export default function App() {
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connected, connection.apiKey, connection.baseUrl]);
+
+  // Task 3.2: never leave a drawer open when the viewport grows past lg —
+  // the inline rails take over and the triggers disappear.
+  useEffect(() => {
+    if (!isNarrow) {
+      setSidebarOpen(false);
+      setModelsOpen(false);
+    }
+  }, [isNarrow]);
+
+  // Task 3.3: global Ctrl/Cmd+K toggles the model quick-switcher.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setSwitcherOpen((o) => !o);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   // Task 0.2: callers MUST pass the session id captured at send time — never
   // `activeId` — so streaming deltas can't leak into a session the user
@@ -277,6 +363,45 @@ export default function App() {
     setActiveId(s.id);
   }, [selectedModel]);
 
+  // Task 3.1: "Clear history" — wipe `nanoforge.v1` and reset sessions /
+  // usage / files to fresh defaults. The persist effect then re-saves the
+  // clean state (so the key holds an empty snapshot, not stale data).
+  const handleClearHistory = useCallback(() => {
+    saver.cancel();
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+    } catch {
+      /* blocked storage */
+    }
+    const s = newSession(selectedModel);
+    setSessions([s]);
+    setActiveId(s.id);
+    setUsage({ input: 0, output: 0, costUsd: 0, requests: 0 });
+    setFiles(VIRTUAL_PROJECT);
+    setViewerFile(null);
+  }, [saver, selectedModel]);
+
+  // Task 3.3: session mutations always addressed by explicit id (same
+  // cross-session discipline as patchMessage).
+  const handleRenameSession = useCallback((id: string, title: string) => {
+    setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, title } : s)));
+  }, []);
+
+  const handleDeleteSession = useCallback(
+    (id: string) => {
+      if (sessions.length <= 1) return; // guard: never delete the last session
+      const next = sessions.filter((s) => s.id !== id);
+      setSessions(next);
+      if (activeId === id) setActiveId(next[0].id);
+    },
+    [sessions, activeId],
+  );
+
+  // Task 3.3: export the active session transcript as a Markdown download.
+  const handleExport = useCallback(() => {
+    if (session) downloadSessionMarkdown(session);
+  }, [session]);
+
   // Task 1.1: Apply/Reject mutates the virtual filesystem for real.
   // The vfs transition is derived from the patch's CURRENT status, so
   // double-clicks / repeat decisions are no-ops and can never corrupt files:
@@ -316,12 +441,23 @@ export default function App() {
   );
 
   const activeViewer = files.find((f) => f.path === viewerFile);
+  const providers = useMemo(() => Array.from(new Set(models.map((m) => m.provider))).sort(), [models]);
 
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-background">
-      <TopBar connection={connection} usage={usage} onOpenSettings={() => setSettingsOpen(true)} />
+      <TopBar
+        connection={connection}
+        usage={usage}
+        onOpenSettings={() => setSettingsOpen(true)}
+        onOpenSidebar={() => setSidebarOpen(true)}
+        onOpenModels={() => setModelsOpen(true)}
+        onExport={handleExport}
+        canExport={!!session && session.messages.length > 0}
+      />
       <div className="flex min-h-0 flex-1">
+        {/* inline rails — lg and up only; below lg the drawers take over */}
         <Sidebar
+          className="hidden lg:flex"
           sessions={sessions}
           activeId={session?.id ?? ""}
           onSelect={setActiveId}
@@ -329,6 +465,8 @@ export default function App() {
           files={files}
           activeFile={viewerFile ?? ""}
           onFileSelect={(p) => setViewerFile(p)}
+          onRename={handleRenameSession}
+          onDelete={handleDeleteSession}
         />
         <ChatPanel
           messages={session?.messages ?? []}
@@ -341,8 +479,63 @@ export default function App() {
           genPrefs={genPrefs}
           onGenPrefsChange={handleGenPrefsChange}
         />
-        <ModelPanel models={models} selected={selectedModel} onSelect={setSelectedModel} live={connection.liveModels} />
+        <ModelPanel
+          className="hidden lg:flex"
+          models={models}
+          selected={selectedModel}
+          onSelect={setSelectedModel}
+          live={connection.liveModels}
+        />
       </div>
+
+      {/* Task 3.2: overlay drawers for < lg. Triggers only exist below lg, and
+          the isNarrow effect force-closes them when the viewport widens. */}
+      <Sheet open={sidebarOpen} onOpenChange={setSidebarOpen}>
+        <SheetContent side="left" className="gap-0 border-border bg-card p-0">
+          <SheetHeader className="sr-only">
+            <SheetTitle>Sessions &amp; workspace</SheetTitle>
+          </SheetHeader>
+          <Sidebar
+            className="h-full w-full border-r-0"
+            sessions={sessions}
+            activeId={session?.id ?? ""}
+            onSelect={(id) => {
+              setActiveId(id);
+              setSidebarOpen(false);
+            }}
+            onNew={() => {
+              handleNewSession();
+              setSidebarOpen(false);
+            }}
+            files={files}
+            activeFile={viewerFile ?? ""}
+            onFileSelect={(p) => {
+              setViewerFile(p);
+              setSidebarOpen(false);
+            }}
+            onRename={handleRenameSession}
+            onDelete={handleDeleteSession}
+          />
+        </SheetContent>
+      </Sheet>
+
+      <Sheet open={modelsOpen} onOpenChange={setModelsOpen}>
+        <SheetContent side="right" className="gap-0 border-border bg-card p-0">
+          <SheetHeader className="sr-only">
+            <SheetTitle>Model catalog</SheetTitle>
+          </SheetHeader>
+          <ModelPanel
+            className="h-full w-full border-l-0"
+            models={models}
+            selected={selectedModel}
+            onSelect={(id) => {
+              setSelectedModel(id);
+              setModelsOpen(false);
+            }}
+            live={connection.liveModels}
+          />
+        </SheetContent>
+      </Sheet>
 
       <ConnectDialog
         open={settingsOpen}
@@ -350,7 +543,46 @@ export default function App() {
         connection={connection}
         onConnect={handleConnect}
         onDisconnect={handleDisconnect}
+        onClearHistory={handleClearHistory}
       />
+
+      {/* Task 3.3: Ctrl/Cmd+K model quick-switcher — same catalog data and
+          provider grouping as ModelPanel; cmdk provides the fuzzy filter. */}
+      <CommandDialog
+        open={switcherOpen}
+        onOpenChange={setSwitcherOpen}
+        title="Switch model"
+        description="Search the model catalog and press Enter to switch"
+        className="border-border bg-card"
+      >
+        <CommandInput placeholder="search models…" />
+        <CommandList className="scrollbar-thin">
+          <CommandEmpty className="font-mono text-[12px] text-muted-foreground">no models match</CommandEmpty>
+          {providers.map((p) => (
+            <CommandGroup heading={p} key={p}>
+              {models
+                .filter((m) => m.provider === p)
+                .map((m) => (
+                  <CommandItem
+                    key={m.id}
+                    value={`${m.name} ${m.id}`}
+                    onSelect={() => {
+                      setSelectedModel(m.id);
+                      setSwitcherOpen(false);
+                    }}
+                    className="font-mono text-[12px]"
+                  >
+                    <span className={m.id === selectedModel ? "text-primary" : "text-foreground"}>{m.name}</span>
+                    {m.id === selectedModel && <Check className="h-3 w-3 text-primary" />}
+                    <CommandShortcut>
+                      {m.priceEstimated ? "~" : ""}${m.inputPrice.toFixed(2)}/${m.outputPrice.toFixed(2)} · {m.contextK}k
+                    </CommandShortcut>
+                  </CommandItem>
+                ))}
+            </CommandGroup>
+          ))}
+        </CommandList>
+      </CommandDialog>
 
       {/* file viewer overlay */}
       {activeViewer && (
@@ -368,7 +600,9 @@ export default function App() {
               </button>
             </div>
             <pre className="scrollbar-thin flex-1 overflow-auto bg-black/30 p-4 font-mono text-[12px] leading-relaxed text-foreground/85">
-              {activeViewer.content}
+              <code>
+                <HighlightedCode code={activeViewer.content} lang={activeViewer.language} />
+              </code>
             </pre>
           </div>
         </div>

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ExternalLink, Eye, EyeOff, KeyRound, Loader2, PlugZap, Unplug, X } from "lucide-react";
+import { ExternalLink, Eye, EyeOff, KeyRound, Loader2, PlugZap, Trash2, Unplug, X } from "lucide-react";
 import type { ConnectionState } from "@/types";
 
 interface Props {
@@ -8,12 +8,15 @@ interface Props {
   connection: ConnectionState;
   onConnect: (apiKey: string, baseUrl: string) => void;
   onDisconnect: () => void;
+  /** Task 3.1: wipe `nanoforge.v1` and reset sessions/usage/files to fresh defaults. */
+  onClearHistory: () => void;
 }
 
-export function ConnectDialog({ open, onClose, connection, onConnect, onDisconnect }: Props) {
+export function ConnectDialog({ open, onClose, connection, onConnect, onDisconnect, onClearHistory }: Props) {
   const [key, setKey] = useState(connection.apiKey);
   const [base, setBase] = useState(connection.baseUrl);
   const [show, setShow] = useState(false);
+  const [confirmClear, setConfirmClear] = useState(false);
   const checking = connection.status === "checking";
 
   // Task 0.3 (defect #3): re-sync local fields from the live connection every
@@ -22,6 +25,7 @@ export function ConnectDialog({ open, onClose, connection, onConnect, onDisconne
     if (open) {
       setKey(connection.apiKey);
       setBase(connection.baseUrl);
+      setConfirmClear(false);
     }
   }, [open, connection.apiKey, connection.baseUrl]);
 
@@ -95,6 +99,27 @@ export function ConnectDialog({ open, onClose, connection, onConnect, onDisconne
           >
             <ExternalLink className="h-3 w-3" /> get a key
           </a>
+          {/* Task 3.1: wipe persisted sessions/usage/files — two-step confirm. */}
+          <button
+            onClick={() => {
+              if (confirmClear) {
+                onClearHistory();
+                setConfirmClear(false);
+              } else {
+                setConfirmClear(true);
+              }
+            }}
+            onBlur={() => setConfirmClear(false)}
+            title="Delete all saved sessions, usage, and workspace state"
+            className={`flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 font-mono text-[11px] transition-colors ${
+              confirmClear
+                ? "border-destructive/60 bg-destructive/15 text-red-300"
+                : "border-transparent text-muted-foreground hover:border-destructive/40 hover:text-red-300"
+            }`}
+          >
+            <Trash2 className="h-3 w-3" />
+            {confirmClear ? "confirm clear?" : "clear history"}
+          </button>
           <div className="flex-1" />
           {connection.status === "connected" && (
             <button

@@ -1,4 +1,5 @@
 import { Fragment, type ReactNode } from "react";
+import { detectLang, tokenize, type TokenKind } from "@/lib/syntax";
 
 /** Minimal markdown-lite: fenced code, inline code, bold, headers, lists. */
 export function RichText({ text }: { text: string }) {
@@ -12,7 +13,9 @@ export function RichText({ text }: { text: string }) {
             className="overflow-x-auto rounded-md border border-border bg-black/40 p-3 font-mono text-[12px] leading-5 text-foreground/90 scrollbar-thin"
           >
             {b.lang && <div className="micro-label mb-1.5">{b.lang}</div>}
-            <code>{b.text}</code>
+            <code>
+              <HighlightedCode code={b.text} lang={b.lang} />
+            </code>
           </pre>
         ) : (
           <div key={i} className="space-y-1.5">
@@ -27,6 +30,36 @@ export function RichText({ text }: { text: string }) {
 }
 
 type Block = { kind: "code" | "text"; text: string; lang?: string };
+
+/**
+ * Task 3.3: theme-token-only syntax colors for the hand-rolled tokenizer in
+ * `src/lib/syntax.ts`. Keywords use `--primary`, strings the (lighter) accent
+ * foreground, comments `--muted-foreground`; plain text inherits.
+ */
+const TOKEN_CLASS: Record<TokenKind, string | undefined> = {
+  keyword: "text-primary",
+  string: "text-accent-foreground",
+  comment: "italic text-muted-foreground",
+  plain: undefined,
+};
+
+/** Renders `code` as highlighted spans. Shared by RichText code blocks and the workspace file viewer. */
+export function HighlightedCode({ code, lang }: { code: string; lang?: string }) {
+  const tokens = tokenize(code, detectLang(lang));
+  return (
+    <>
+      {tokens.map((t, i) =>
+        TOKEN_CLASS[t.kind] ? (
+          <span key={i} className={TOKEN_CLASS[t.kind]}>
+            {t.text}
+          </span>
+        ) : (
+          <Fragment key={i}>{t.text}</Fragment>
+        ),
+      )}
+    </>
+  );
+}
 
 function splitBlocks(text: string): Block[] {
   const out: Block[] = [];

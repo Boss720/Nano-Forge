@@ -1,15 +1,18 @@
 import { useMemo, useState } from "react";
 import { Check, ExternalLink, Search } from "lucide-react";
 import type { NanoModel } from "@/types";
+import { cn } from "@/lib/utils";
 
 interface Props {
   models: NanoModel[];
   selected: string;
   onSelect: (id: string) => void;
   live: boolean;
+  /** Layout overrides — e.g. `hidden lg:flex` inline, `h-full w-full border-l-0` in a drawer. */
+  className?: string;
 }
 
-export function ModelPanel({ models, selected, onSelect, live }: Props) {
+export function ModelPanel({ models, selected, onSelect, live, className }: Props) {
   const [q, setQ] = useState("");
   const [provider, setProvider] = useState<string>("all");
 
@@ -25,7 +28,7 @@ export function ModelPanel({ models, selected, onSelect, live }: Props) {
   }, [models, q, provider]);
 
   return (
-    <aside className="flex w-72 shrink-0 flex-col border-l border-border bg-card/50">
+    <aside className={cn("flex w-72 shrink-0 flex-col border-l border-border bg-card/50", className)}>
       <div className="flex items-center justify-between px-3 pb-2 pt-3">
         <span className="micro-label">Model catalog</span>
         <span className={`font-mono text-[10px] ${live ? "text-emerald-400" : "text-muted-foreground"}`}>
