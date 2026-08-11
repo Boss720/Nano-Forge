@@ -9,6 +9,8 @@ export interface NanoModel {
   tags: string[];
   /** true when returned by the live /api/v1/models endpoint */
   live?: boolean;
+  /** true when pricing came from the magnitude heuristic, not explicit per-token fields */
+  priceEstimated?: boolean;
 }
 
 export type ToolKind = "read_file" | "edit_file" | "run_command" | "search" | "think";

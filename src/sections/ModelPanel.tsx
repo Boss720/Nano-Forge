@@ -79,7 +79,9 @@ export function ModelPanel({ models, selected, onSelect, live }: Props) {
                 <span className="micro-label">{m.provider}</span>
               </div>
               <div className="mt-1 flex items-center gap-2 font-mono text-[10px] text-muted-foreground">
-                <span>${m.inputPrice}/{m.outputPrice} · 1M tok</span>
+                <span title={m.priceEstimated ? "estimated pricing" : undefined}>
+                  {m.priceEstimated ? "~" : ""}${m.inputPrice.toFixed(2)} in · ${m.outputPrice.toFixed(2)} out /1M
+                </span>
                 <span>·</span>
                 <span>{m.contextK}k ctx</span>
               </div>

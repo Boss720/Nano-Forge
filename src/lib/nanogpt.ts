@@ -44,15 +44,22 @@ export async function fetchModels(baseUrl: string, apiKey: string): Promise<Nano
         const id = m.id as string;
         const pricing = (m.pricing ?? {}) as Record<string, unknown>;
         const ctx = (m.context_length ?? m.contextWindow ?? 128_000) as number;
+        // Prefer explicit OpenRouter-style per-token fields; only fall back to
+        // the magnitude heuristic when they are absent/invalid.
+        const explicitInput = perTokenToPerMillion(pricing.prompt);
+        const explicitOutput = perTokenToPerMillion(pricing.completion);
+        const inputPrice = explicitInput ?? toPerMillion(pricing.input);
+        const outputPrice = explicitOutput ?? toPerMillion(pricing.output);
         return {
           id,
           name: (m.name as string) ?? id,
           provider: id.includes("/") ? id.split("/")[0] : guessProvider(id),
-          inputPrice: toPerMillion(pricing.prompt ?? pricing.input),
-          outputPrice: toPerMillion(pricing.completion ?? pricing.output),
+          inputPrice,
+          outputPrice,
           contextK: Math.round(Number(ctx) / 1000) || 128,
           tags: [],
           live: true,
+          ...(explicitInput == null || explicitOutput == null ? { priceEstimated: true as const } : {}),
         };
       });
     return mapped.length ? mapped : FALLBACK_MODELS;
@@ -61,10 +68,19 @@ export async function fetchModels(baseUrl: string, apiKey: string): Promise<Nano
   }
 }
 
-function toPerMillion(v: unknown): number {
+/** Explicit per-token price (OpenRouter-style) → USD per 1M tokens; null when absent/invalid. */
+function perTokenToPerMillion(v: unknown): number | null {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return +(n * 1_000_000).toFixed(3);
+}
+
+/** Magnitude heuristic for ambiguous pricing values. */
+export function toPerMillion(v: unknown): number {
   const n = Number(v);
   if (!Number.isFinite(n) || n <= 0) return 0;
-  // nano-gpt reports per-token pricing; anything < 0.01 is per-token → scale up
+  // nano-gpt reports per-token pricing; anything < 0.01 is per-token → scale up.
+  // Exactly 0.01 is treated as already per-million.
   return n < 0.01 ? +(n * 1_000_000).toFixed(3) : n;
 }
 
