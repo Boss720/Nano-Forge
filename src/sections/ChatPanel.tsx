@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import {
-  Bot, Brain, Check, ChevronDown, ChevronRight, CircleDollarSign, FileEdit, FileSearch,
-  Play, SendHorizonal, Settings2, Square, TerminalSquare, X,
+  Ban, Bot, Brain, Check, ChevronDown, ChevronRight, CircleDollarSign, Clock, FileEdit, FileSearch,
+  Play, SendHorizonal, Settings2, ShieldAlert, Square, TerminalSquare, X,
 } from "lucide-react";
-import type { GenerationPrefs, Message, NanoModel, Patch, ToolCall } from "@/types";
+import type { GenerationPrefs, Message, NanoModel, Patch, ToolCall, ToolRun, ToolRunState } from "@/types";
 import { AGENT_SYSTEM_PROMPT } from "@/lib/catalog";
 import { estimateTokens } from "@/lib/context";
 import { RichText } from "@/components/RichText";
@@ -20,6 +20,14 @@ interface Props {
   onPatchDecision: (messageId: string, decision: "applied" | "rejected") => void;
   genPrefs: GenerationPrefs;
   onGenPrefsChange: (prefs: GenerationPrefs) => void;
+  /**
+   * Module 2 Task 7 (optional): supervised terminal jobs reported by the
+   * local agent host. Absent/empty when no host session exists — the panel
+   * then renders exactly as before.
+   */
+  toolRuns?: ToolRun[];
+  /** Stop (cancel) one terminal job; typically wired to HostClient.cancelRun. */
+  onToolStop?: (toolRunId: string) => void;
 }
 
 const TOOL_ICON: Record<ToolCall["kind"], typeof Brain> = {
@@ -35,7 +43,7 @@ function fmtK(n: number): string {
   return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
 }
 
-export function ChatPanel({ messages, running, model, connected, onSend, onStop, onPatchDecision, genPrefs, onGenPrefsChange }: Props) {
+export function ChatPanel({ messages, running, model, connected, onSend, onStop, onPatchDecision, genPrefs, onGenPrefsChange, toolRuns, onToolStop }: Props) {
   const [draft, setDraft] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -69,6 +77,13 @@ export function ChatPanel({ messages, running, model, connected, onSend, onStop,
         {messages.map((m) => (
           <MessageView key={m.id} m={m} onPatchDecision={onPatchDecision} />
         ))}
+        {toolRuns && toolRuns.length > 0 && (
+          <div className="max-w-[85%] space-y-2">
+            {toolRuns.map((t) => (
+              <ToolRunCard key={t.id} t={t} onStop={onToolStop} />
+            ))}
+          </div>
+        )}
       </div>
 
       {/* composer */}
@@ -328,6 +343,103 @@ function ToolCard({ t }: { t: ToolCall }) {  const [open, setOpen] = useState(fa
         {open ? <ChevronDown className="h-3 w-3 text-muted-foreground" /> : <ChevronRight className="h-3 w-3 text-muted-foreground" />}
       </button>
       {open && <div className="border-t border-border px-3 py-2 font-mono text-[11px] leading-relaxed text-muted-foreground">{t.detail}</div>}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Module 2 Task 7: supervised terminal tool cards (host-driven)      */
+/* ------------------------------------------------------------------ */
+
+const TOOL_RUN_LABEL: Record<ToolRunState, string> = {
+  queued: "queued",
+  approval_required: "approval required",
+  running: "running",
+  done: "done",
+  error: "error",
+  cancelled: "cancelled",
+};
+
+function ToolRunStatusIcon({ state }: { state: ToolRunState }) {
+  switch (state) {
+    case "queued":
+      return <Clock className="h-3 w-3 text-muted-foreground" />;
+    case "approval_required":
+      return <ShieldAlert className="h-3 w-3 text-amber-400" />;
+    case "running":
+      return <span className="h-2 w-2 rounded-full bg-primary pulse-dot" />;
+    case "done":
+      return <Check className="h-3 w-3 text-emerald-400" />;
+    case "error":
+      return <X className="h-3 w-3 text-red-400" />;
+    case "cancelled":
+      return <Ban className="h-3 w-3 text-muted-foreground" />;
+  }
+}
+
+/**
+ * One host-supervised terminal job. Structured `executable + args[]` only
+ * (never a shell string); Stop is offered while the job can still be halted
+ * and is wired to the host cancel callback.
+ */
+function ToolRunCard({ t, onStop }: { t: ToolRun; onStop?: (toolRunId: string) => void }) {
+  const [open, setOpen] = useState(t.state === "running" || t.state === "error");
+  const stoppable = t.state === "queued" || t.state === "running" || t.state === "approval_required";
+  return (
+    <div className="rounded-md border border-border bg-card/70" data-testid={`tool-run-${t.id}`} data-state={t.state}>
+      <div className="flex items-center gap-2 px-2.5 py-1.5">
+        <button onClick={() => setOpen(!open)} className="flex min-w-0 flex-1 items-center gap-2 text-left">
+          <TerminalSquare className={`h-3.5 w-3.5 shrink-0 ${t.state === "running" ? "pulse-dot text-primary" : "text-muted-foreground"}`} />
+          <span className="shrink-0 font-mono text-[11.5px] text-foreground/90">{t.executable}</span>
+          <span className="min-w-0 truncate font-mono text-[10.5px] text-muted-foreground">
+            {t.args.join(" ")}
+          </span>
+          <span className={`micro-label shrink-0 ${t.state === "approval_required" ? "text-amber-400" : ""}`}>
+            {TOOL_RUN_LABEL[t.state]}
+          </span>
+        </button>
+        {stoppable && onStop && (
+          <button
+            aria-label={`Stop ${t.executable}`}
+            onClick={() => onStop(t.id)}
+            className="flex shrink-0 items-center gap-1 rounded border border-destructive/50 bg-destructive/15 px-1.5 py-0.5 font-mono text-[10px] text-red-300 transition-colors hover:bg-destructive/25"
+          >
+            <Square className="h-2.5 w-2.5" /> stop
+          </button>
+        )}
+        {t.exitCode != null && (
+          <span className={`shrink-0 font-mono text-[10px] ${t.exitCode === 0 ? "text-muted-foreground" : "text-red-400"}`}>
+            exit {t.exitCode}
+          </span>
+        )}
+        <ToolRunStatusIcon state={t.state} />
+        <button onClick={() => setOpen(!open)} aria-label="Toggle details" className="shrink-0">
+          {open ? <ChevronDown className="h-3 w-3 text-muted-foreground" /> : <ChevronRight className="h-3 w-3 text-muted-foreground" />}
+        </button>
+      </div>
+      {open && (
+        <div className="space-y-1 border-t border-border px-3 py-2 font-mono text-[11px] leading-relaxed text-muted-foreground">
+          <div>
+            <span className="micro-label normal-case tracking-normal">cwd </span>
+            {t.cwd}
+          </div>
+          {t.policyReason && (
+            <div className="flex items-center gap-1 text-amber-400/90">
+              <ShieldAlert className="h-3 w-3" /> policy: {t.policyReason}
+            </div>
+          )}
+          {t.output && (
+            <pre className="scrollbar-thin max-h-40 overflow-auto whitespace-pre-wrap rounded bg-black/40 p-2 text-[11px]">
+              {t.output}
+            </pre>
+          )}
+          {t.truncated && (
+            <div className="text-[10px] uppercase tracking-wider text-amber-400/80">
+              … output truncated by host cap
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

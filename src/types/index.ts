@@ -119,3 +119,67 @@ export interface UsageRun {
   /** Errored runs are recorded for audit but are not billable requests. */
   errored?: boolean;
 }
+
+/* ------------------------------------------------------------------ */
+/* Agent platform (Module 1 Task 2): executable plan contracts        */
+/* ------------------------------------------------------------------ */
+
+/** Plan-level UI state machine. Runs stay disabled until explicit approval. */
+export type PlanUIState = "draft" | "awaiting_approval" | "executing" | "paused" | "completed";
+
+export type PlanStepStatus = "pending" | "running" | "succeeded" | "failed" | "blocked";
+
+export interface PlanStep {
+  id: string;
+  title: string;
+  dependsOn: string[];
+  status: PlanStepStatus;
+  /**
+   * When present, this step may NEVER enter "running" on the strength of
+   * model output or chat text — only an explicit user click counts.
+   */
+  approval?: "required";
+  sideEffecting?: boolean;
+  /** Exact workspace-relative paths / scopes this step touches. */
+  affectedScopes?: string[];
+  estimate?: { tokens?: number; costUsd?: number; durationSec?: number };
+  artifacts?: string[];
+}
+
+export interface ExecutionPlan {
+  id: string;
+  goal: string;
+  steps: PlanStep[];
+  state: PlanUIState;
+}
+
+/* ------------------------------------------------------------------ */
+/* Agent platform (Module 2 Task 7): terminal tool-run cards          */
+/* ------------------------------------------------------------------ */
+
+/** Host-side lifecycle of one supervised terminal job. */
+export type ToolRunState =
+  | "queued"
+  | "approval_required"
+  | "running"
+  | "done"
+  | "error"
+  | "cancelled";
+
+/** One terminal tool card in the chat transcript (mirrors host run events). */
+export interface ToolRun {
+  id: string;
+  /** Structured invocation only — never a free-form shell string. */
+  executable: string;
+  args: string[];
+  /** Workspace-confined working directory. */
+  cwd: string;
+  state: ToolRunState;
+  /** Why policy asked/denied, e.g. "write outside workspace requires approval". */
+  policyReason?: string;
+  /** Latest stdout/stderr excerpt (may be truncated by the host output cap). */
+  output?: string;
+  /** true when the host capped the streamed output. */
+  truncated?: boolean;
+  exitCode?: number;
+}

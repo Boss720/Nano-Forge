@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ExternalLink, Eye, EyeOff, KeyRound, Loader2, PlugZap, Trash2, Unplug, X, Zap } from "lucide-react";
+import { ExternalLink, Eye, EyeOff, KeyRound, Loader2, PlugZap, Puzzle, Trash2, Unplug, X, Zap } from "lucide-react";
 import type { ConnectionState } from "@/types";
 import { formatQuote } from "@/lib/x402";
 
@@ -14,9 +14,15 @@ interface Props {
   onDisconnect: () => void;
   /** Task 3.1: wipe `nanoforge.v1` and reset sessions/usage/files to fresh defaults. */
   onClearHistory: () => void;
+  /**
+   * Agent platform (Task 14): opens the IntegrationsPanel (rules / skills /
+   * MCP servers). Optional — when omitted (no local host), no entry point is
+   * rendered and the connect flow is unchanged.
+   */
+  onOpenIntegrations?: () => void;
 }
 
-export function ConnectDialog({ open, onClose, connection, onConnect, onDisconnect, onClearHistory }: Props) {
+export function ConnectDialog({ open, onClose, connection, onConnect, onDisconnect, onClearHistory, onOpenIntegrations }: Props) {
   const [key, setKey] = useState(connection.apiKey);
   const [base, setBase] = useState(connection.baseUrl);
   const [show, setShow] = useState(false);
@@ -166,6 +172,17 @@ export function ConnectDialog({ open, onClose, connection, onConnect, onDisconne
           >
             <ExternalLink className="h-3 w-3" /> get a key
           </a>
+          {/* Agent platform (Task 14): entry point to the integrations panel.
+              Rendered only when the wiring layer provides the handler. */}
+          {onOpenIntegrations && (
+            <button
+              onClick={onOpenIntegrations}
+              title="Rules packs, skills, and MCP servers"
+              className="flex items-center gap-1.5 font-mono text-[11px] text-muted-foreground hover:text-primary"
+            >
+              <Puzzle className="h-3 w-3" /> integrations
+            </button>
+          )}
           {/* Task 3.1: wipe persisted sessions/usage/files — two-step confirm. */}
           <button
             onClick={() => {

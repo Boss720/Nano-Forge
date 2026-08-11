@@ -2,17 +2,23 @@ import { useMemo, useState } from "react";
 import { Check, ExternalLink, Search } from "lucide-react";
 import type { NanoModel } from "@/types";
 import { cn } from "@/lib/utils";
+import { RouteDecisionCard, type RouteDecisionCardProps } from "./RouteDecisionCard";
 
 interface Props {
   models: NanoModel[];
   selected: string;
   onSelect: (id: string) => void;
   live: boolean;
+  /**
+   * Agent platform (Task 17): optional route decision view. Omit entirely
+   * when no local host/router is active — the panel is unchanged without it.
+   */
+  routeDecision?: RouteDecisionCardProps;
   /** Layout overrides — e.g. `hidden lg:flex` inline, `h-full w-full border-l-0` in a drawer. */
   className?: string;
 }
 
-export function ModelPanel({ models, selected, onSelect, live, className }: Props) {
+export function ModelPanel({ models, selected, onSelect, live, routeDecision, className }: Props) {
   const [q, setQ] = useState("");
   const [provider, setProvider] = useState<string>("all");
 
@@ -47,6 +53,13 @@ export function ModelPanel({ models, selected, onSelect, live, className }: Prop
           />
         </div>
       </div>
+
+      {/* Task 17: surfaced only while a host/router route decision exists. */}
+      {routeDecision && (
+        <div className="px-2 pb-2">
+          <RouteDecisionCard {...routeDecision} />
+        </div>
+      )}
 
       <div className="scrollbar-thin flex gap-1 overflow-x-auto px-3 pb-2">
         {providers.map((p) => (
