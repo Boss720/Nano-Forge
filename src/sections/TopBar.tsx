@@ -1,4 +1,4 @@
-import { BarChart3, Download, KeyRound, PanelLeft, PanelRight, Settings, Zap } from "lucide-react";
+import { BarChart3, Download, Image, KeyRound, PanelLeft, PanelRight, Settings, Zap } from "lucide-react";
 import type { ConnectionState, UsageTotals } from "@/types";
 
 interface Props {
@@ -13,9 +13,11 @@ interface Props {
   canExport: boolean;
   /** Final phase: open the cost dashboard dialog. */
   onOpenCosts: () => void;
+  /** Final phase: open the image generation panel. */
+  onOpenImages: () => void;
 }
 
-export function TopBar({ connection, usage, onOpenSettings, onOpenSidebar, onOpenModels, onExport, canExport, onOpenCosts }: Props) {
+export function TopBar({ connection, usage, onOpenSettings, onOpenSidebar, onOpenModels, onExport, canExport, onOpenCosts, onOpenImages }: Props) {
   const connected = connection.status === "connected";
   return (
     <header className="flex h-12 shrink-0 items-center gap-4 border-b border-border bg-card px-4">
@@ -74,6 +76,16 @@ export function TopBar({ connection, usage, onOpenSettings, onOpenSidebar, onOpe
         aria-label="Open cost dashboard"
       >
         <BarChart3 className="h-4 w-4" />
+      </button>
+
+      {/* Final phase: image generation panel */}
+      <button
+        onClick={onOpenImages}
+        title="Image generation — text-to-image via nano-gpt"
+        className="rounded-md border border-border bg-secondary/60 p-1.5 text-muted-foreground transition-colors hover:border-primary/50 hover:text-primary"
+        aria-label="Open image generation panel"
+      >
+        <Image className="h-4 w-4" />
       </button>
 
       {/* usage */}

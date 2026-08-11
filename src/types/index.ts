@@ -1,3 +1,5 @@
+import type { X402Quote } from "@/lib/x402";
+
 export interface NanoModel {
   id: string;
   name: string;
@@ -79,6 +81,12 @@ export interface ConnectionState {
   status: "disconnected" | "checking" | "connected" | "error";
   error?: string;
   liveModels: boolean;
+  /**
+   * Final phase (x402): set when key validation fails with HTTP 402 — the
+   * endpoint offers accountless pay-per-request. `null` means a 402 was
+   * returned but no parseable quote; `undefined` means no 402 at all.
+   */
+  x402?: X402Quote | null;
 }
 
 export interface UsageTotals {

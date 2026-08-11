@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Check, X } from "lucide-react";
 import type { ConnectionState, GenerationPrefs, Message, Patch, Session, ToolCall, UsageRun, UsageTotals, VirtualFile } from "@/types";
 import { DEFAULT_GEN_PREFS } from "@/types";
 import { FALLBACK_MODELS, AGENT_SYSTEM_PROMPT, VIRTUAL_PROJECT } from "@/lib/catalog";
 import { DEFAULT_BASE_URL, fetchModels, streamChat, validateKey } from "@/lib/nanogpt";
+import { formatQuote } from "@/lib/x402";
 import { runDemoAgent } from "@/lib/demoAgent";
 import { patchSessionMessage } from "@/lib/sessionReducer";
 import { applyRunUsage, runCost } from "@/lib/usage";
@@ -32,6 +33,10 @@ import { ChatPanel } from "@/sections/ChatPanel";
 import { ModelPanel } from "@/sections/ModelPanel";
 import { ConnectDialog } from "@/sections/ConnectDialog";
 import { CostDashboard } from "@/sections/CostDashboard";
+
+// Final phase (Task A): the image panel is lazy-loaded so it stays out of the
+// already-large main bundle (recharts). The chunk loads on first open.
+const ImagePanel = lazy(() => import("@/sections/ImagePanel"));
 
 const uid = () => Math.random().toString(36).slice(2, 10);
 const LS_KEY = "nanoforge.connection";
@@ -122,6 +127,8 @@ export default function App() {
   const [runs, setRuns] = useState<UsageRun[]>(() => hydrated?.runs ?? []);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [costsOpen, setCostsOpen] = useState(false);
+  // Final phase (Task A): image generation panel (lazy chunk, dialog).
+  const [imagesOpen, setImagesOpen] = useState(false);
   const [viewerFile, setViewerFile] = useState<string | null>(null);
   // Task 1.1: the virtual workspace lives in state so applied patches are
   // visible in the sidebar / file viewer.
@@ -319,6 +326,11 @@ export default function App() {
       // ```diff fence (message state holds the same text, but reading it here
       // would need a round-trip through React state).
       let streamed = "";
+      // Final phase (Task B): on a 402, `onX402` (fired BEFORE `onError`)
+      // composes the accountless-payment message here; `onError` then renders
+      // it verbatim instead of the generic error line, so the user sees ONE
+      // coherent message rather than two stacked ones.
+      let x402Content: string | null = null;
       streamChat(
         connection.baseUrl,
         connection.apiKey,
@@ -341,9 +353,18 @@ export default function App() {
             }
             finishRun(sid, agentMsg.id, u);
           },
+          onX402: (err) => {
+            x402Content =
+              `**Accountless payment required (HTTP 402).** This request needs a per-request payment` +
+              (err.quote ? ` of **${formatQuote(err.quote)}**` : "") +
+              `. Pay per request without an account, or add a subscription key in Settings to skip per-request payments.`;
+          },
           onError: (err) => {
             abortRef.current = null;
-            patchMessage(sid, agentMsg.id, (m) => ({ ...m, content: m.content + `\n\n**Error:** ${err}` }));
+            patchMessage(sid, agentMsg.id, (m) => ({
+              ...m,
+              content: m.content + (x402Content ? `\n\n${x402Content}` : `\n\n**Error:** ${err}`),
+            }));
             finishRun(sid, agentMsg.id, { input: 0, output: 0 }, { errored: true });
           },
         },
@@ -367,10 +388,12 @@ export default function App() {
   }, []);
 
   const handleConnect = useCallback(async (apiKey: string, baseUrl: string) => {
-    setConnection((c) => ({ ...c, apiKey, baseUrl, status: "checking", error: undefined }));
+    setConnection((c) => ({ ...c, apiKey, baseUrl, status: "checking", error: undefined, x402: undefined }));
     const result = await validateKey(baseUrl, apiKey);
     const status = result.ok ? "connected" : "error";
-    setConnection({ apiKey, baseUrl, status, error: result.error, liveModels: false });
+    // Final phase (Task B): keep the x402 quote (possibly null) on the
+    // connection so ConnectDialog can surface accountless mode on a 402.
+    setConnection({ apiKey, baseUrl, status, error: result.error, liveModels: false, x402: result.x402 });
     if (result.ok) {
       localStorage.setItem(LS_KEY, JSON.stringify({ apiKey, baseUrl }));
       setSettingsOpen(false);
@@ -515,6 +538,7 @@ export default function App() {
         onExport={handleExport}
         canExport={!!session && session.messages.length > 0}
         onOpenCosts={() => setCostsOpen(true)}
+        onOpenImages={() => setImagesOpen(true)}
       />
       <div className="flex min-h-0 flex-1">
         {/* inline rails — lg and up only; below lg the drawers take over */}
@@ -655,6 +679,21 @@ export default function App() {
 
       {/* Final phase (Task B): cost dashboard over the per-run usage log. */}
       <CostDashboard open={costsOpen} onOpenChange={setCostsOpen} runs={runs} models={models} usage={usage} />
+
+      {/* Final phase (Task A): image generation panel — lazy chunk, mounted
+          only after first open so it never touches the initial bundle. */}
+      {imagesOpen && (
+        <Suspense fallback={null}>
+          <ImagePanel
+            open={imagesOpen}
+            onOpenChange={setImagesOpen}
+            baseUrl={connection.baseUrl}
+            apiKey={connection.apiKey}
+            connected={connected}
+            onOpenSettings={() => setSettingsOpen(true)}
+          />
+        </Suspense>
+      )}
 
       {/* file viewer overlay */}
       {activeViewer && (

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
-import { ExternalLink, Eye, EyeOff, KeyRound, Loader2, PlugZap, Trash2, Unplug, X } from "lucide-react";
+import { ExternalLink, Eye, EyeOff, KeyRound, Loader2, PlugZap, Trash2, Unplug, X, Zap } from "lucide-react";
 import type { ConnectionState } from "@/types";
+import { formatQuote } from "@/lib/x402";
 
 /** Final roadmap phase (Task C): dismissible MCP interop note. Dismissal persists. */
 const LS_MCP_NOTE_KEY = "nanoforge.mcp-note-dismissed";
@@ -100,6 +101,32 @@ export function ConnectDialog({ open, onClose, connection, onConnect, onDisconne
           {connection.error && (
             <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11.5px] leading-relaxed text-amber-200">
               {connection.error}
+            </div>
+          )}
+
+          {/* Final phase (Task B): the key was rejected with HTTP 402 — the
+              endpoint offers x402 accountless pay-per-request. `x402 === null`
+              means 402 with no parseable quote → generic copy. */}
+          {connection.status === "error" && connection.x402 !== undefined && (
+            <div className="flex items-start gap-2 rounded-md border border-primary/40 bg-primary/10 px-3 py-2.5 text-[11.5px] leading-relaxed text-muted-foreground">
+              <Zap className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" />
+              <p className="flex-1">
+                <span className="text-foreground">Accountless mode available.</span> This key wasn't accepted, but the
+                endpoint answered with an x402 payment quote
+                {connection.x402 ? (
+                  <>
+                    {" "}— <span className="font-mono text-primary">{formatQuote(connection.x402)}</span>
+                  </>
+                ) : (
+                  " (no price details returned)"
+                )}
+                . You can pay per request without an account — no key needed — or fix the key above for
+                subscription access. Details at{" "}
+                <a href="https://nano-gpt.com" target="_blank" rel="noreferrer" className="text-primary hover:underline">
+                  nano-gpt.com <ExternalLink className="inline h-3 w-3 align-[-1px]" />
+                </a>
+                .
+              </p>
             </div>
           )}
 
