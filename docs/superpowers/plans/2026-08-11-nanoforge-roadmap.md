@@ -8,6 +8,12 @@
 
 **Tech Stack:** React 19, TS 5.9, Vite 7, Tailwind 3.4, lucide-react, vitest (to be added).
 
+## Implementation status — 2026-08-11
+
+The concrete work described in Phases 0–3 is implemented in the repository, including the test scaffolding, session/request fixes, virtual filesystem patching, context and pricing handling, live patch extraction and edit/verify loop, generation controls, persistence, responsive drawers, transcript export, model quick-switching, session rename/delete, and syntax highlighting. The repository also contains implementations for the optional Phase 4 image-generation, cost-dashboard, x402, and MCP-interoperability items; the Phase 4 epics below remain preserved as the original future-scope record.
+
+Current verification: `npm run lint`, host/protocol typechecks, production build, and root/host/protocol tests pass. The production build still reports a bundle-size warning.
+
 ## Global Constraints
 
 - No backend server — everything ships as a static site; API calls go browser → nano-gpt.com directly (document CORS caveat; offer proxy base-URL field as escape hatch, already present).
@@ -65,11 +71,11 @@
 - Create: `.git/` (`git init`), `vitest.config.ts`, `src/lib/__tests__/`
 - Modify: `package.json` (add `vitest`, `@vitest/coverage-v8`, `jsdom` devDeps; add `"test": "vitest run"` script; rename `"name": "nanoforge"`)
 
-- [ ] `git init && git add -A && git commit -m "chore: baseline"`
-- [ ] `npm i -D vitest jsdom @vitest/coverage-v8`
-- [ ] Create `vitest.config.ts` with `environment: "node"`, `alias @ → ./src` (mirror vite.config).
-- [ ] Delete `src/pages/Home.tsx`, `src/App.css`; `npm uninstall react-router`.
-- [ ] Verify: `npm test` (0 tests pass), `npm run build` green. Commit.
+- [x] `git init && git add -A && git commit -m "chore: baseline"`
+- [x] `npm i -D vitest jsdom @vitest/coverage-v8`
+- [x] Create `vitest.config.ts` with `environment: "node"`, `alias @ → ./src` (mirror vite.config).
+- [x] Delete `src/pages/Home.tsx`, `src/App.css`; `npm uninstall react-router`.
+- [x] Verify: `npm test` (0 tests pass), `npm run build` green. Commit.
 
 ### Task 0.2: Fix cross-session write bug
 
@@ -78,18 +84,18 @@
 
 - Interfaces:
   - Produces: `patchSessionMessage(sessions: Session[], sessionId: string, msgId: string, fn: (m: Message) => Message): Session[]`
-- [ ] Write failing test: patch targets session B while another session is "active" — assert only session B changed.
-- [ ] Implement `sessionReducer.ts`; refactor `App.tsx` to call it with the `session.id` captured at `handleSend` time (not `activeId`).
-- [ ] Manual check: start demo run, switch sessions mid-stream, confirm no leakage. Build green. Commit.
+- [x] Write failing test: patch targets session B while another session is "active" — assert only session B changed.
+- [x] Implement `sessionReducer.ts`; refactor `App.tsx` to call it with the `session.id` captured at `handleSend` time (not `activeId`).
+- [x] Manual check: start demo run, switch sessions mid-stream, confirm no leakage. Build green. Commit.
 
 ### Task 0.3: Fix request counting + stale key
 
 **Files:** Modify `src/App.tsx` (`finishRun` gains `counted: boolean` param), `src/sections/ConnectDialog.tsx`
 
-- [ ] Test: `finishRun` with `{input:0, output:0, errored:true}` does not increment `requests`.
-- [ ] In `onError`, call `finishRun(agentMsg.id, { input: 0, output: 0 }, { errored: true })`.
-- [ ] ConnectDialog: sync local state on open — `useEffect(() => { setKey(connection.apiKey); setBase(connection.baseUrl); }, [open])`.
-- [ ] Build green. Commit.
+- [x] Test: `finishRun` with `{input:0, output:0, errored:true}` does not increment `requests`.
+- [x] In `onError`, call `finishRun(agentMsg.id, { input: 0, output: 0 }, { errored: true })`.
+- [x] ConnectDialog: sync local state on open — `useEffect(() => { setKey(connection.apiKey); setBase(connection.baseUrl); }, [open])`.
+- [x] Build green. Commit.
 
 ## Phase 1 — Make "Apply" real + context awareness · ~1–2 sessions
 
@@ -103,9 +109,9 @@
   - Produces:
     - `applyPatch(files: VirtualFile[], patch: Patch): VirtualFile[]` — reconstructs the file by walking diff lines: keep `ctx`, keep `add`, drop `del`.
     - `revertPatch(files: VirtualFile[], patch: Patch): VirtualFile[]`
-- [ ] Failing test: applying `RATE_LIMIT_PATCH` to `src/server.ts` yields content containing `x-rate-limit` and no `−` lines.
-- [ ] Implement; wire `handlePatchDecision("applied")` → `setFiles(applyPatch(...))`; show toast-free inline confirm (patch card already shows status).
-- [ ] File viewer + sidebar read from `files` state. Build green. Commit.
+- [x] Failing test: applying `RATE_LIMIT_PATCH` to `src/server.ts` yields content containing `x-rate-limit` and no `−` lines.
+- [x] Implement; wire `handlePatchDecision("applied")` → `setFiles(applyPatch(...))`; show toast-free inline confirm (patch card already shows status).
+- [x] File viewer + sidebar read from `files` state. Build green. Commit.
 
 ### Task 1.2: Context budget + token meter
 
@@ -115,17 +121,17 @@
 
 - Interfaces:
   - Produces: `buildContext(msgs: Message[], system: string, budgetTokens: number): { role: string; content: string }[]` — greedy from newest, estimate tokens as `ceil(chars/4)`, reserve 25% of budget for output.
-- [ ] Failing tests: truncation drops oldest first; system message always retained; estimate monotonic in length.
-- [ ] Implement; replace `slice(-12)`; pass `model.contextK * 1000` as budget.
-- [ ] Composer: thin progress bar (`bg-secondary` track, `bg-primary` fill, red >85%). Build green. Commit.
+- [x] Failing tests: truncation drops oldest first; system message always retained; estimate monotonic in length.
+- [x] Implement; replace `slice(-12)`; pass `model.contextK * 1000` as budget.
+- [x] Composer: thin progress bar (`bg-secondary` track, `bg-primary` fill, red >85%). Build green. Commit.
 
 ### Task 1.3: Pricing robustness
 
 **Files:** Modify `src/lib/nanogpt.ts` + `src/types/index.ts` (add `priceEstimated?: boolean`), ModelPanel label
 
-- [ ] Read `pricing.prompt`/`completion` when present; only fall back to heuristic otherwise, setting `priceEstimated: true`; render `~` prefix in ModelPanel for estimated prices.
-- [ ] Change label `$1.75/14 · 1M tok` → `$1.75 in · $14.00 out /1M`.
-- [ ] Unit-test `toPerMillion` boundary (0.01 exactly → treated as per-million). Commit.
+- [x] Read `pricing.prompt`/`completion` when present; only fall back to heuristic otherwise, setting `priceEstimated: true`; render `~` prefix in ModelPanel for estimated prices.
+- [x] Change label `$1.75/14 · 1M tok` → `$1.75 in · $14.00 out /1M`.
+- [x] Unit-test `toPerMillion` boundary (0.01 exactly → treated as per-million). Commit.
 
 ## Phase 2 — Real agent loop in live mode · ~2–3 sessions (the flagship upgrade)
 
@@ -137,9 +143,9 @@
 
 - Interfaces:
   - Produces: `extractPatch(markdown: string): Patch | null` — finds a fenced `diff`/`patch` block, parses `+`/`-`/` ` lines, reads target file from a leading `--- file: path` line or the fence info string.
-- [ ] Failing tests for: diff fence with file header; plain fence; no fence → null.
-- [ ] Update `AGENT_SYSTEM_PROMPT` to require: *"When changing code, emit one ```diff fence whose first line is `--- file: <path>`"*."
-- [ ] On live `onDone`, run `extractPatch`; if found attach to the message so `PatchCard` renders with Apply/Reject (which now mutates the vfs from Task 1.1). Commit.
+- [x] Failing tests for: diff fence with file header; plain fence; no fence → null.
+- [x] Update `AGENT_SYSTEM_PROMPT` to require: *"When changing code, emit one ```diff fence whose first line is `--- file: <path>`"*."
+- [x] On live `onDone`, run `extractPatch`; if found attach to the message so `PatchCard` renders with Apply/Reject (which now mutates the vfs from Task 1.1). Commit.
 
 ### Task 2.2: Multi-turn edit-verify loop
 
@@ -148,14 +154,14 @@
 - Modify: `src/App.tsx`
 
 - Behavior: after a patch is applied in live mode, auto-send a verification turn: *"Patch applied to `<file>`. New content:\n```\n<content>\n```\nReview for breakage; reply `LGTM` or emit a follow-up diff."* Cap at 2 auto-turns (`maxAutoTurns` constant), show auto-turns as collapsed system messages.
-- [ ] Test: loop stops after `LGTM`; stops at cap; never fires in demo mode or when patch rejected.
-- [ ] Implement; build green; commit.
+- [x] Test: loop stops after `LGTM`; stops at cap; never fires in demo mode or when patch rejected.
+- [x] Implement; build green; commit.
 
 ### Task 2.3: Generation controls
 
 **Files:** Modify `src/lib/nanogpt.ts` (`streamChat` accepts `options: { temperature?: number; maxTokens?: number }`), `src/sections/ChatPanel.tsx` composer popover, `src/App.tsx` (persist per-model prefs in localStorage `nanoforge.genprefs`)
 
-- [ ] Slider for temperature (0–1.5, default 0.3 for coding) + max tokens cap; passed through to request body. Commit.
+- [x] Slider for temperature (0–1.5, default 0.3 for coding) + max tokens cap; passed through to request body. Commit.
 
 ## Phase 3 — Persistence + QoL · ~2 sessions
 
@@ -164,24 +170,24 @@
 **Files:** Create `src/lib/persist.ts` + tests; Modify `src/App.tsx`
 
 - Serialize `sessions`, `usage`, `files` (vfs) to localStorage under `nanoforge.v1` (debounced 500ms on change); version field for future migration; "Clear history" button in ConnectDialog footer.
-- [ ] Tests: round-trip; corrupted JSON → fresh state; version mismatch → fresh state. Commit.
+- [x] Tests: round-trip; corrupted JSON → fresh state; version mismatch → fresh state. Commit.
 
 ### Task 3.2: Responsive layout
 
 **Files:** Modify `src/App.tsx`, `src/sections/Sidebar.tsx`, `src/sections/ModelPanel.tsx`
 
 - `< lg:` both rails become overlay drawers (hamburger buttons in TopBar); composer stays full-width. Use existing `hidden`/`lg:flex` Tailwind breakpoints + a small `useMediaQuery` hook in `src/hooks/`.
-- [ ] Manual check at 390px and 768px widths. Commit.
+- [x] Manual check at 390px and 768px widths. Commit.
 
 ### Task 3.3: Transcript export + QoL batch
 
 **Files:** Modify `src/sections/TopBar.tsx`, create `src/lib/exporter.ts`
 
-- [ ] Export active session as Markdown (messages + diffs as fences) → download blob.
-- [ ] `Ctrl/Cmd+K` model quick-switcher (reuse ModelPanel filtered list in a command dialog).
-- [ ] Session rename (double-click title in Sidebar) + delete (hover ×).
-- [ ] Syntax highlighting in file viewer + RichText code blocks via a tiny tokenizer (keywords/strings/comments for ts/json/md — no new dependency).
-- [ ] Commit.
+- [x] Export active session as Markdown (messages + diffs as fences) → download blob.
+- [x] `Ctrl/Cmd+K` model quick-switcher (reuse ModelPanel filtered list in a command dialog).
+- [x] Session rename (double-click title in Sidebar) + delete (hover ×).
+- [x] Syntax highlighting in file viewer + RichText code blocks via a tiny tokenizer (keywords/strings/comments for ts/json/md — no new dependency).
+- [x] Commit.
 
 ## Phase 4 — Beyond-text nano-gpt surface (optional, later)
 

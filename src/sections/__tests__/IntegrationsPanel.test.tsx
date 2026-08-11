@@ -72,12 +72,14 @@ const mcpServers: McpServerRow[] = [
 
 function renderPanel(overrides: Partial<IntegrationsPanelProps> = {}) {
   const props: IntegrationsPanelProps = {
+    plugins: [],
     rulesPacks,
     skills,
     mcpServers,
     onToggleRulesPack: vi.fn(),
     onToggleSkill: vi.fn(),
     onToggleMcpServer: vi.fn(),
+    onTogglePlugin: vi.fn(),
     ...overrides,
   };
   render(<IntegrationsPanel {...props} />);
@@ -91,11 +93,19 @@ const rowOf = (id: string) => {
 };
 
 describe("IntegrationsPanel", () => {
-  it("renders the three sections with rows, health, and last error", () => {
+  it("renders the tabs and can navigate between sections", async () => {
+    const user = userEvent.setup();
     renderPanel();
+    
+    // Default tab is plugins
+    expect(screen.getByRole("tab", { name: "Plugins" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Skills" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "MCP Servers" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Governance Rules" })).toBeInTheDocument();
+
+    // Click Governance Rules tab
+    await user.click(screen.getByRole("tab", { name: "Governance Rules" }));
     expect(screen.getByRole("region", { name: "Rules packs" })).toBeInTheDocument();
-    expect(screen.getByRole("region", { name: "Skills" })).toBeInTheDocument();
-    expect(screen.getByRole("region", { name: "MCP servers" })).toBeInTheDocument();
 
     const rules = rowOf("webapp");
     expect(rules.getByText("Webapp rules")).toBeInTheDocument();
@@ -103,6 +113,8 @@ describe("IntegrationsPanel", () => {
     expect(rules.getByText("project")).toBeInTheDocument();
     expect(rules.getByText(/^sha256:/)).toBeInTheDocument();
 
+    // Click MCP Servers tab
+    await user.click(screen.getByRole("tab", { name: "MCP Servers" }));
     const mcp = rowOf("github");
     expect(mcp.getByText(/@modelcontextprotocol\/server-github/)).toBeInTheDocument();
     expect(mcp.getByText("mcp.github.create_issue")).toBeInTheDocument();
@@ -111,6 +123,7 @@ describe("IntegrationsPanel", () => {
   it("toggles a rules pack via callback", async () => {
     const user = userEvent.setup();
     const props = renderPanel();
+    await user.click(screen.getByRole("tab", { name: "Governance Rules" }));
     await user.click(rowOf("webapp").getByRole("switch", { name: "enable Webapp rules" }));
     expect(props.onToggleRulesPack).toHaveBeenCalledWith("webapp", true);
   });
@@ -118,6 +131,7 @@ describe("IntegrationsPanel", () => {
   it("skill enable switch stays disabled until instructions are viewed", async () => {
     const user = userEvent.setup();
     const props = renderPanel();
+    await user.click(screen.getByRole("tab", { name: "Skills" }));
     const row = rowOf("pr-review");
     const toggle = row.getByRole("switch", { name: "enable PR Review" });
 
@@ -137,6 +151,7 @@ describe("IntegrationsPanel", () => {
   it("skill with invalid hash can never be enabled, even after viewing instructions", async () => {
     const user = userEvent.setup();
     const props = renderPanel();
+    await user.click(screen.getByRole("tab", { name: "Skills" }));
     const row = rowOf("tampered");
     await user.click(row.getByRole("button", { name: "view instructions" }));
     expect(row.getByText("hash mismatch")).toBeInTheDocument();
@@ -144,8 +159,10 @@ describe("IntegrationsPanel", () => {
     expect(props.onToggleSkill).not.toHaveBeenCalled();
   });
 
-  it("renders secret references by name only — no secret-looking value reaches the DOM", () => {
+  it("renders secret references by name only — no secret-looking value reaches the DOM", async () => {
+    const user = userEvent.setup();
     renderPanel();
+    await user.click(screen.getByRole("tab", { name: "MCP Servers" }));
     const panel = screen.getByTestId("integrations-panel");
 
     // the opaque reference name IS shown
@@ -168,12 +185,15 @@ describe("IntegrationsPanel", () => {
   it("mcp toggle callback fires with the server id", async () => {
     const user = userEvent.setup();
     const props = renderPanel();
+    await user.click(screen.getByRole("tab", { name: "MCP Servers" }));
     await user.click(rowOf("github").getByRole("switch", { name: "enable GitHub MCP" }));
     expect(props.onToggleMcpServer).toHaveBeenCalledWith("github", false);
   });
 
-  it("renders empty sections cleanly", () => {
+  it("renders empty sections cleanly", async () => {
+    const user = userEvent.setup();
     renderPanel({ rulesPacks: [], skills: [], mcpServers: [] });
-    expect(screen.getAllByText("none configured")).toHaveLength(3);
+    await user.click(screen.getByRole("tab", { name: "Governance Rules" }));
+    expect(screen.getByText("none configured")).toBeInTheDocument();
   });
 });

@@ -115,6 +115,36 @@ export function getServer(
 }
 
 /**
+ * Load multiple registry files (e.g. global and plugin-level) and merge them.
+ * Duplicate server names are rejected across all files (first one wins).
+ */
+export async function loadMcpRegistries(filePaths: string[]): Promise<LoadMcpRegistryResult> {
+  const mergedRegistry: McpRegistry = { servers: [], sourcePath: filePaths.join(",") };
+  const allErrors: McpRegistryError[] = [];
+  const seen = new Set<string>();
+
+  for (const filePath of filePaths) {
+    const { registry, errors } = await loadMcpRegistry(filePath);
+    allErrors.push(...errors);
+    
+    for (const server of registry.servers) {
+      if (seen.has(server.name)) {
+        allErrors.push({
+          file: filePath,
+          kind: "validation",
+          message: `duplicate server name "${server.name}" across registries`,
+        });
+        continue;
+      }
+      seen.add(server.name);
+      mergedRegistry.servers.push(server);
+    }
+  }
+
+  return { registry: mergedRegistry, errors: allErrors };
+}
+
+/**
  * Exact-match command approval. A launch command is approved only when it is
  * byte-for-byte identical to the command stored in the registry entry. Any
  * difference — different path, different spelling, symlinked alias — is

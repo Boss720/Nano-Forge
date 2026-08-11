@@ -32,6 +32,10 @@ export type SecretReference = z.infer<typeof secretReferenceSchema>;
 export const mcpServerDefinitionSchema = z.object({
   /** kebab-case server identifier; used in tool namespacing `mcp.<name>.<tool>`. */
   name: z.string().regex(/^[a-z0-9][a-z0-9-]*$/, "name must be kebab-case"),
+  displayName: z.string().optional(),
+  icon: z.string().optional(),
+  version: z.string().optional(),
+  transport: z.enum(["stdio", "sse"]).default("stdio"),
   /**
    * The approved executable: an absolute path or a PATH-resolved executable.
    * Exact-match checked against the registry at spawn time — a launch whose
@@ -68,6 +72,10 @@ export type McpHealth = "unknown" | "ok" | "error";
  */
 export interface McpServerStatus {
   name: string;
+  displayName?: string;
+  icon?: string;
+  version?: string;
+  transport: "stdio" | "sse";
   enabled: boolean;
   health: McpHealth;
   /** Last error string, if any. Never contains secret values. */
@@ -88,6 +96,10 @@ export function toServerStatus(
 ): McpServerStatus {
   return {
     name: def.name,
+    displayName: def.displayName,
+    icon: def.icon,
+    version: def.version,
+    transport: def.transport,
     enabled: def.enabled,
     health,
     lastError,

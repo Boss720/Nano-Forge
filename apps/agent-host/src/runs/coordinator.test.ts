@@ -18,7 +18,6 @@ import type {
   TerminalJobSpec,
 } from "../terminal/types";
 import type {
-  ChatRequest,
   ProviderAdapter,
   ProviderDelta,
 } from "../providers/types";
@@ -485,7 +484,9 @@ describe("RunCoordinator", () => {
 
     // Pause synchronously inside the step.succeeded emit — before the drive
     // loop regains control and could start s2.
-    let handle!: ReturnType<typeof coordinator.submitRun>;
+    // The subscription needs the handle before submitRun returns.
+    // eslint-disable-next-line prefer-const
+    let handle: ReturnType<typeof coordinator.submitRun>;
     let pausedOnce = false;
     eventLog.subscribeAll((e) => {
       if (e.type === "step.succeeded" && !pausedOnce) {

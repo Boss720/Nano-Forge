@@ -60,6 +60,41 @@ export const planSubmitSchema = z.object({
 });
 
 /* ------------------------------------------------------------------------ */
+/* Workspace Types                                                          */
+/* ------------------------------------------------------------------------ */
+
+export const dirEntrySchema = z.object({
+  name: z.string(),
+  isDir: z.boolean(),
+  size: z.number().optional(),
+  modified: z.string().optional(),
+});
+export type DirEntry = z.infer<typeof dirEntrySchema>;
+
+export const fileStatSchema = z.object({
+  size: z.number(),
+  modified: z.string(),
+  isDir: z.boolean(),
+  isFile: z.boolean(),
+});
+export type FileStat = z.infer<typeof fileStatSchema>;
+
+export const searchMatchSchema = z.object({
+  file: z.string(),
+  line: z.number(),
+  column: z.number(),
+  text: z.string(),
+  matchText: z.string(),
+});
+export type SearchMatch = z.infer<typeof searchMatchSchema>;
+
+export const gitFileStatusSchema = z.object({
+  path: z.string(),
+  status: z.enum(["M", "A", "D", "R", "?", "!"]),
+});
+export type GitFileStatus = z.infer<typeof gitFileStatusSchema>;
+
+/* ------------------------------------------------------------------------ */
 /* Client -> Host                                                           */
 /* ------------------------------------------------------------------------ */
 
@@ -86,6 +121,23 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
     approved: z.boolean(),
     reason: z.string().max(4096).optional(),
   }),
+  // Workspace RPCs
+  z.object({ type: z.literal("workspace.readDir"), requestId: idSchema, path: z.string() }),
+  z.object({ type: z.literal("workspace.readFile"), requestId: idSchema, path: z.string() }),
+  z.object({ type: z.literal("workspace.writeFile"), requestId: idSchema, path: z.string(), content: z.string() }),
+  z.object({ type: z.literal("workspace.stat"), requestId: idSchema, path: z.string() }),
+  z.object({
+    type: z.literal("workspace.search"),
+    requestId: idSchema,
+    query: z.string(),
+    options: z.object({
+      caseSensitive: z.boolean().optional(),
+      includes: z.array(z.string()).optional(),
+      maxResults: z.number().optional(),
+    }).optional(),
+  }),
+  z.object({ type: z.literal("workspace.gitStatus"), requestId: idSchema }),
+  z.object({ type: z.literal("workspace.watch"), enabled: z.boolean() }),
 ]);
 export type ClientMessage = z.infer<typeof clientMessageSchema>;
 export type ClientMessageType = ClientMessage["type"];
@@ -145,6 +197,14 @@ export const hostMessageSchema = z.discriminatedUnion("type", [
     runId: idSchema.optional(),
     at: atSchema.optional(),
   }),
+  // Workspace RPC Results
+  z.object({ type: z.literal("workspace.readDir.result"), requestId: idSchema, path: z.string(), entries: z.array(dirEntrySchema) }),
+  z.object({ type: z.literal("workspace.readFile.result"), requestId: idSchema, path: z.string(), content: z.string(), language: z.string(), size: z.number() }),
+  z.object({ type: z.literal("workspace.writeFile.result"), requestId: idSchema, path: z.string(), success: z.boolean() }),
+  z.object({ type: z.literal("workspace.stat.result"), requestId: idSchema, path: z.string(), stat: fileStatSchema }),
+  z.object({ type: z.literal("workspace.search.result"), requestId: idSchema, matches: z.array(searchMatchSchema) }),
+  z.object({ type: z.literal("workspace.gitStatus.result"), requestId: idSchema, files: z.array(gitFileStatusSchema) }),
+  z.object({ type: z.literal("workspace.fileChanged"), path: z.string(), changeType: z.enum(["created", "modified", "deleted"]) }),
 ]);
 export type HostMessage = z.infer<typeof hostMessageSchema>;
 export type HostMessageType = HostMessage["type"];

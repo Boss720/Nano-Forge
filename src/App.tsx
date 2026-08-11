@@ -692,12 +692,14 @@ export default function App({ hostSession }: { hostSession?: UseHostSessionOptio
             </DialogDescription>
           </DialogHeader>
           <IntegrationsPanel
+            plugins={[]}
             rulesPacks={host.integrations.rulesPacks}
             skills={host.integrations.skills}
             mcpServers={host.integrations.mcpServers}
             onToggleRulesPack={host.toggleRulesPack}
             onToggleSkill={host.toggleSkill}
             onToggleMcpServer={host.toggleMcpServer}
+            onTogglePlugin={() => {}}
           />
         </DialogContent>
       </Dialog>

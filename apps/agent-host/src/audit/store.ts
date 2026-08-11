@@ -330,9 +330,6 @@ export class AuditStore {
 
 const payloadStr = (e: AuditEventRecord, key: string): string =>
   typeof e.payload[key] === "string" ? (e.payload[key] as string) : "";
-const payloadNum = (e: AuditEventRecord, key: string): number | undefined =>
-  typeof e.payload[key] === "number" ? (e.payload[key] as number) : undefined;
-
 function renderMarkdown(
   run: AuditRunRecord,
   events: AuditEventRecord[],

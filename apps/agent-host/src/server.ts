@@ -22,6 +22,7 @@ import { pathToFileURL } from "node:url";
 import Fastify, { type FastifyInstance } from "fastify";
 import websocket from "@fastify/websocket";
 import type { WebSocket } from "ws";
+import { attachAgentSession, type AgentSessionOptions } from "./session";
 import {
   decodeClientMessage,
   type HostMessage,
@@ -90,6 +91,17 @@ export function createTokenStore(maxOutstanding = 64): TokenStore {
 /* Host factory                                                             */
 /* ------------------------------------------------------------------------ */
 
+/**
+ * Protocol attachment: installs the message loop on an authenticated socket.
+ * The default is the wave-1 scaffold ({@link attachAgentProtocol}); the
+ * Task 20 composition (`composition.ts`) injects a RunCoordinator-backed
+ * session through this seam instead.
+ */
+export type ProtocolAttachment = (
+  socket: WebSocket,
+  context: { hostId: string },
+) => void;
+
 export interface HostOptions {
   /** Port to bind; 0 (default) picks an ephemeral port. */
   port?: number;
@@ -97,6 +109,10 @@ export interface HostOptions {
   token?: string;
   /** Enable Fastify's logger. */
   logger?: boolean;
+  /** Authenticated-socket handler; defaults to {@link attachAgentProtocol}. */
+  attach?: ProtocolAttachment;
+  /** Configuration for the real coordinator/workspace session. */
+  session?: AgentSessionOptions;
 }
 
 export interface HostHandle {
@@ -136,7 +152,11 @@ export async function createHost(options: HostOptions = {}): Promise<HostHandle>
     }
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
-    attachAgentProtocol(socket, { hostId });
+    if (options.attach) {
+      options.attach(socket, { hostId });
+    } else {
+      attachAgentSession(socket, { hostId }, options.session);
+    }
   });
 
   await app.listen({ host: "127.0.0.1", port: options.port ?? 0 });

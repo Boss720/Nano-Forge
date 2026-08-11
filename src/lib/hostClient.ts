@@ -21,6 +21,7 @@
  * a tool execution frame; execution is the host's job after policy + grant.
  */
 import type { ExecutionPlan, PlanUIState, ToolRunState } from "@/types";
+import type { DirEntry, SearchMatch, GitFileStatus } from "@/types/workspace";
 
 /* ------------------------------------------------------------------ */
 /* Wire message shapes                                                */
@@ -31,7 +32,10 @@ export type HostClientRequestType =
   | "approval.grant"
   | "approval.deny"
   | "run.pause"
-  | "run.cancel";
+  | "run.cancel"
+  | "workspace.readDir"
+  | "workspace.search"
+  | "workspace.gitStatus";
 
 export interface HostClientRequest {
   type: HostClientRequestType;
@@ -88,7 +92,11 @@ export type HostMessage =
   | ToolApprovalRequiredMessage
   | ToolOutputMessage
   | RunEventMessage
-  | HostErrorMessage;
+  | HostErrorMessage
+  | { type: "workspace.readDir.result"; requestId: string; path: string; entries: DirEntry[] }
+  | { type: "workspace.search.result"; requestId: string; matches: SearchMatch[] }
+  | { type: "workspace.gitStatus.result"; requestId: string; files: GitFileStatus[] }
+  | { type: "workspace.fileChanged"; path: string; changeType: "created" | "modified" | "deleted" };
 
 /** Any host frame may carry a requestId correlating it to a client request. */
 type WithRequestId = { requestId?: string };
@@ -151,6 +159,10 @@ const HOST_MESSAGE_TYPES = new Set([
   "tool.output",
   "run.event",
   "error",
+  "workspace.readDir.result",
+  "workspace.search.result",
+  "workspace.gitStatus.result",
+  "workspace.fileChanged",
 ]);
 
 const isRecord = (v: unknown): v is Record<string, unknown> =>
@@ -200,6 +212,18 @@ export function parseHostMessage(raw: unknown): (HostMessage & WithRequestId) | 
     case "error":
       if (!isString(data.code) || !isString(data.message)) return null;
       return { ...(data as unknown as HostErrorMessage), requestId };
+    case "workspace.readDir.result":
+      if (!isString(data.requestId) || !isString(data.path) || !Array.isArray(data.entries)) return null;
+      return { ...(data as Record<string, unknown>), requestId } as never;
+    case "workspace.search.result":
+      if (!isString(data.requestId) || !Array.isArray(data.matches)) return null;
+      return { ...(data as Record<string, unknown>), requestId } as never;
+    case "workspace.gitStatus.result":
+      if (!isString(data.requestId) || !Array.isArray(data.files)) return null;
+      return { ...(data as Record<string, unknown>), requestId } as never;
+    case "workspace.fileChanged":
+      if (!isString(data.path) || !isString(data.changeType)) return null;
+      return { ...(data as Record<string, unknown>), requestId } as never;
     default:
       return null;
   }
@@ -208,7 +232,7 @@ export function parseHostMessage(raw: unknown): (HostMessage & WithRequestId) | 
 export type HostEventHandler = (msg: HostMessage) => void;
 
 interface PendingRequest {
-  resolve: () => void;
+  resolve: (value?: any) => void;
   reject: (err: Error) => void;
 }
 
@@ -278,6 +302,13 @@ export class HostClient {
     return this.request({ type: "run.cancel", runId });
   }
 
+  readDir(path = ""): Promise<DirEntry[]> { return this.requestResult({ type: "workspace.readDir", path }).then((m) => (m as { entries: DirEntry[] }).entries); }
+  search(query: string, options?: { caseSensitive?: boolean; includes?: string[]; maxResults?: number }): Promise<SearchMatch[]> {
+    return this.requestResult({ type: "workspace.search", query, options }).then((m) => (m as { matches: SearchMatch[] }).matches);
+  }
+  gitStatus(): Promise<GitFileStatus[]> { return this.requestResult({ type: "workspace.gitStatus" }).then((m) => (m as { files: GitFileStatus[] }).files); }
+  writeFile(path: string, content: string): Promise<void> { return this.request({ type: "workspace.writeFile", path, content } as never); }
+
   /** Terminate the session. No reconnect — the token is single-use. */
   close(): void {
     this.closed = true;
@@ -307,6 +338,15 @@ export class HostClient {
     });
   }
 
+  private requestResult(msg: Record<string, unknown>): Promise<unknown> {
+    if (!this.ws || this.ws.readyState !== WS_OPEN) return Promise.reject(new HostConnectionError("not connected to agent host"));
+    const requestId = `req-${++this.seq}`;
+    return new Promise((resolve, reject) => {
+      this.pending.set(requestId, { resolve, reject });
+      this.ws!.send(JSON.stringify({ ...msg, requestId }));
+    });
+  }
+
   private handleFrame(raw: unknown): void {
     const msg = parseHostMessage(typeof raw === "string" ? raw : String(raw));
     if (!msg) return; // untrusted/malformed frame: drop silently
@@ -319,7 +359,7 @@ export class HostClient {
         if (msg.type === "error") {
           p.reject(new HostConnectionError(`${msg.code}: ${msg.message}`));
         } else {
-          p.resolve();
+          p.resolve(msg);
         }
       }
     }

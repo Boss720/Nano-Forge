@@ -39,6 +39,7 @@ function makeDef(overrides: Partial<McpServerDefinition> = {}): McpServerDefinit
     env: {},
     tools: ["echo"],
     enabled: true,
+    transport: "stdio",
     ...overrides,
   };
 }
