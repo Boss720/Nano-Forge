@@ -93,3 +93,21 @@ export interface VirtualFile {
   language: string;
   content: string;
 }
+
+/**
+ * Final roadmap phase (cost dashboard): one immutable record per finished
+ * run. Persisted alongside the aggregate `UsageTotals` so per-model and
+ * per-day breakdowns stay available after restart. Helpers live in
+ * `src/lib/usageLog.ts`.
+ */
+export interface UsageRun {
+  id: string;
+  /** Epoch milliseconds when the run finished. */
+  ts: number;
+  modelId: string;
+  input: number;
+  output: number;
+  costUsd: number;
+  /** Errored runs are recorded for audit but are not billable requests. */
+  errored?: boolean;
+}

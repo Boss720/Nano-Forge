@@ -1,4 +1,4 @@
-import type { Session, UsageTotals, VirtualFile } from "@/types";
+import type { Session, UsageRun, UsageTotals, VirtualFile } from "@/types";
 
 /**
  * localStorage persistence (roadmap Task 3.1).
@@ -24,6 +24,13 @@ export interface PersistedState {
   sessions: Session[];
   usage: UsageTotals;
   files: VirtualFile[];
+  /**
+   * Final roadmap phase (cost dashboard): per-run usage records. Optional
+   * and additive — `STATE_VERSION` stays 1, and saves written before this
+   * field existed load with `runs === undefined` (NOT an empty array), so
+   * callers should default with `loaded.runs ?? []`.
+   */
+  runs?: UsageRun[];
 }
 
 /** The subset of the DOM Storage API we rely on. */
@@ -46,7 +53,9 @@ function isPersistedState(value: unknown): value is PersistedState {
     Array.isArray(v.sessions) &&
     Array.isArray(v.files) &&
     typeof v.usage === "object" &&
-    v.usage !== null
+    v.usage !== null &&
+    // `runs` is optional, but when present it must be an array.
+    (v.runs === undefined || Array.isArray(v.runs))
   );
 }
 

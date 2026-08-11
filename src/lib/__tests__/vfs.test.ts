@@ -104,3 +104,186 @@ describe("revertPatch", () => {
     expect(revertPatch(VIRTUAL_PROJECT, ghost)).toBe(VIRTUAL_PROJECT);
   });
 });
+
+/**
+ * Partial-diff splicing (Task B): when the diff's ctx lines anchor in the
+ * current file content, only the matched region is replaced and the rest of
+ * the file survives byte-for-byte. Rebuild semantics remain as fallback.
+ */
+describe("partial diff splicing", () => {
+  const FILE = {
+    path: "src/app.ts",
+    language: "typescript",
+    content: [
+      "// header",
+      "const a = 1;",
+      "const b = 2;",
+      "const c = 3;",
+      "const d = 4;",
+      "// footer",
+      "",
+    ].join("\n"), // trailing newline, like the catalog files
+  };
+  const files = [FILE];
+
+  function patched(patch: Patch): string {
+    const next = applyPatch(files, patch);
+    return next.find((f) => f.path === FILE.path)!.content;
+  }
+  function reverted(patch: Patch, base = files): string {
+    const next = revertPatch(base, patch);
+    return next.find((f) => f.path === FILE.path)!.content;
+  }
+
+  it("mid-file partial diff leaves head and tail intact", () => {
+    const patch: Patch = {
+      file: FILE.path,
+      status: "pending",
+      lines: [
+        { type: "ctx", text: "const b = 2;" },
+        { type: "del", text: "const c = 3;" },
+        { type: "add", text: "const c = 30;" },
+        { type: "add", text: "const c2 = 31;" },
+        { type: "ctx", text: "const d = 4;" },
+      ],
+    };
+    const content = patched(patch);
+    expect(content).toBe(
+      ["// header", "const a = 1;", "const b = 2;", "const c = 30;", "const c2 = 31;", "const d = 4;", "// footer", ""].join("\n"),
+    );
+    expect(content.startsWith("// header\nconst a = 1;")).toBe(true);
+    expect(content.endsWith("// footer\n")).toBe(true);
+  });
+
+  it("partial diff at file start inserts before the first anchor", () => {
+    const patch: Patch = {
+      file: FILE.path,
+      status: "pending",
+      lines: [
+        { type: "add", text: 'import { x } from "./x.js";' },
+        { type: "ctx", text: "// header" },
+        { type: "ctx", text: "const a = 1;" },
+      ],
+    };
+    const content = patched(patch);
+    expect(content).toBe(
+      ['import { x } from "./x.js";', "// header", "const a = 1;", "const b = 2;", "const c = 3;", "const d = 4;", "// footer", ""].join("\n"),
+    );
+  });
+
+  it("partial diff at file end appends after the last anchor", () => {
+    const patch: Patch = {
+      file: FILE.path,
+      status: "pending",
+      lines: [
+        { type: "ctx", text: "const d = 4;" },
+        { type: "ctx", text: "// footer" },
+        { type: "add", text: "export {}; // appended" },
+      ],
+    };
+    const content = patched(patch);
+    expect(content.startsWith("// header\nconst a = 1;")).toBe(true);
+    expect(content).toContain("// footer\nexport {}; // appended");
+    // trailing-newline convention of the original file is preserved
+    expect(content.endsWith("\n")).toBe(true);
+  });
+
+  it("ambiguous anchors: the first (topmost) match site wins", () => {
+    const dup = {
+      path: "src/dup.ts",
+      language: "typescript",
+      content: ["same();", "same();", "same();"].join("\n"),
+    };
+    const patch: Patch = {
+      file: dup.path,
+      status: "pending",
+      lines: [
+        { type: "ctx", text: "same();" },
+        { type: "add", text: "// inserted" },
+        { type: "ctx", text: "same();" },
+      ],
+    };
+    const next = applyPatch([dup], patch);
+    expect(next[0].content).toBe(["same();", "// inserted", "same();", "same();"].join("\n"));
+  });
+
+  it("falls back to rebuild semantics when ctx anchors do not match the file", () => {
+    const patch: Patch = {
+      file: FILE.path,
+      status: "pending",
+      lines: [
+        { type: "ctx", text: "totally unrelated content" },
+        { type: "add", text: "brand new line" },
+        { type: "del", text: "ghost line" },
+      ],
+    };
+    const content = patched(patch);
+    // Rebuild: ctx + add only — head/tail of the original file are gone.
+    expect(content).toBe("totally unrelated content\nbrand new line\n");
+  });
+
+  it("falls back to rebuild semantics for diffs with no ctx lines at all", () => {
+    const patch: Patch = {
+      file: FILE.path,
+      status: "pending",
+      lines: [
+        { type: "del", text: "old" },
+        { type: "add", text: "new-a" },
+        { type: "add", text: "new-b" },
+      ],
+    };
+    expect(patched(patch)).toBe("new-a\nnew-b\n");
+    expect(reverted(patch)).toBe("old\n");
+  });
+
+  it("revert splices the same region (inverse) on a fresh file", () => {
+    const patch: Patch = {
+      file: FILE.path,
+      status: "pending",
+      lines: [
+        { type: "ctx", text: "const b = 2;" },
+        { type: "del", text: "const c = 3;" },
+        { type: "add", text: "const c = 30;" },
+        { type: "ctx", text: "const d = 4;" },
+      ],
+    };
+    // Reverting the untouched file keeps head/tail and restores del lines.
+    expect(reverted(patch)).toBe(FILE.content);
+  });
+
+  it("apply then revert round-trips back to the exact original content", () => {
+    const patch: Patch = {
+      file: FILE.path,
+      status: "pending",
+      lines: [
+        { type: "ctx", text: "const b = 2;" },
+        { type: "del", text: "const c = 3;" },
+        { type: "add", text: "const c = 30;" },
+        { type: "add", text: "const extra = true;" },
+        { type: "ctx", text: "const d = 4;" },
+      ],
+    };
+    const applied = applyPatch(files, patch);
+    expect(applied[0].content).not.toBe(FILE.content);
+    const restored = revertPatch(applied, patch);
+    expect(restored[0].content).toBe(FILE.content);
+  });
+
+  it("the RATE_LIMIT patch (partial diff of catalog server.ts) now preserves the file tail", () => {
+    const next = applyPatch(VIRTUAL_PROJECT, PATCH);
+    const content = contentOf(next, "src/server.ts");
+    // Previously truncated by rebuild semantics; splice keeps the tail.
+    expect(content).toContain("server.listen(PORT, () => {");
+    expect(content).toContain("res.writeHead(404);");
+    // Revert restores the deleted line and keeps the spliced tail too.
+    // (Byte-exact equality with the catalog original is NOT expected: the
+    // demo diff itself is asymmetric — it carries both `del ""` and
+    // `add ""` for the same blank line — so the inverse reinserts one extra
+    // empty line. Faithful minimal diffs round-trip exactly, as shown by the
+    // round-trip tests above.)
+    const restored = contentOf(revertPatch(next, PATCH), "src/server.ts");
+    expect(restored).toContain(DELETED_LINE);
+    expect(restored).not.toContain(ADDED_LINE);
+    expect(restored).toContain("server.listen(PORT, () => {");
+  });
+});

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Session, UsageTotals, VirtualFile } from "@/types";
+import type { Session, UsageRun, UsageTotals, VirtualFile } from "@/types";
 import {
   createDebouncedSaver,
   loadState,
@@ -94,6 +94,51 @@ describe("saveState / loadState round-trip", () => {
     };
     expect(loadState(broken)).toBeNull();
     expect(saveState(makeState(), broken)).toBe(false);
+  });
+});
+
+describe("persisted runs (cost dashboard, additive v1 field)", () => {
+  const runs: UsageRun[] = [
+    { id: "r1", ts: 1720000001000, modelId: "gpt-nano", input: 100, output: 40, costUsd: 0.001 },
+    { id: "r2", ts: 1720000002000, modelId: "gpt-nano", input: 5, output: 0, costUsd: 0.0001, errored: true },
+  ];
+
+  it("round-trips runs through save/load", () => {
+    const storage = makeStorage();
+    const state = { ...makeState(), runs };
+    expect(saveState(state, storage)).toBe(true);
+    const loaded = loadState(storage);
+    expect(loaded).toEqual({ version: 1, ...state });
+    expect(loaded?.runs).toEqual(runs);
+  });
+
+  it("loads old saves WITHOUT a runs field — runs comes back undefined (callers default with ?? [])", () => {
+    const storage = makeStorage();
+    // Simulate a payload written before the runs field existed.
+    storage.setItem(STORAGE_KEY, JSON.stringify({ version: 1, ...makeState() }));
+    const loaded = loadState(storage);
+    expect(loaded).not.toBeNull();
+    expect(loaded?.runs).toBeUndefined();
+    expect(loaded?.runs ?? []).toEqual([]); // documented consumer pattern
+  });
+
+  it("rejects payloads where runs is present but not an array", () => {
+    const storage = makeStorage();
+    storage.setItem(STORAGE_KEY, JSON.stringify({ version: 1, ...makeState(), runs: "oops" }));
+    expect(loadState(storage)).toBeNull();
+  });
+
+  it("passes runs through the debounced saver", () => {
+    vi.useFakeTimers();
+    try {
+      const storage = makeStorage();
+      const saver = createDebouncedSaver(500, storage);
+      saver({ ...makeState(), runs });
+      vi.advanceTimersByTime(500);
+      expect(loadState(storage)?.runs).toEqual(runs);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
