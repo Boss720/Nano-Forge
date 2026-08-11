@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Check, X } from "lucide-react";
-import type { ConnectionState, GenerationPrefs, Message, Patch, Session, ToolCall, UsageTotals, VirtualFile } from "@/types";
+import type { ConnectionState, GenerationPrefs, Message, Patch, Session, ToolCall, UsageRun, UsageTotals, VirtualFile } from "@/types";
 import { DEFAULT_GEN_PREFS } from "@/types";
 import { FALLBACK_MODELS, AGENT_SYSTEM_PROMPT, VIRTUAL_PROJECT } from "@/lib/catalog";
 import { DEFAULT_BASE_URL, fetchModels, streamChat, validateKey } from "@/lib/nanogpt";
 import { runDemoAgent } from "@/lib/demoAgent";
 import { patchSessionMessage } from "@/lib/sessionReducer";
 import { applyRunUsage, runCost } from "@/lib/usage";
+import { appendRun } from "@/lib/usageLog";
 import { applyPatch, revertPatch } from "@/lib/vfs";
 import { buildContext } from "@/lib/context";
 import { extractPatch } from "@/lib/patchParse";
@@ -30,10 +31,13 @@ import { Sidebar } from "@/sections/Sidebar";
 import { ChatPanel } from "@/sections/ChatPanel";
 import { ModelPanel } from "@/sections/ModelPanel";
 import { ConnectDialog } from "@/sections/ConnectDialog";
+import { CostDashboard } from "@/sections/CostDashboard";
 
 const uid = () => Math.random().toString(36).slice(2, 10);
 const LS_KEY = "nanoforge.connection";
 const LS_GENPREFS_KEY = "nanoforge.genprefs";
+/** Final phase (Task D): quick-switcher renders at most this many cmdk items. */
+const MAX_SWITCHER_ITEMS = 50;
 
 function loadConnection(): ConnectionState {
   try {
@@ -88,14 +92,16 @@ function loadGenPrefs(): Record<string, GenerationPrefs> {
  * - `countAutoTurns` derives the auto-turn budget from the message list, so
  *   hydrated transcripts keep their edit-verify history for free.
  */
-function hydratePersisted(): { sessions: Session[]; usage: UsageTotals; files: VirtualFile[] } | null {
+function hydratePersisted(): { sessions: Session[]; usage: UsageTotals; files: VirtualFile[]; runs: UsageRun[] } | null {
   const state = loadState();
   if (!state) return null;
   const sessions = state.sessions.map((s) => ({
     ...s,
     messages: s.messages.map((m) => (m.streaming ? { ...m, streaming: false } : m)),
   }));
-  return { sessions, usage: state.usage, files: state.files };
+  // `runs` is additive (persist v1, optional): saves written before the cost
+  // dashboard existed load with `runs === undefined` → default to empty.
+  return { sessions, usage: state.usage, files: state.files, runs: state.runs ?? [] };
 }
 
 export default function App() {
@@ -112,7 +118,10 @@ export default function App() {
   const [activeId, setActiveId] = useState(() => sessions[0]?.id ?? "");
   const [running, setRunning] = useState(false);
   const [usage, setUsage] = useState<UsageTotals>(() => hydrated?.usage ?? { input: 0, output: 0, costUsd: 0, requests: 0 });
+  // Final phase (Task A): per-run usage log feeding the cost dashboard.
+  const [runs, setRuns] = useState<UsageRun[]>(() => hydrated?.runs ?? []);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [costsOpen, setCostsOpen] = useState(false);
   const [viewerFile, setViewerFile] = useState<string | null>(null);
   // Task 1.1: the virtual workspace lives in state so applied patches are
   // visible in the sidebar / file viewer.
@@ -130,6 +139,9 @@ export default function App() {
   const [modelsOpen, setModelsOpen] = useState(false);
   // Task 3.3: Ctrl/Cmd+K model quick-switcher.
   const [switcherOpen, setSwitcherOpen] = useState(false);
+  // Task D: controlled query drives the ~50-item window (cmdk then fuzzy-
+  // re-ranks the windowed items — all `includes` matches pass its filter).
+  const [switcherQuery, setSwitcherQuery] = useState("");
 
   const handleGenPrefsChange = useCallback(
     (p: GenerationPrefs) => {
@@ -157,8 +169,8 @@ export default function App() {
   // sessions/usage/files coalesces into a single write 500ms later.
   const [saver] = useState(() => createDebouncedSaver(500));
   useEffect(() => {
-    saver({ sessions, usage, files });
-  }, [saver, sessions, usage, files]);
+    saver({ sessions, usage, files, runs });
+  }, [saver, sessions, usage, files, runs]);
   // Flush pending state on tab close / unmount so the last edit is never lost.
   useEffect(() => {
     window.addEventListener("beforeunload", saver.flush);
@@ -223,6 +235,20 @@ export default function App() {
         model: m?.name ?? selectedModel,
       }));
       setUsage((u) => applyRunUsage(u, { input: out.input, output: out.output, costUsd: cost }, opts));
+      // Task A: record the run for the cost dashboard — same cost figure that
+      // was folded into the aggregate; errored runs are logged for audit but
+      // don't count as requests (mirrors applyRunUsage via usageLog.fold).
+      setRuns((prev) =>
+        appendRun(prev, {
+          id: crypto.randomUUID(),
+          ts: Date.now(),
+          modelId: selectedModel,
+          input: out.input,
+          output: out.output,
+          costUsd: cost,
+          ...(opts?.errored ? { errored: true } : {}),
+        }),
+      );
       setRunning(false);
     },
     [model, selectedModel, patchMessage],
@@ -377,6 +403,7 @@ export default function App() {
     setSessions([s]);
     setActiveId(s.id);
     setUsage({ input: 0, output: 0, costUsd: 0, requests: 0 });
+    setRuns([]);
     setFiles(VIRTUAL_PROJECT);
     setViewerFile(null);
   }, [saver, selectedModel]);
@@ -441,7 +468,41 @@ export default function App() {
   );
 
   const activeViewer = files.find((f) => f.path === viewerFile);
-  const providers = useMemo(() => Array.from(new Set(models.map((m) => m.provider))).sort(), [models]);
+
+  // Task D: window the quick-switcher. Rendering ~1,100 cmdk items at once
+  // makes opening/typing sluggish, so the list is pre-filtered by the
+  // controlled query and capped at MAX_SWITCHER_ITEMS before cmdk ever sees
+  // it. cmdk still applies its own fuzzy filter/ranking to the windowed
+  // items — safe because every `includes` match also satisfies cmdk's
+  // subsequence match, so no windowed item is dropped. Ranking puts
+  // name-prefix matches first, then id-prefix, then any substring match.
+  // Provider grouping is preserved by grouping the windowed result.
+  const switcher = useMemo(() => {
+    const q = switcherQuery.trim().toLowerCase();
+    if (!q) {
+      return { items: models.slice(0, MAX_SWITCHER_ITEMS), total: models.length, truncated: models.length > MAX_SWITCHER_ITEMS };
+    }
+    const rank = (m: (typeof models)[number]) => {
+      const name = m.name.toLowerCase();
+      const id = m.id.toLowerCase();
+      if (name.startsWith(q)) return 0;
+      if (id.startsWith(q)) return 1;
+      return 2;
+    };
+    const matches = models
+      .filter((m) => `${m.name} ${m.id}`.toLowerCase().includes(q))
+      .sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name));
+    return { items: matches.slice(0, MAX_SWITCHER_ITEMS), total: matches.length, truncated: matches.length > MAX_SWITCHER_ITEMS };
+  }, [models, switcherQuery]);
+  const switcherProviders = useMemo(
+    () => Array.from(new Set(switcher.items.map((m) => m.provider))).sort(),
+    [switcher.items],
+  );
+  // Reset the query each time the switcher opens (it also opens via the
+  // global Ctrl/Cmd+K handler, bypassing onOpenChange).
+  useEffect(() => {
+    if (switcherOpen) setSwitcherQuery("");
+  }, [switcherOpen]);
 
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-background">
@@ -453,6 +514,7 @@ export default function App() {
         onOpenModels={() => setModelsOpen(true)}
         onExport={handleExport}
         canExport={!!session && session.messages.length > 0}
+        onOpenCosts={() => setCostsOpen(true)}
       />
       <div className="flex min-h-0 flex-1">
         {/* inline rails — lg and up only; below lg the drawers take over */}
@@ -547,7 +609,9 @@ export default function App() {
       />
 
       {/* Task 3.3: Ctrl/Cmd+K model quick-switcher — same catalog data and
-          provider grouping as ModelPanel; cmdk provides the fuzzy filter. */}
+          provider grouping as ModelPanel; cmdk provides the fuzzy filter.
+          Task D: only a windowed slice (≤ MAX_SWITCHER_ITEMS) is rendered —
+          see the `switcher` memo above. */}
       <CommandDialog
         open={switcherOpen}
         onOpenChange={setSwitcherOpen}
@@ -555,12 +619,12 @@ export default function App() {
         description="Search the model catalog and press Enter to switch"
         className="border-border bg-card"
       >
-        <CommandInput placeholder="search models…" />
+        <CommandInput placeholder="search models…" value={switcherQuery} onValueChange={setSwitcherQuery} />
         <CommandList className="scrollbar-thin">
           <CommandEmpty className="font-mono text-[12px] text-muted-foreground">no models match</CommandEmpty>
-          {providers.map((p) => (
+          {switcherProviders.map((p) => (
             <CommandGroup heading={p} key={p}>
-              {models
+              {switcher.items
                 .filter((m) => m.provider === p)
                 .map((m) => (
                   <CommandItem
@@ -582,7 +646,15 @@ export default function App() {
             </CommandGroup>
           ))}
         </CommandList>
+        {switcher.truncated && (
+          <div className="border-t border-border px-3 py-1.5 font-mono text-[10px] text-muted-foreground">
+            showing {switcher.items.length} of {switcher.total} — keep typing to narrow
+          </div>
+        )}
       </CommandDialog>
+
+      {/* Final phase (Task B): cost dashboard over the per-run usage log. */}
+      <CostDashboard open={costsOpen} onOpenChange={setCostsOpen} runs={runs} models={models} usage={usage} />
 
       {/* file viewer overlay */}
       {activeViewer && (

@@ -2,6 +2,9 @@ import { useEffect, useState } from "react";
 import { ExternalLink, Eye, EyeOff, KeyRound, Loader2, PlugZap, Trash2, Unplug, X } from "lucide-react";
 import type { ConnectionState } from "@/types";
 
+/** Final roadmap phase (Task C): dismissible MCP interop note. Dismissal persists. */
+const LS_MCP_NOTE_KEY = "nanoforge.mcp-note-dismissed";
+
 interface Props {
   open: boolean;
   onClose: () => void;
@@ -17,7 +20,23 @@ export function ConnectDialog({ open, onClose, connection, onConnect, onDisconne
   const [base, setBase] = useState(connection.baseUrl);
   const [show, setShow] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
+  const [mcpNoteDismissed, setMcpNoteDismissed] = useState(() => {
+    try {
+      return localStorage.getItem(LS_MCP_NOTE_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
   const checking = connection.status === "checking";
+
+  const dismissMcpNote = () => {
+    setMcpNoteDismissed(true);
+    try {
+      localStorage.setItem(LS_MCP_NOTE_KEY, "1");
+    } catch {
+      /* blocked storage — note just reappears next session */
+    }
+  };
 
   // Task 0.3 (defect #3): re-sync local fields from the live connection every
   // time the dialog opens, so a disconnected/stale key never reappears.
@@ -88,6 +107,27 @@ export function ConnectDialog({ open, onClose, connection, onConnect, onDisconne
             <span className="text-foreground">No subscription?</span> Pay-as-you-go works too — same endpoint, same
             key flow, per-model pricing from a pre-funded wallet.
           </div>
+
+          {/* Final phase (Task C): dismissible MCP interop note. */}
+          {!mcpNoteDismissed && (
+            <div className="flex items-start gap-2 rounded-md border border-border bg-secondary/30 px-3 py-2.5 text-[11.5px] leading-relaxed text-muted-foreground">
+              <p className="flex-1">
+                <span className="text-foreground">Using Claude Code or Cursor?</span> The same nano-gpt key works
+                over MCP — setup in the{" "}
+                <a href="https://nano-gpt.com/mcp" target="_blank" rel="noreferrer" className="text-primary hover:underline">
+                  MCP docs <ExternalLink className="inline h-3 w-3 align-[-1px]" />
+                </a>
+                .
+              </p>
+              <button
+                onClick={dismissMcpNote}
+                className="mt-0.5 shrink-0 rounded p-0.5 text-muted-foreground hover:text-foreground"
+                aria-label="Dismiss MCP note"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </div>
+          )}
         </div>
 
         <div className="flex items-center gap-2 border-t border-border px-4 py-3">
