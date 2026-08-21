@@ -272,6 +272,14 @@ Options:
     fs.copyFileSync(hostBundleFile, path.join(BUNDLE_DIR, 'agent-host.mjs'));
   }
 
+  // Copy default-policy.json alongside server.mjs — policy.ts resolves it via
+  // import.meta.url at runtime, so it must be adjacent to the bundle file.
+  const defaultPolicySrc = path.join(ROOT_DIR, 'apps', 'agent-host', 'src', 'policy', 'default-policy.json');
+  if (fs.existsSync(defaultPolicySrc)) {
+    fs.copyFileSync(defaultPolicySrc, path.join(BUNDLE_DIR, 'default-policy.json'));
+    console.log('[packager] Bundled default-policy.json');
+  }
+
   // Step 6: Generate Batch Runner and Documentation
   generateBatchLauncher(path.join(BUNDLE_DIR, 'NanoForge.bat'));
   generateBatchLauncher(path.join(RELEASE_DIR, 'NanoForge.bat'));
