@@ -32,7 +32,7 @@ export interface SubmittedStep {
   id: string;
   title: string;
   dependsOn: readonly string[];
-  approval?: "required";
+  approval?: "required" | "auto";
   sideEffecting?: boolean;
   affectedScopes?: readonly string[];
 }

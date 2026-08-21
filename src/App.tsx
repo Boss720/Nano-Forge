@@ -40,6 +40,12 @@ import { PlanPanel } from "@/sections/PlanPanel";
 import { BrowserPermissionDialog } from "@/sections/BrowserPermissionDialog";
 import { IntegrationsPanel } from "@/sections/IntegrationsPanel";
 import { VisualEvidenceCard } from "@/sections/VisualEvidenceCard";
+import { ArtifactDock } from "@/sections/ArtifactDock";
+import { SubagentsPanel } from "@/sections/SubagentsPanel";
+import { ThemeCustomizer } from "@/sections/settings/ThemeCustomizer";
+import { useArtifacts } from "@/hooks/useArtifacts";
+import { useVoiceCall } from "@/hooks/useVoiceCall";
+import { VoiceCallDrawer } from "@/components/voice/VoiceCallDrawer";
 import { useHostSession, type UseHostSessionOptions } from "@/lib/hostSession";
 import {
   Dialog,
@@ -146,10 +152,16 @@ export default function App({ hostSession }: { hostSession?: UseHostSessionOptio
   // Final phase (Task A): per-run usage log feeding the cost dashboard.
   const [runs, setRuns] = useState<UsageRun[]>(() => hydrated?.runs ?? []);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [themeOpen, setThemeOpen] = useState(false);
   const [costsOpen, setCostsOpen] = useState(false);
   // Final phase (Task A): image generation panel (lazy chunk, dialog).
   const [imagesOpen, setImagesOpen] = useState(false);
+  // Milestone 3: subagent swarm control plane dock
+  const [subagentsOpen, setSubagentsOpen] = useState(false);
   const [viewerFile, setViewerFile] = useState<string | null>(null);
+
+  // Phase 1: Dedicated Artifact Dock Manager
+  const artifactsManager = useArtifacts();
   // Task 1.1: the virtual workspace lives in state so applied patches are
   // visible in the sidebar / file viewer.
   const [files, setFiles] = useState<VirtualFile[]>(() => hydrated?.files ?? VIRTUAL_PROJECT);
@@ -326,7 +338,10 @@ export default function App({ hostSession }: { hostSession?: UseHostSessionOptio
                 ...m,
                 toolCalls: m.toolCalls?.map((t) => (t.id === id ? { ...t, status, durationMs } : t)),
               })),
-            onPatch: (p: Patch) => patchMessage(sid, agentMsg.id, (m) => ({ ...m, patch: p })),
+            onPatch: (p: Patch) => {
+              patchMessage(sid, agentMsg.id, (m) => ({ ...m, patch: p }));
+              artifactsManager.addPatchArtifact(p);
+            },
             onDelta: (d) => patchMessage(sid, agentMsg.id, (m) => ({ ...m, content: m.content + d })),
             onDone: (u) => finishRun(sid, agentMsg.id, u),
           },
@@ -370,6 +385,7 @@ export default function App({ hostSession }: { hostSession?: UseHostSessionOptio
             const patch = extractPatch(streamed);
             if (patch) {
               patchMessage(sid, agentMsg.id, (m) => ({ ...m, patch }));
+              artifactsManager.addPatchArtifact(patch);
             }
             finishRun(sid, agentMsg.id, u);
           },
@@ -394,6 +410,34 @@ export default function App({ hostSession }: { hostSession?: UseHostSessionOptio
     },
     [running, session, connected, selectedModel, model, connection, patchMessage, finishRun, genPrefs],
   );
+
+  // Milestone 3: Voice Call Controller Hook
+  const voice = useVoiceCall({
+    modelName: model?.name ?? selectedModel,
+    onSendPrompt: (prompt) => {
+      handleSend(prompt);
+    },
+    onCommitTurn: (turn) => {
+      if (!session) return;
+      const turnMsg: Message = {
+        id: uid(),
+        role: turn.speaker === "user" ? "user" : "assistant",
+        content: turn.interrupted ? `${turn.text} [interrupted]` : turn.text,
+        ts: Date.now(),
+      };
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.id === session.id
+            ? {
+                ...s,
+                title: s.messages.length === 0 ? turn.text.slice(0, 34) : s.title,
+                messages: [...s.messages, turnMsg],
+              }
+            : s
+        )
+      );
+    },
+  });
 
   const handleStop = useCallback(() => {
     abortRef.current?.abort();
@@ -559,6 +603,14 @@ export default function App({ hostSession }: { hostSession?: UseHostSessionOptio
         canExport={!!session && session.messages.length > 0}
         onOpenCosts={() => setCostsOpen(true)}
         onOpenImages={() => setImagesOpen(true)}
+        onOpenArtifacts={artifactsManager.toggleDock}
+        artifactCount={artifactsManager.artifacts.length}
+        onOpenSubagents={() => setSubagentsOpen((o) => !o)}
+        subagentCount={host.subagents.filter((a) => a.state === "running").length || host.subagents.length}
+        onOpenTheme={() => setThemeOpen(true)}
+        onOpenVoiceCall={voice.openDrawer}
+        isVoiceCallActive={voice.isCallActive}
+        voiceCallStatus={voice.status}
       />
       <div className="flex min-h-0 flex-1">
         {/* inline rails — lg and up only; below lg the drawers take over */}
@@ -586,7 +638,37 @@ export default function App({ hostSession }: { hostSession?: UseHostSessionOptio
           onGenPrefsChange={handleGenPrefsChange}
           toolRuns={host.toolRuns}
           onToolStop={host.stopToolRun}
+          onTriggerVoiceCall={() => {
+            if (voice.isCallActive) {
+              voice.openDrawer();
+            } else {
+              void voice.startCall();
+            }
+          }}
+          isVoiceCallActive={voice.isCallActive}
         />
+        {/* Phase 1: Dedicated Artifact Viewer Dock */}
+        {artifactsManager.isOpen && artifactsManager.artifacts.length > 0 && (
+          <aside data-testid="artifact-rail" className="hidden min-h-0 w-[440px] shrink-0 flex-col lg:flex">
+            <ArtifactDock
+              artifacts={artifactsManager.artifacts}
+              activeArtifactId={artifactsManager.activeArtifactId}
+              onSelectArtifact={artifactsManager.selectArtifact}
+              onClose={artifactsManager.closeDock}
+              onSendFeedback={artifactsManager.handleFeedback}
+            />
+          </aside>
+        )}
+        {/* Milestone 3: Dedicated Subagents Swarm Control Plane Dock */}
+        {subagentsOpen && (
+          <aside data-testid="subagents-rail" className="hidden min-h-0 w-[480px] shrink-0 flex-col lg:flex">
+            <SubagentsPanel
+              session={host}
+              onClose={() => setSubagentsOpen(false)}
+              onSelectArtifact={(p) => setViewerFile(p)}
+            />
+          </aside>
+        )}
         {/* Agent platform (Tasks 3 + 9): plan inspector side rail, mounted
             only while a plan (or run evidence) exists — host-driven, so the
             default host-absent UI never renders it. PlanPanel keeps its own
@@ -670,6 +752,23 @@ export default function App({ hostSession }: { hostSession?: UseHostSessionOptio
         </SheetContent>
       </Sheet>
 
+      {/* Milestone 3: Subagent Swarm drawer for mobile/narrow screens */}
+      <Sheet open={subagentsOpen && isNarrow} onOpenChange={setSubagentsOpen}>
+        <SheetContent side="right" className="gap-0 border-border bg-card p-0 sm:max-w-xl w-full">
+          <SheetHeader className="sr-only">
+            <SheetTitle>Subagent Swarm Control Plane</SheetTitle>
+          </SheetHeader>
+          <SubagentsPanel
+            session={host}
+            onClose={() => setSubagentsOpen(false)}
+            onSelectArtifact={(p) => {
+              setViewerFile(p);
+              setSubagentsOpen(false);
+            }}
+          />
+        </SheetContent>
+      </Sheet>
+
       <ConnectDialog
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
@@ -678,7 +777,24 @@ export default function App({ hostSession }: { hostSession?: UseHostSessionOptio
         onDisconnect={handleDisconnect}
         onClearHistory={handleClearHistory}
         onOpenIntegrations={() => setIntegrationsOpen(true)}
+        onOpenTheme={() => {
+          setSettingsOpen(false);
+          setThemeOpen(true);
+        }}
       />
+
+      {/* Milestone 4: Theme & Palette Customizer Modal */}
+      <Dialog open={themeOpen} onOpenChange={setThemeOpen}>
+        <DialogContent className="scrollbar-thin max-h-[85vh] overflow-y-auto border-border bg-card sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle className="font-mono text-[13px] tracking-wide">Theme &amp; Visual Palette</DialogTitle>
+            <DialogDescription className="font-mono text-[11px]">
+              Customize presets, accent colors, surface contrast, and border radius in real-time.
+            </DialogDescription>
+          </DialogHeader>
+          <ThemeCustomizer onClose={() => setThemeOpen(false)} />
+        </DialogContent>
+      </Dialog>
 
       {/* Agent platform (Task 14): rules packs / skills / MCP servers. Rows
           come from the host session (empty → "none configured" until the host
@@ -794,6 +910,13 @@ export default function App({ hostSession }: { hostSession?: UseHostSessionOptio
           </div>
         </div>
       )}
+
+      {/* Milestone 3: Interactive Audio Voice Call Drawer */}
+      <VoiceCallDrawer
+        isOpen={voice.isDrawerOpen}
+        voice={voice}
+        onClose={voice.closeDrawer}
+      />
     </div>
   );
 }

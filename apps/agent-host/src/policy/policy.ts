@@ -185,6 +185,196 @@ export function authorize(req: ToolRequest, policy: Policy): PolicyDecision {
 }
 
 /* ------------------------------------------------------------------------ */
+/* Subagent Path Confinement & Sandboxing Policy (SEC-SUB-01)               */
+/* ------------------------------------------------------------------------ */
+
+export type SubagentWorkspaceMode = "inherit" | "branch" | "share";
+export type SubagentArchetypeKind =
+  | "explorer"
+  | "implementer"
+  | "qa"
+  | "specialist"
+  | "verifier"
+  | "planner"
+  | "custom";
+
+export interface SubagentConfinementOptions {
+  subagentId: string;
+  subagentName?: string;
+  archetype?: SubagentArchetypeKind;
+  workspaceRoot: string;
+  assignedMetadataDir: string; // e.g. .agents/worker_m2 or .agents/explorer_123 or full path
+  isolationMode: SubagentWorkspaceMode;
+  worktreePath?: string;
+  scratchDir?: string;
+  allowSourceTreeWrites?: boolean;
+}
+
+export interface SubagentAccessRequest {
+  candidatePath: string;
+  operation: "read" | "write" | "delete";
+}
+
+export interface SubagentAccessDecision {
+  allowed: boolean;
+  decision: PolicyDecision;
+  resolvedPath?: string;
+  reason?: string;
+}
+
+/**
+ * Normalizes and decodes a path to prevent %2e%2e or relative traversal escapes.
+ */
+export function canonicalizeSubagentPath(rawPath: string): string {
+  let decoded = rawPath;
+  try {
+    decoded = decodeURIComponent(rawPath);
+  } catch {
+    // Keep original if decoding fails
+  }
+  return path.normalize(decoded);
+}
+
+/**
+ * Authorizes a subagent file operation against SEC-SUB-01 and isolation modes.
+ *
+ * Rules:
+ * 1. Writes to `.agents/` are strictly confined to the agent's assigned metadata dir.
+ *    Writing to `.agents/` root or any other subagent's folder is strictly DENIED (SEC-SUB-01).
+ * 2. Directory traversal (`..` sequences escaping workspace or worktree) is DENIED.
+ * 3. In `branch` mode, writes to the source tree must reside inside `worktreePath`.
+ * 4. In `share` mode, source tree writes are denied; writes are allowed in `scratchDir`.
+ * 5. Read-only archetypes (`explorer`, `verifier`, `planner`) have `allowSourceTreeWrites = false`.
+ */
+export function authorizeSubagentPathAccess(
+  options: SubagentConfinementOptions,
+  request: SubagentAccessRequest
+): SubagentAccessDecision {
+  const root = path.resolve(options.workspaceRoot || ".");
+  const normalizedCandidate = canonicalizeSubagentPath(request.candidatePath);
+
+  // Determine effective workspace root based on isolation mode
+  const worktreeAbs = options.worktreePath ? path.resolve(root, options.worktreePath) : undefined;
+  const scratchAbs = options.scratchDir ? path.resolve(root, options.scratchDir) : undefined;
+
+  let effectiveRoot = root;
+  if (options.isolationMode === "branch" && worktreeAbs) {
+    effectiveRoot = worktreeAbs;
+  }
+
+  // Resolve absolute path: if candidate is relative and references .agents or worktree/scratch from root, resolve from root
+  let resolvedTarget: string;
+  if (path.isAbsolute(normalizedCandidate)) {
+    resolvedTarget = path.resolve(normalizedCandidate);
+  } else if (
+    normalizedCandidate.startsWith(".agents") ||
+    (options.worktreePath && normalizedCandidate.startsWith(options.worktreePath)) ||
+    (options.scratchDir && normalizedCandidate.startsWith(options.scratchDir))
+  ) {
+    resolvedTarget = path.resolve(root, normalizedCandidate);
+  } else {
+    resolvedTarget = path.resolve(effectiveRoot, normalizedCandidate);
+  }
+
+  // 1. Check traversal out of workspace root
+  // The path must reside inside workspaceRoot, worktreePath, or scratchDir
+  const insideRoot = isWithinWorkspace(resolvedTarget, root);
+  const insideWorktree = worktreeAbs ? isWithinWorkspace(resolvedTarget, worktreeAbs) : false;
+  const insideScratch = scratchAbs ? isWithinWorkspace(resolvedTarget, scratchAbs) : false;
+
+  if (!insideRoot && !insideWorktree && !insideScratch) {
+    return {
+      allowed: false,
+      decision: "deny",
+      reason: `Path traversal violation: "${request.candidatePath}" resolves outside allowed workspace boundaries.`,
+    };
+  }
+
+  // 2. Check `.agents/` metadata confinement (SEC-SUB-01)
+  const agentsRoot = path.resolve(root, ".agents");
+  const isInsideAgents = isWithinWorkspace(resolvedTarget, agentsRoot);
+  const isWorkspaceOverlay = insideWorktree || insideScratch;
+
+  // Metadata isolation applies to .agents/ paths that are NOT the agent's worktree or scratch space
+  if (isInsideAgents && !isWorkspaceOverlay) {
+    // Resolve assigned metadata directory
+    const assignedDir = path.isAbsolute(options.assignedMetadataDir)
+      ? path.resolve(options.assignedMetadataDir)
+      : path.resolve(root, options.assignedMetadataDir);
+
+    if (request.operation === "write" || request.operation === "delete") {
+      const isInsideOwnFolder = isWithinWorkspace(resolvedTarget, assignedDir);
+      // Writing directly to .agents root or another subagent folder is prohibited
+      if (!isInsideOwnFolder || normalizeForCompare(resolvedTarget) === normalizeForCompare(agentsRoot)) {
+        return {
+          allowed: false,
+          decision: "deny",
+          reason: `SEC-SUB-01 Violation: Subagent "${options.subagentId}" cannot write outside its assigned directory "${options.assignedMetadataDir}".`,
+        };
+      }
+    }
+    // Read operations inside .agents are allowed (shared metadata convention)
+    return {
+      allowed: true,
+      decision: "allow",
+      resolvedPath: resolvedTarget,
+    };
+  }
+
+  // 3. For operations outside `.agents/` metadata (i.e. source tree, worktree, or scratch):
+  if (request.operation === "write" || request.operation === "delete") {
+    // Check archetype read-only restriction
+    const isReadOnlyArchetype =
+      options.archetype === "explorer" ||
+      options.archetype === "verifier" ||
+      options.archetype === "planner";
+    if (isReadOnlyArchetype || options.allowSourceTreeWrites === false) {
+      // In share mode, writing to scratch directory is still allowed for read-only agents
+      if (options.isolationMode === "share" && insideScratch) {
+        return {
+          allowed: true,
+          decision: "allow",
+          resolvedPath: resolvedTarget,
+        };
+      }
+      return {
+        allowed: false,
+        decision: "deny",
+        reason: `Archetype "${options.archetype || 'read-only'}" (read-only archetype) is not permitted to mutate source tree files.`,
+      };
+    }
+
+    // Check isolation mode write permissions
+    if (options.isolationMode === "share") {
+      // In share mode, source root is read-only. Writes only allowed in scratchDir
+      if (!insideScratch) {
+        return {
+          allowed: false,
+          decision: "deny",
+          reason: `Share isolation mode: writes to repository source tree are denied. Use scratch directory.`,
+        };
+      }
+    } else if (options.isolationMode === "branch") {
+      // In branch mode, writes must be confined to worktreePath
+      if (!insideWorktree) {
+        return {
+          allowed: false,
+          decision: "deny",
+          reason: `Branch isolation mode: writes outside worktree "${options.worktreePath}" are denied.`,
+        };
+      }
+    }
+  }
+
+  return {
+    allowed: true,
+    decision: "allow",
+    resolvedPath: resolvedTarget,
+  };
+}
+
+
+/* ------------------------------------------------------------------------ */
 /* Loading                                                                  */
 /* ------------------------------------------------------------------------ */
 
@@ -213,3 +403,4 @@ export function loadPolicy(workspaceRoot?: string): Policy {
 
 /** Default policy with an unpinned (".") workspace root. */
 export const DEFAULT_POLICY: Policy = loadPolicy();
+

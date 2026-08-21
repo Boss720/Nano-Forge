@@ -22,6 +22,41 @@
  */
 import type { ExecutionPlan, PlanUIState, ToolRunState } from "@/types";
 import type { DirEntry, SearchMatch, GitFileStatus } from "@/types/workspace";
+import type { HostIntegrationsState } from "@/lib/hostSession";
+import type {
+  InvokeSubagentParams,
+  InvokeSubagentResult,
+  ManageSubagentsParams,
+  ManageSubagentsResult,
+  SendMessageParams,
+  SendMessageResult,
+  DefineSubagentParams,
+  DefineSubagentResult,
+  SubagentInfo,
+  SubagentMessage,
+  SubagentLifecycleEvent,
+  SubagentState,
+  SubagentTelemetry,
+} from "@protocol/subagents";
+import type {
+  ManageTaskParams,
+  ManageTaskResult,
+  ScheduleParams,
+  ScheduleResult,
+  TaskSummary,
+  TaskLifecycleEvent,
+} from "@protocol/tasks";
+import type {
+  MemoryEntry,
+  MemorySetParams,
+  MemorySetResult,
+  MemoryGetParams,
+  MemoryGetResult,
+  MemoryQueryParams,
+  MemoryQueryResult,
+  MemoryDeleteParams,
+  MemoryDeleteResult,
+} from "@protocol/memory";
 
 /* ------------------------------------------------------------------ */
 /* Wire message shapes                                                */
@@ -35,7 +70,21 @@ export type HostClientRequestType =
   | "run.cancel"
   | "workspace.readDir"
   | "workspace.search"
-  | "workspace.gitStatus";
+  | "workspace.gitStatus"
+  | "integration.toggle"
+  | "subagent.invoke"
+  | "subagent.manage"
+  | "subagent.sendMessage"
+  | "subagent.define"
+  | "task.manage"
+  | "schedule.create"
+  | "memory.set"
+  | "memory.get"
+  | "memory.query"
+  | "memory.delete"
+  | "playground.dispatchTurn"
+  | "playground.simulateTurn"
+  | "playground.injectFailure";
 
 export interface HostClientRequest {
   type: HostClientRequestType;
@@ -43,6 +92,14 @@ export interface HostClientRequest {
   plan?: ExecutionPlan;
   runId?: string;
   stepId?: string;
+  kind?: "rules" | "skill" | "mcp";
+  id?: string;
+  enabled?: boolean;
+  params?: unknown;
+  parentId?: string;
+  callerId?: string;
+  senderId?: string;
+  creatorSubagentId?: string;
 }
 
 export interface RunStateMessage {
@@ -78,6 +135,7 @@ export interface RunEventMessage {
   runId: string;
   event: string;
   detail?: string;
+  data?: unknown;
 }
 
 export interface HostErrorMessage {
@@ -87,12 +145,339 @@ export interface HostErrorMessage {
   runId?: string;
 }
 
+export interface IntegrationsSnapshotMessage {
+  type: "integrations.snapshot";
+  requestId?: string;
+  snapshot: HostIntegrationsState;
+}
+
+export interface SubagentInvokeResultMessage {
+  type: "subagent.invoke.result";
+  requestId: string;
+  result: InvokeSubagentResult;
+}
+
+export interface SubagentManageResultMessage {
+  type: "subagent.manage.result";
+  requestId: string;
+  result: ManageSubagentsResult;
+}
+
+export interface SubagentSendMessageResultMessage {
+  type: "subagent.sendMessage.result";
+  requestId: string;
+  result: SendMessageResult;
+}
+
+export interface SubagentDefineResultMessage {
+  type: "subagent.define.result";
+  requestId: string;
+  result: DefineSubagentResult;
+}
+
+export interface SubagentEventMessage {
+  type: "subagent.event";
+  event: SubagentLifecycleEvent;
+  at?: string;
+}
+
+export interface SubagentSpawnedMessage {
+  type: "subagent.spawned";
+  subagent: SubagentInfo;
+  at?: string;
+}
+
+export interface SubagentStateChangedMessage {
+  type: "subagent.state_changed" | "subagent.state";
+  subagentId: string;
+  previousState?: SubagentState;
+  newState?: SubagentState;
+  state?: SubagentState;
+  reason?: string;
+  tokensUsed?: number;
+  at?: string;
+}
+
+export interface SubagentMessageSentMessage {
+  type: "subagent.message_sent" | "subagent.message";
+  message: SubagentMessage;
+  at?: string;
+}
+
+export interface SubagentHeartbeatMessage {
+  type: "subagent.heartbeat";
+  subagentId: string;
+  lastVisited: string;
+  progressSummary?: string;
+  at?: string;
+}
+
+export interface SubagentCompletedMessage {
+  type: "subagent.completed";
+  subagentId: string;
+  tokensUsed: number;
+  turnCount: number;
+  handoffArtifact?: string;
+  at?: string;
+}
+
+export interface SubagentErroredMessage {
+  type: "subagent.errored";
+  subagentId: string;
+  error: string;
+  code?: string;
+  at?: string;
+}
+
+export interface SubagentTreeUpdatedMessage {
+  type: "subagent.tree_updated";
+  rootId: string;
+  activeCount: number;
+  tree: SubagentInfo[];
+  at?: string;
+}
+
+export interface SubagentsSnapshotMessage {
+  type: "subagents.snapshot";
+  snapshot: SubagentInfo[];
+  at?: string;
+}
+
+export interface TaskManageResultMessage {
+  type: "task.manage.result";
+  requestId: string;
+  result: ManageTaskResult;
+}
+
+export interface ScheduleCreateResultMessage {
+  type: "schedule.create.result";
+  requestId: string;
+  result: ScheduleResult;
+}
+
+export interface TaskEventMessage {
+  type: "task.event";
+  event: TaskLifecycleEvent;
+  at?: string;
+}
+
+export interface TaskSpawnedMessage {
+  type: "task.spawned";
+  task: TaskSummary;
+  at?: string;
+}
+
+export interface TaskCompletedMessage {
+  type: "task.completed";
+  taskId: string;
+  exitCode?: number | null;
+  durationMs?: number;
+  at?: string;
+}
+
+export interface TaskKilledMessage {
+  type: "task.killed";
+  taskId: string;
+  signal?: string;
+  at?: string;
+}
+
+export interface ScheduleTriggeredMessage {
+  type: "schedule.triggered";
+  scheduleId: string;
+  iteration: number;
+  prompt: string;
+  at?: string;
+}
+
+export interface ScheduleCancelledMessage {
+  type: "schedule.cancelled";
+  scheduleId: string;
+  reason: string;
+  at?: string;
+}
+
+export interface TasksSnapshotMessage {
+  type: "tasks.snapshot";
+  snapshot: TaskSummary[];
+  at?: string;
+}
+
+export interface SchedulesSnapshotMessage {
+  type: "schedules.snapshot";
+  snapshot: ScheduleResult[];
+  at?: string;
+}
+
+export interface MemorySetResultMessage {
+  type: "memory.set.result";
+  requestId: string;
+  result: MemorySetResult;
+}
+
+export interface MemoryGetResultMessage {
+  type: "memory.get.result";
+  requestId: string;
+  result: MemoryGetResult;
+}
+
+export interface MemoryQueryResultResultMessage {
+  type: "memory.query.result";
+  requestId: string;
+  result: MemoryQueryResult;
+}
+
+export interface MemoryDeleteResultMessage {
+  type: "memory.delete.result";
+  requestId: string;
+  result: MemoryDeleteResult;
+}
+
+export interface MemoryEntrySetMessage {
+  type: "memory.entry_set";
+  entry: MemoryEntry;
+  at?: string;
+}
+
+export interface MemoryEntryDeletedMessage {
+  type: "memory.entry_deleted";
+  key: string;
+  namespace: string;
+  at?: string;
+}
+
+export interface MemoryClearedMessage {
+  type: "memory.cleared";
+  namespace?: string;
+  at?: string;
+}
+
+export interface MemorySnapshotMessage {
+  type: "memory.snapshot";
+  snapshot: MemoryEntry[];
+  at?: string;
+}
+
+export interface SubagentTelemetryUpdatedMessage {
+  type: "subagent.telemetry_updated";
+  subagentId: string;
+  telemetry: SubagentTelemetry;
+  at?: string;
+}
+
+export interface SubagentTurnStartedMessage {
+  type: "subagent.turn_started";
+  subagentId: string;
+  turnId?: string;
+  prompt?: string;
+  at?: string;
+}
+
+export interface SubagentTurnCompletedMessage {
+  type: "subagent.turn_completed";
+  subagentId: string;
+  turnId?: string;
+  tokensUsed?: number;
+  turnLatencyMs?: number;
+  output?: string;
+  at?: string;
+}
+
+export interface PlaygroundDispatchTurnResultMessage {
+  type: "playground.dispatchTurn.result";
+  requestId: string;
+  result?: {
+    success: boolean;
+    turnId?: string;
+    response?: string;
+    tokensUsed?: number;
+    latencyMs?: number;
+  };
+  turnId?: string;
+  response?: string;
+  tokensUsed?: number;
+  latencyMs?: number;
+  success?: boolean;
+}
+
+export interface PlaygroundSimulateTurnResultMessage {
+  type: "playground.simulateTurn.result";
+  requestId: string;
+  result?: {
+    success: boolean;
+    turnId?: string;
+    scenario?: string;
+    output?: string;
+    tokensUsed?: number;
+    latencyMs?: number;
+  };
+  turnId?: string;
+  scenario?: string;
+  output?: string;
+  tokensUsed?: number;
+  latencyMs?: number;
+  success?: boolean;
+}
+
+export interface PlaygroundInjectFailureResultMessage {
+  type: "playground.injectFailure.result";
+  requestId: string;
+  result?: {
+    success: boolean;
+    affectedSubagents?: string[];
+    recovered?: boolean;
+    message?: string;
+  };
+  affectedSubagents?: string[];
+  recovered?: boolean;
+  message?: string;
+  success?: boolean;
+}
+
 export type HostMessage =
   | RunStateMessage
   | ToolApprovalRequiredMessage
   | ToolOutputMessage
   | RunEventMessage
   | HostErrorMessage
+  | IntegrationsSnapshotMessage
+  | SubagentInvokeResultMessage
+  | SubagentManageResultMessage
+  | SubagentSendMessageResultMessage
+  | SubagentDefineResultMessage
+  | SubagentEventMessage
+  | SubagentSpawnedMessage
+  | SubagentStateChangedMessage
+  | SubagentMessageSentMessage
+  | SubagentHeartbeatMessage
+  | SubagentCompletedMessage
+  | SubagentErroredMessage
+  | SubagentTreeUpdatedMessage
+  | SubagentsSnapshotMessage
+  | TaskManageResultMessage
+  | ScheduleCreateResultMessage
+  | TaskEventMessage
+  | TaskSpawnedMessage
+  | TaskCompletedMessage
+  | TaskKilledMessage
+  | ScheduleTriggeredMessage
+  | ScheduleCancelledMessage
+  | TasksSnapshotMessage
+  | SchedulesSnapshotMessage
+  | MemorySetResultMessage
+  | MemoryGetResultMessage
+  | MemoryQueryResultResultMessage
+  | MemoryDeleteResultMessage
+  | MemoryEntrySetMessage
+  | MemoryEntryDeletedMessage
+  | MemoryClearedMessage
+  | MemorySnapshotMessage
+  | SubagentTelemetryUpdatedMessage
+  | SubagentTurnStartedMessage
+  | SubagentTurnCompletedMessage
+  | PlaygroundDispatchTurnResultMessage
+  | PlaygroundSimulateTurnResultMessage
+  | PlaygroundInjectFailureResultMessage
   | { type: "workspace.readDir.result"; requestId: string; path: string; entries: DirEntry[] }
   | { type: "workspace.search.result"; requestId: string; matches: SearchMatch[] }
   | { type: "workspace.gitStatus.result"; requestId: string; files: GitFileStatus[] }
@@ -163,6 +548,46 @@ const HOST_MESSAGE_TYPES = new Set([
   "workspace.search.result",
   "workspace.gitStatus.result",
   "workspace.fileChanged",
+  "integrations.snapshot",
+  "subagent.invoke.result",
+  "subagent.manage.result",
+  "subagent.sendMessage.result",
+  "subagent.define.result",
+  "subagent.event",
+  "subagent.spawned",
+  "subagent.state_changed",
+  "subagent.state",
+  "subagent.message_sent",
+  "subagent.message",
+  "subagent.heartbeat",
+  "subagent.completed",
+  "subagent.errored",
+  "subagent.tree_updated",
+  "subagents.snapshot",
+  "task.manage.result",
+  "schedule.create.result",
+  "task.event",
+  "task.spawned",
+  "task.completed",
+  "task.killed",
+  "schedule.triggered",
+  "schedule.cancelled",
+  "tasks.snapshot",
+  "schedules.snapshot",
+  "memory.set.result",
+  "memory.get.result",
+  "memory.query.result",
+  "memory.delete.result",
+  "memory.entry_set",
+  "memory.entry_deleted",
+  "memory.cleared",
+  "memory.snapshot",
+  "subagent.telemetry_updated",
+  "subagent.turn_started",
+  "subagent.turn_completed",
+  "playground.dispatchTurn.result",
+  "playground.simulateTurn.result",
+  "playground.injectFailure.result",
 ]);
 
 const isRecord = (v: unknown): v is Record<string, unknown> =>
@@ -224,6 +649,99 @@ export function parseHostMessage(raw: unknown): (HostMessage & WithRequestId) | 
     case "workspace.fileChanged":
       if (!isString(data.path) || !isString(data.changeType)) return null;
       return { ...(data as Record<string, unknown>), requestId } as never;
+    case "integrations.snapshot":
+      if (!isRecord(data.snapshot)) return null;
+      return { ...(data as unknown as IntegrationsSnapshotMessage), requestId };
+    case "subagent.invoke.result":
+    case "subagent.manage.result":
+    case "subagent.sendMessage.result":
+    case "subagent.define.result":
+    case "task.manage.result":
+    case "schedule.create.result":
+      if (!isString(data.requestId)) return null;
+      return { ...(data as Record<string, unknown>), requestId } as never;
+    case "subagent.event":
+      if (!isRecord(data.event)) return null;
+      return { ...(data as unknown as SubagentEventMessage), requestId };
+    case "subagent.spawned":
+      if (!isRecord(data.subagent)) return null;
+      return { ...(data as unknown as SubagentSpawnedMessage), requestId };
+    case "subagent.state_changed":
+    case "subagent.state":
+      if (!isString(data.subagentId)) return null;
+      return { ...(data as unknown as SubagentStateChangedMessage), requestId };
+    case "subagent.message_sent":
+    case "subagent.message":
+      if (!isRecord(data.message)) return null;
+      return { ...(data as unknown as SubagentMessageSentMessage), requestId };
+    case "subagent.heartbeat":
+      if (!isString(data.subagentId)) return null;
+      return { ...(data as unknown as SubagentHeartbeatMessage), requestId };
+    case "subagent.completed":
+      if (!isString(data.subagentId)) return null;
+      return { ...(data as unknown as SubagentCompletedMessage), requestId };
+    case "subagent.errored":
+      if (!isString(data.subagentId) || !isString(data.error)) return null;
+      return { ...(data as unknown as SubagentErroredMessage), requestId };
+    case "subagent.tree_updated":
+      if (!isString(data.rootId) || !Array.isArray(data.tree)) return null;
+      return { ...(data as unknown as SubagentTreeUpdatedMessage), requestId };
+    case "subagents.snapshot":
+      if (!Array.isArray(data.snapshot)) return null;
+      return { ...(data as unknown as SubagentsSnapshotMessage), requestId };
+    case "task.event":
+      if (!isRecord(data.event)) return null;
+      return { ...(data as unknown as TaskEventMessage), requestId };
+    case "task.spawned":
+      if (!isRecord(data.task)) return null;
+      return { ...(data as unknown as TaskSpawnedMessage), requestId };
+    case "task.completed":
+      if (!isString(data.taskId)) return null;
+      return { ...(data as unknown as TaskCompletedMessage), requestId };
+    case "task.killed":
+      if (!isString(data.taskId)) return null;
+      return { ...(data as unknown as TaskKilledMessage), requestId };
+    case "schedule.triggered":
+      if (!isString(data.scheduleId)) return null;
+      return { ...(data as unknown as ScheduleTriggeredMessage), requestId };
+    case "schedule.cancelled":
+      if (!isString(data.scheduleId)) return null;
+      return { ...(data as unknown as ScheduleCancelledMessage), requestId };
+    case "tasks.snapshot":
+      if (!Array.isArray(data.snapshot)) return null;
+      return { ...(data as unknown as TasksSnapshotMessage), requestId };
+    case "schedules.snapshot":
+      if (!Array.isArray(data.snapshot)) return null;
+      return { ...(data as unknown as SchedulesSnapshotMessage), requestId };
+    case "memory.set.result":
+    case "memory.get.result":
+    case "memory.query.result":
+    case "memory.delete.result":
+    case "playground.dispatchTurn.result":
+    case "playground.simulateTurn.result":
+    case "playground.injectFailure.result":
+      if (!isString(data.requestId)) return null;
+      return { ...(data as Record<string, unknown>), requestId } as never;
+    case "memory.entry_set":
+      if (!isRecord(data.entry)) return null;
+      return { ...(data as unknown as MemoryEntrySetMessage), requestId };
+    case "memory.entry_deleted":
+      if (!isString(data.key) || !isString(data.namespace)) return null;
+      return { ...(data as unknown as MemoryEntryDeletedMessage), requestId };
+    case "memory.cleared":
+      return { ...(data as unknown as MemoryClearedMessage), requestId };
+    case "memory.snapshot":
+      if (!Array.isArray(data.snapshot)) return null;
+      return { ...(data as unknown as MemorySnapshotMessage), requestId };
+    case "subagent.telemetry_updated":
+      if (!isString(data.subagentId) || !isRecord(data.telemetry)) return null;
+      return { ...(data as unknown as SubagentTelemetryUpdatedMessage), requestId };
+    case "subagent.turn_started":
+      if (!isString(data.subagentId)) return null;
+      return { ...(data as unknown as SubagentTurnStartedMessage), requestId };
+    case "subagent.turn_completed":
+      if (!isString(data.subagentId)) return null;
+      return { ...(data as unknown as SubagentTurnCompletedMessage), requestId };
     default:
       return null;
   }
@@ -308,6 +826,104 @@ export class HostClient {
   }
   gitStatus(): Promise<GitFileStatus[]> { return this.requestResult({ type: "workspace.gitStatus" }).then((m) => (m as { files: GitFileStatus[] }).files); }
   writeFile(path: string, content: string): Promise<void> { return this.request({ type: "workspace.writeFile", path, content } as never); }
+  toggleIntegration(kind: "rules" | "skill" | "mcp", id: string, enabled: boolean): Promise<void> {
+    return this.request({ type: "integration.toggle", kind, id, enabled });
+  }
+
+  invokeSubagent(params: InvokeSubagentParams, parentId?: string): Promise<InvokeSubagentResult> {
+    return this.requestResult({
+      type: "subagent.invoke",
+      params,
+      ...(parentId ? { parentId } : {}),
+    }).then((m) => (m as { result?: InvokeSubagentResult }).result ?? (m as unknown as InvokeSubagentResult));
+  }
+
+  manageSubagents(params: ManageSubagentsParams, callerId?: string): Promise<ManageSubagentsResult> {
+    return this.requestResult({
+      type: "subagent.manage",
+      params,
+      ...(callerId ? { callerId } : {}),
+    }).then((m) => (m as { result?: ManageSubagentsResult }).result ?? (m as unknown as ManageSubagentsResult));
+  }
+
+  sendMessage(params: SendMessageParams, senderId = "root"): Promise<SendMessageResult> {
+    return this.requestResult({
+      type: "subagent.sendMessage",
+      params,
+      senderId,
+    }).then((m) => (m as { result?: SendMessageResult }).result ?? (m as unknown as SendMessageResult));
+  }
+
+  defineSubagent(params: DefineSubagentParams): Promise<DefineSubagentResult> {
+    return this.requestResult({
+      type: "subagent.define",
+      params,
+    }).then((m) => (m as { result?: DefineSubagentResult }).result ?? (m as unknown as DefineSubagentResult));
+  }
+
+  manageTask(params: ManageTaskParams): Promise<ManageTaskResult> {
+    return this.requestResult({
+      type: "task.manage",
+      params,
+    }).then((m) => (m as { result?: ManageTaskResult }).result ?? (m as unknown as ManageTaskResult));
+  }
+
+  createSchedule(params: ScheduleParams, creatorSubagentId?: string): Promise<ScheduleResult> {
+    return this.requestResult({
+      type: "schedule.create",
+      params,
+      ...(creatorSubagentId ? { creatorSubagentId } : {}),
+    }).then((m) => (m as { result?: ScheduleResult }).result ?? (m as unknown as ScheduleResult));
+  }
+
+  setSharedMemory(params: MemorySetParams): Promise<MemorySetResult> {
+    return this.requestResult({
+      type: "memory.set",
+      params,
+    }).then((m) => (m as { result?: MemorySetResult }).result ?? (m as unknown as MemorySetResult));
+  }
+
+  getSharedMemory(params: MemoryGetParams): Promise<MemoryGetResult> {
+    return this.requestResult({
+      type: "memory.get",
+      params,
+    }).then((m) => (m as { result?: MemoryGetResult }).result ?? (m as unknown as MemoryGetResult));
+  }
+
+  querySharedMemory(params: MemoryQueryParams): Promise<MemoryQueryResult> {
+    return this.requestResult({
+      type: "memory.query",
+      params,
+    }).then((m) => (m as { result?: MemoryQueryResult }).result ?? (m as unknown as MemoryQueryResult));
+  }
+
+  deleteSharedMemory(params: MemoryDeleteParams): Promise<MemoryDeleteResult> {
+    return this.requestResult({
+      type: "memory.delete",
+      params,
+    }).then((m) => (m as { result?: MemoryDeleteResult }).result ?? (m as unknown as MemoryDeleteResult));
+  }
+
+  dispatchPlaygroundTurn(subagentId: string, prompt: string): Promise<any> {
+    return this.requestResult({
+      type: "playground.dispatchTurn",
+      params: { subagentId, prompt },
+    }).then((m) => (m as { result?: any }).result ?? m);
+  }
+
+  simulateAgentTurn(subagentId: string, scenario: string): Promise<any> {
+    return this.requestResult({
+      type: "playground.simulateTurn",
+      params: { subagentId, scenario },
+    }).then((m) => (m as { result?: any }).result ?? m);
+  }
+
+  injectAgentFailure(subagentId: string, failureType: string, strategy?: string): Promise<any> {
+    return this.requestResult({
+      type: "playground.injectFailure",
+      params: { subagentId, failureType, ...(strategy ? { strategy } : {}) },
+    }).then((m) => (m as { result?: any }).result ?? m);
+  }
 
   /** Terminate the session. No reconnect — the token is single-use. */
   close(): void {

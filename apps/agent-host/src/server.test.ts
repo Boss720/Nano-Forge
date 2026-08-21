@@ -211,4 +211,120 @@ describe("authenticated local host", () => {
     const { code } = await waitForClose(ws);
     expect(code).toBe(CLOSE_INVALID_MESSAGE);
   });
+
+  it("handles memory RPCs (set, get, query, delete) and broadcasts memory events", async () => {
+    host = await createHost();
+    const ws = new NativeWebSocket(agentUrl(host, host.token));
+    const received: Record<string, unknown>[] = [];
+    const waiters: ((msg: Record<string, unknown>) => void)[] = [];
+
+    ws.addEventListener("message", (event) => {
+      const parsed = JSON.parse(String(event.data));
+      if (waiters.length > 0) {
+        const resolve = waiters.shift()!;
+        resolve(parsed);
+      } else {
+        received.push(parsed);
+      }
+    });
+
+    const getNext = (): Promise<Record<string, unknown>> => {
+      if (received.length > 0) {
+        return Promise.resolve(received.shift()!);
+      }
+      return new Promise((resolve) => waiters.push(resolve));
+    };
+
+    await waitForOpen(ws);
+    const ready = await getNext();
+    expect(ready.type).toBe("host.ready");
+
+    // 1. memory.set
+    ws.send(
+      JSON.stringify({
+        type: "memory.set",
+        requestId: "req-mem-1",
+        params: {
+          key: "cluster_status",
+          value: "healthy",
+          namespace: "swarm",
+          tags: ["cluster", "status"],
+        },
+      })
+    );
+
+    // Expect to receive both memory.event and memory.set.result
+    const msg1 = await getNext();
+    const msg2 = await getNext();
+    const receivedTypes = [msg1.type, msg2.type];
+    expect(receivedTypes).toContain("memory.set.result");
+    expect(receivedTypes).toContain("memory.event");
+
+    const setResultMsg = (msg1.type === "memory.set.result" ? msg1 : msg2) as any;
+    expect(setResultMsg.requestId).toBe("req-mem-1");
+    expect(setResultMsg.result.success).toBe(true);
+    expect(setResultMsg.result.entry.key).toBe("cluster_status");
+    expect(setResultMsg.result.entry.namespace).toBe("swarm");
+
+    // 2. memory.get
+    ws.send(
+      JSON.stringify({
+        type: "memory.get",
+        requestId: "req-mem-2",
+        params: {
+          key: "cluster_status",
+          namespace: "swarm",
+        },
+      })
+    );
+
+    const getResultMsg = (await getNext()) as any;
+    expect(getResultMsg.type).toBe("memory.get.result");
+    expect(getResultMsg.requestId).toBe("req-mem-2");
+    expect(getResultMsg.result.found).toBe(true);
+    expect(getResultMsg.result.entry.value).toBe("healthy");
+
+    // 3. memory.query
+    ws.send(
+      JSON.stringify({
+        type: "memory.query",
+        requestId: "req-mem-3",
+        params: {
+          namespace: "swarm",
+          query: "status",
+        },
+      })
+    );
+
+    const queryResultMsg = (await getNext()) as any;
+    expect(queryResultMsg.type).toBe("memory.query.result");
+    expect(queryResultMsg.requestId).toBe("req-mem-3");
+    expect(queryResultMsg.result.total).toBe(1);
+    expect(queryResultMsg.result.entries[0].key).toBe("cluster_status");
+
+    // 4. memory.delete
+    ws.send(
+      JSON.stringify({
+        type: "memory.delete",
+        requestId: "req-mem-4",
+        params: {
+          key: "cluster_status",
+          namespace: "swarm",
+        },
+      })
+    );
+
+    const msg3 = await getNext();
+    const msg4 = await getNext();
+    const delTypes = [msg3.type, msg4.type];
+    expect(delTypes).toContain("memory.delete.result");
+    expect(delTypes).toContain("memory.event");
+
+    const delResultMsg = (msg3.type === "memory.delete.result" ? msg3 : msg4) as any;
+    expect(delResultMsg.requestId).toBe("req-mem-4");
+    expect(delResultMsg.result.success).toBe(true);
+    expect(delResultMsg.result.deleted).toBe(true);
+
+    ws.close();
+  });
 });

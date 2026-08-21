@@ -9,6 +9,10 @@
 import path from "node:path";
 import type { ExecutionPlan } from "@protocol/plan";
 import type { ModelProfile } from "@protocol/routing";
+import {
+  safeParseTerminalClientMessage,
+  type TerminalServerMessage,
+} from "@protocol/terminal";
 import type { WebSocket } from "ws";
 import { AuditStore } from "./audit/store";
 import {
@@ -22,6 +26,7 @@ import { InMemoryProviderRegistry } from "./providers/registry";
 import { RunCoordinator, bindRouter, type ApprovalGate, type ApprovalOutcome, type ApprovalRequest } from "./runs/coordinator";
 import { RunEventLog, type RunEvent } from "./runs/events";
 import { runTerminalJob } from "./terminal/runner";
+import { PtyManager } from "./terminal/ptyManager";
 import {
   handleGitStatus,
   handleReadDir,
@@ -30,7 +35,11 @@ import {
   handleStat,
   handleWriteFile,
 } from "./workspace/filesystem";
-import { createWorkspaceWatcher } from "./workspace/watcher";
+import { createWorkspaceWatcher } from "./workspace/watcher.js";
+import { SubagentSupervisor } from "./agents/supervisor.js";
+import { DaemonManager } from "./daemons/manager.js";
+import { SharedMemoryEngine } from "./agents/memory.js";
+import { VoiceSessionManager } from "./voice/voiceManager.js";
 
 export interface AgentSessionOptions {
   workspaceRoot?: string;
@@ -46,9 +55,19 @@ export interface AgentSessionOptions {
     apiKey?: string;
     model?: string;
   };
+  /** Virtual PTY manager instance for interactive terminal sessions. */
+  ptyManager?: PtyManager;
+  /** Subagent supervisor instance. */
+  subagentSupervisor?: SubagentSupervisor;
+  /** Daemon task manager instance. */
+  daemonManager?: DaemonManager;
+  /** Shared memory engine instance. */
+  memoryEngine?: SharedMemoryEngine;
+  /** Voice session manager instance. */
+  voiceManager?: VoiceSessionManager;
 }
 
-type Send = (message: HostMessage) => void;
+type Send = (message: HostMessage | TerminalServerMessage) => void;
 
 class SocketApprovalGate implements ApprovalGate {
   private readonly pending = new Map<string, (outcome: ApprovalOutcome) => void>();
@@ -118,7 +137,7 @@ export function attachAgentSession(
   const now = () => new Date().toISOString();
   const send: Send = (message) => {
     const payload = JSON.stringify(message);
-    if (socket.readyState === socket.OPEN) socket.send(payload);
+    if (socket.readyState === 1) socket.send(payload);
     else socket.once("open", () => socket.send(payload));
   };
   const providerId = options.provider?.id ?? process.env.NANOFORGE_PROVIDER_ID ?? "openai-compatible";
@@ -147,6 +166,47 @@ export function attachAgentSession(
   });
   const runs = new Map<string, ReturnType<RunCoordinator["submitRun"]>>();
   let watcher: ReturnType<typeof createWorkspaceWatcher> | undefined;
+  const ptyManager =
+    options.ptyManager ??
+    new PtyManager({
+      workspaceRoot,
+      onMessage: (msg) => send(msg),
+    });
+
+  const daemonManager = options.daemonManager ?? new DaemonManager();
+  const subagentSupervisor =
+    options.subagentSupervisor ??
+    new SubagentSupervisor({
+      workspaceRoot,
+      daemonSupervisor: daemonManager.supervisor,
+      scheduler: daemonManager.scheduler,
+    });
+  const memoryEngine = options.memoryEngine ?? subagentSupervisor.memory;
+  const voiceManager =
+    options.voiceManager ??
+    new VoiceSessionManager({
+      workspaceRoot,
+      coordinator,
+      providerRegistry: registry,
+      profiles,
+      send: (msg) => send(msg),
+    });
+
+  subagentSupervisor.subscribe((event) => {
+    send({ type: "subagent.event", event, at: now() });
+  });
+
+  memoryEngine.subscribe((event) => {
+    send({ type: "memory.event", event, at: now() });
+  });
+
+  daemonManager.supervisor.subscribe((event) => {
+    send({ type: "task.event", event, at: now() });
+  });
+
+  daemonManager.scheduler.subscribe((event) => {
+    send({ type: "task.event", event, at: now() });
+  });
 
   eventLog.subscribeAll((event) => {
     // Submission emits its first ledger events synchronously. Defer their
@@ -208,15 +268,60 @@ export function attachAgentSession(
     }
   };
 
-  socket.on("message", (data: unknown) => {
+  socket.on("message", async (data: unknown) => {
     const decoded = decodeClientMessage(data);
     if (!decoded.ok) {
+      if (typeof data === "string" || data instanceof Buffer || Array.isArray(data)) {
+        try {
+          const parsed = JSON.parse(String(data));
+          if (
+            typeof parsed === "object" &&
+            parsed !== null &&
+            "type" in parsed &&
+            typeof (parsed as { type: unknown }).type === "string" &&
+            ((parsed as { type: string }).type).startsWith("terminal.")
+          ) {
+            const terminalResult = safeParseTerminalClientMessage(parsed);
+            if (terminalResult.success) {
+              const tMsg = terminalResult.data;
+              switch (tMsg.type) {
+                case "terminal.create":
+                  void ptyManager.createSession(tMsg).catch((err) => {
+                    send({
+                      type: "error",
+                      code: "terminal_error",
+                      message: err instanceof Error ? err.message : String(err),
+                      at: now(),
+                    });
+                  });
+                  break;
+                case "terminal.input":
+                  ptyManager.writeInput(tMsg.id, tMsg.data);
+                  break;
+                case "terminal.resize":
+                  ptyManager.resize(tMsg.id, tMsg.cols, tMsg.rows);
+                  break;
+                case "terminal.kill":
+                  void ptyManager.kill(tMsg.id, tMsg.signal);
+                  break;
+              }
+              return;
+            }
+          }
+        } catch {
+          /* ignore */
+        }
+      }
       socket.close(4400, "invalid message");
       return;
     }
     const message = decoded.message;
     if (message.type.startsWith("workspace.")) {
       void dispatchWorkspace(message);
+      return;
+    }
+    if (message.type.startsWith("voice.")) {
+      void voiceManager.handleClientMessage(message);
       return;
     }
     switch (message.type) {
@@ -256,11 +361,105 @@ export function attachAgentSession(
       case "tool.response":
         approvalGate.resolve(message.requestId, message.type === "tool.response" ? message.approved : false, message.reason);
         break;
+      case "subagent.invoke": {
+        try {
+          const result = await subagentSupervisor.spawnSubagent(message.params, message.parentId);
+          send({ type: "subagent.invoke.result", requestId: message.requestId, result });
+        } catch (err) {
+          send({ type: "error", code: "subagent_error", message: err instanceof Error ? err.message : String(err), at: now() });
+        }
+        break;
+      }
+      case "subagent.manage": {
+        try {
+          const result = await subagentSupervisor.manageSubagents(message.params, message.callerId);
+          send({ type: "subagent.manage.result", requestId: message.requestId, result });
+        } catch (err) {
+          send({ type: "error", code: "subagent_error", message: err instanceof Error ? err.message : String(err), at: now() });
+        }
+        break;
+      }
+      case "subagent.sendMessage": {
+        try {
+          const result = await subagentSupervisor.sendMessage(message.params, message.senderId);
+          send({ type: "subagent.sendMessage.result", requestId: message.requestId, result });
+        } catch (err) {
+          send({ type: "error", code: "subagent_error", message: err instanceof Error ? err.message : String(err), at: now() });
+        }
+        break;
+      }
+      case "subagent.define": {
+        try {
+          const result = await subagentSupervisor.defineSubagent(message.params);
+          send({ type: "subagent.define.result", requestId: message.requestId, result });
+        } catch (err) {
+          send({ type: "error", code: "subagent_error", message: err instanceof Error ? err.message : String(err), at: now() });
+        }
+        break;
+      }
+      case "task.manage": {
+        try {
+          const result = await daemonManager.manageTask(message.params);
+          send({ type: "task.manage.result", requestId: message.requestId, result });
+        } catch (err) {
+          send({ type: "error", code: "task_error", message: err instanceof Error ? err.message : String(err), at: now() });
+        }
+        break;
+      }
+      case "schedule.create": {
+        try {
+          const result = await daemonManager.scheduleTask(message.params, message.creatorSubagentId);
+          send({ type: "schedule.create.result", requestId: message.requestId, result });
+        } catch (err) {
+          send({ type: "error", code: "schedule_error", message: err instanceof Error ? err.message : String(err), at: now() });
+        }
+        break;
+      }
+      case "memory.set": {
+        try {
+          const result = memoryEngine.set(message.params, message.authorInfo);
+          send({ type: "memory.set.result", requestId: message.requestId, result });
+        } catch (err) {
+          send({ type: "error", code: "memory_error", message: err instanceof Error ? err.message : String(err), at: now() });
+        }
+        break;
+      }
+      case "memory.get": {
+        try {
+          const result = memoryEngine.get(message.params);
+          send({ type: "memory.get.result", requestId: message.requestId, result });
+        } catch (err) {
+          send({ type: "error", code: "memory_error", message: err instanceof Error ? err.message : String(err), at: now() });
+        }
+        break;
+      }
+      case "memory.query": {
+        try {
+          const result = memoryEngine.query(message.params);
+          send({ type: "memory.query.result", requestId: message.requestId, result });
+        } catch (err) {
+          send({ type: "error", code: "memory_error", message: err instanceof Error ? err.message : String(err), at: now() });
+        }
+        break;
+      }
+      case "memory.delete": {
+        try {
+          const result = memoryEngine.delete(message.params);
+          send({ type: "memory.delete.result", requestId: message.requestId, result });
+        } catch (err) {
+          send({ type: "error", code: "memory_error", message: err instanceof Error ? err.message : String(err), at: now() });
+        }
+        break;
+      }
     }
   });
   socket.on("close", () => {
     approvalGate.close();
     void watcher?.close();
     auditStore.close();
+    ptyManager.dispose();
+    void daemonManager.dispose();
+    voiceManager.dispose();
   });
 }
+

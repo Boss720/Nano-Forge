@@ -1,5 +1,6 @@
-import { BarChart3, Download, Image, KeyRound, PanelLeft, PanelRight, Settings, Zap } from "lucide-react";
+import { BarChart3, Download, Image, KeyRound, Layers, Network, Palette, PanelLeft, PanelRight, PhoneCall, Settings, Zap } from "lucide-react";
 import type { ConnectionState, UsageTotals } from "@/types";
+import type { VoiceCallStatus } from "@protocol/voice";
 
 interface Props {
   connection: ConnectionState;
@@ -15,9 +16,39 @@ interface Props {
   onOpenCosts: () => void;
   /** Final phase: open the image generation panel. */
   onOpenImages: () => void;
+  /** Phase 1: open artifact viewer dock */
+  onOpenArtifacts?: () => void;
+  artifactCount?: number;
+  /** Milestone 3: open subagent swarm dock */
+  onOpenSubagents?: () => void;
+  subagentCount?: number;
+  /** Milestone 4: open theme customizer dialog */
+  onOpenTheme?: () => void;
+  /** Milestone 3: open voice call drawer */
+  onOpenVoiceCall?: () => void;
+  isVoiceCallActive?: boolean;
+  voiceCallStatus?: VoiceCallStatus;
 }
 
-export function TopBar({ connection, usage, onOpenSettings, onOpenSidebar, onOpenModels, onExport, canExport, onOpenCosts, onOpenImages }: Props) {
+export function TopBar({
+  connection,
+  usage,
+  onOpenSettings,
+  onOpenSidebar,
+  onOpenModels,
+  onExport,
+  canExport,
+  onOpenCosts,
+  onOpenImages,
+  onOpenArtifacts,
+  artifactCount = 0,
+  onOpenSubagents,
+  subagentCount = 0,
+  onOpenTheme,
+  onOpenVoiceCall,
+  isVoiceCallActive = false,
+  voiceCallStatus,
+}: Props) {
   const connected = connection.status === "connected";
   return (
     <header className="flex h-12 shrink-0 items-center gap-4 border-b border-border bg-card px-4">
@@ -88,7 +119,60 @@ export function TopBar({ connection, usage, onOpenSettings, onOpenSidebar, onOpe
         <Image className="h-4 w-4" />
       </button>
 
-      {/* usage */}
+      {/* Phase 1: Artifact Dock toggle */}
+      {onOpenArtifacts && (
+        <button
+          onClick={onOpenArtifacts}
+          title="Artifacts Dock — diffs, diagrams, and live previews"
+          className="relative rounded-md border border-border bg-secondary/60 p-1.5 text-muted-foreground transition-colors hover:border-primary/50 hover:text-primary"
+          aria-label="Open artifacts dock"
+        >
+          <Layers className="h-4 w-4" />
+          {artifactCount > 0 && (
+            <span className="absolute -right-1 -top-1 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-primary font-mono text-[9px] font-bold text-primary-foreground">
+              {artifactCount}
+            </span>
+          )}
+        </button>
+      )}
+
+      {/* Milestone 3: Subagent Swarm Control Plane toggle */}
+      {onOpenSubagents && (
+        <button
+          onClick={onOpenSubagents}
+          title="Swarm Control Plane — subagents, mailboxes, and daemons"
+          className="relative rounded-md border border-border bg-secondary/60 p-1.5 text-muted-foreground transition-colors hover:border-primary/50 hover:text-primary"
+          aria-label="Open subagents control plane"
+        >
+          <Network className="h-4 w-4" />
+          {subagentCount > 0 && (
+            <span className="absolute -right-1 -top-1 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-cyan-500 font-mono text-[9px] font-bold text-white">
+              {subagentCount}
+            </span>
+          )}
+        </button>
+      )}
+
+      {/* Milestone 3: Voice Call trigger & active indicator */}
+      {onOpenVoiceCall && (
+        <button
+          onClick={onOpenVoiceCall}
+          data-testid="topbar-voice-call-button"
+          data-call-active={String(isVoiceCallActive)}
+          title={isVoiceCallActive ? `Voice Call (${voiceCallStatus || "active"})` : "Start Voice Call"}
+          className={`relative rounded-md border p-1.5 transition-all ${
+            isVoiceCallActive
+              ? "border-emerald-500/60 bg-emerald-500/15 text-emerald-400 shadow-sm"
+              : "border-border bg-secondary/60 text-muted-foreground hover:border-primary/50 hover:text-primary"
+          }`}
+          aria-label={isVoiceCallActive ? "Open active voice call" : "Start voice call"}
+        >
+          <PhoneCall className={`h-4 w-4 ${isVoiceCallActive ? "animate-pulse" : ""}`} />
+          {isVoiceCallActive && (
+            <span className="absolute -right-1 -top-1 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-emerald-500 text-[8px] text-white font-bold pulse-dot" />
+          )}
+        </button>
+      )}
       <div className="hidden items-center gap-4 font-mono text-[11px] text-muted-foreground md:flex">
         <span>
           <span className="text-foreground">{usage.requests}</span> runs
@@ -122,6 +206,17 @@ export function TopBar({ connection, usage, onOpenSettings, onOpenSidebar, onOpe
       >
         <PanelRight className="h-4 w-4" />
       </button>
+
+      {onOpenTheme && (
+        <button
+          onClick={onOpenTheme}
+          title="Theme Customizer — presets & live palette"
+          className="rounded-md border border-border bg-secondary/60 p-1.5 text-muted-foreground transition-colors hover:border-primary/50 hover:text-primary"
+          aria-label="Open theme customizer"
+        >
+          <Palette className="h-4 w-4" />
+        </button>
+      )}
 
       <button
         onClick={onOpenSettings}

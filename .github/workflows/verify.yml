@@ -1,0 +1,49 @@
+name: Verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  quality-gate:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck web app
+        run: npx tsc -p tsconfig.app.json
+
+      - name: Typecheck protocol package
+        run: npm run typecheck:protocol
+
+      - name: Typecheck agent host
+        run: npm run typecheck:host
+
+      - name: Unit tests (web)
+        run: npm test
+
+      - name: Unit tests (protocol)
+        run: npm run test:protocol
+
+      - name: Unit tests (agent host)
+        run: npm run test:host
+
+      - name: Build
+        run: npm run build

@@ -13,7 +13,9 @@
     "test:host": "vitest run --config apps/agent-host/vitest.config.ts",
     "typecheck:protocol": "tsc -p packages/protocol/tsconfig.json",
     "typecheck:host": "tsc -p apps/agent-host/tsconfig.json",
-    "start:host": "tsx apps/agent-host/src/server.ts"
+    "start:host": "tsx apps/agent-host/src/server.ts",
+    "start:launcher": "node scripts/nanoforge-launcher.cjs",
+    "package": "node scripts/package-release.js"
   },
   "dependencies": {
     "@fastify/websocket": "^11.3.0",

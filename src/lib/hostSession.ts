@@ -46,9 +46,9 @@
  *  5. Visual-verification evidence arrives as `run.event` "visual.evidence"
  *     with detail JSON `{ assertions?, diff? }` (VisualEvidenceCard props).
  *
- *  6. Integrations (rules packs / skills / MCP servers, Task 14) have no
- *     protocol frames yet: rows start empty ("none configured") and the
- *     toggles are documented no-ops until the host protocol grows them.
+ *  6. Integrations arrive as `integrations.snapshot` frames. UI toggles are
+ *     session-local host requests: they update the loaded runtime context but
+ *     never rewrite `.nanoforge` manifests and never grant tool permissions.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ExecutionPlan, PlanStep, PlanStepStatus, ToolRun } from "@/types";
@@ -137,6 +137,38 @@ export function browserScopeOrigin(step: PlanStep): string | null {
 }
 
 /* ------------------------------------------------------------------ */
+import type {
+  InvokeSubagentParams,
+  InvokeSubagentResult,
+  ManageSubagentsParams,
+  ManageSubagentsResult,
+  SendMessageParams,
+  SendMessageResult,
+  DefineSubagentParams,
+  DefineSubagentResult,
+  SubagentInfo,
+  SubagentMessage,
+} from "@protocol/subagents";
+import type {
+  ManageTaskParams,
+  ManageTaskResult,
+  ScheduleParams,
+  ScheduleResult,
+  TaskSummary,
+} from "@protocol/tasks";
+import type {
+  MemoryEntry,
+  MemorySetParams,
+  MemorySetResult,
+  MemoryGetParams,
+  MemoryGetResult,
+  MemoryQueryParams,
+  MemoryQueryResult,
+  MemoryDeleteParams,
+  MemoryDeleteResult,
+} from "@protocol/memory";
+
+/* ------------------------------------------------------------------ */
 /* Derived state types                                                 */
 /* ------------------------------------------------------------------ */
 
@@ -151,6 +183,20 @@ export interface HostClientLike {
   denyApproval(runId: string, stepId: string): Promise<void>;
   pauseRun(runId: string): Promise<void>;
   cancelRun(runId: string): Promise<void>;
+  toggleIntegration?(kind: "rules" | "skill" | "mcp", id: string, enabled: boolean): Promise<void>;
+  invokeSubagent?(params: InvokeSubagentParams, parentId?: string): Promise<InvokeSubagentResult>;
+  manageSubagents?(params: ManageSubagentsParams, callerId?: string): Promise<ManageSubagentsResult>;
+  sendMessage?(params: SendMessageParams, senderId?: string): Promise<SendMessageResult>;
+  defineSubagent?(params: DefineSubagentParams): Promise<DefineSubagentResult>;
+  manageTask?(params: ManageTaskParams): Promise<ManageTaskResult>;
+  createSchedule?(params: ScheduleParams, creatorSubagentId?: string): Promise<ScheduleResult>;
+  setSharedMemory?(params: MemorySetParams): Promise<MemorySetResult>;
+  getSharedMemory?(params: MemoryGetParams): Promise<MemoryGetResult>;
+  querySharedMemory?(params: MemoryQueryParams): Promise<MemoryQueryResult>;
+  deleteSharedMemory?(params: MemoryDeleteParams): Promise<MemoryDeleteResult>;
+  dispatchPlaygroundTurn?(subagentId: string, prompt: string): Promise<any>;
+  simulateAgentTurn?(subagentId: string, scenario: string): Promise<any>;
+  injectAgentFailure?(subagentId: string, failureType: string, strategy?: string): Promise<any>;
 }
 
 export interface HostIntegrationsState {
@@ -190,6 +236,14 @@ export interface HostSession {
   integrations: HostIntegrationsState;
   evidence: HostEvidence | null;
   permissionPending: BrowserPermissionRequest | null;
+  // Subagent & Daemon Swarm Control Plane State
+  subagents: SubagentInfo[];
+  activeSubagentId: string | null;
+  interAgentMessages: SubagentMessage[];
+  daemonTasks: TaskSummary[];
+  schedules: ScheduleResult[];
+  sharedMemory: MemoryEntry[];
+
   /** Wiring seam for the (future) plan composer and tests: install/replace
    *  the inspected plan. Passing null clears the plan rail and its evidence. */
   setPlan(plan: ExecutionPlan | null): void;
@@ -199,10 +253,52 @@ export interface HostSession {
   cancel(planId: string): void;
   stopToolRun(toolRunId: string): void;
   decidePermission(decision: BrowserPermissionDecision): void;
-  /** Task 14: integration toggles ride a future protocol extension — no-ops. */
   toggleRulesPack: (id: string, enabled: boolean) => void;
   toggleSkill: (id: string, enabled: boolean) => void;
   toggleMcpServer: (id: string, enabled: boolean) => void;
+
+  // Subagents & Tasks Control Plane Methods
+  setActiveSubagentId: (id: string | null) => void;
+  spawnSubagent: (params: InvokeSubagentParams, parentId?: string) => Promise<InvokeSubagentResult | null>;
+  killSubagent: (subagentId: string) => Promise<ManageSubagentsResult | null>;
+  killSubagentTree: (subagentId: string) => Promise<ManageSubagentsResult | null>;
+  sendAgentMessage: (
+    recipientId: string,
+    body: string,
+    options?: { subject?: string; referencedArtifacts?: string[]; priority?: "high" | "normal" | "low" }
+  ) => Promise<SendMessageResult | null>;
+  manageSubagentsAction: (params: ManageSubagentsParams) => Promise<ManageSubagentsResult | null>;
+  defineSubagent: (params: DefineSubagentParams) => Promise<DefineSubagentResult | null>;
+  manageTask: (params: ManageTaskParams) => Promise<ManageTaskResult | null>;
+  createSchedule: (params: ScheduleParams) => Promise<ScheduleResult | null>;
+  cancelSchedule: (scheduleId: string) => Promise<ManageTaskResult | null>;
+  sendTaskInput: (taskId: string, input: string) => Promise<ManageTaskResult | null>;
+  killTask: (taskId: string) => Promise<ManageTaskResult | null>;
+
+  // Shared Memory & Playground Methods
+  setSharedMemory: (
+    key: string,
+    value: unknown,
+    namespace?: string,
+    ttlSeconds?: number,
+    tags?: string[]
+  ) => Promise<MemorySetResult | null>;
+  getSharedMemory: (key: string, namespace?: string) => Promise<MemoryGetResult | null>;
+  querySharedMemory: (params: MemoryQueryParams) => Promise<MemoryQueryResult | null>;
+  deleteSharedMemory: (key: string, namespace?: string) => Promise<MemoryDeleteResult | null>;
+  dispatchPlaygroundTurn: (
+    subagentId: string,
+    prompt: string
+  ) => Promise<{ success: boolean; turnId?: string; response?: string; tokensUsed?: number; latencyMs?: number } | null>;
+  simulateAgentTurn: (
+    subagentId: string,
+    scenario: string
+  ) => Promise<{ success: boolean; turnId?: string; scenario?: string; output?: string; tokensUsed?: number; latencyMs?: number } | null>;
+  injectAgentFailure: (
+    subagentId: string,
+    failureType: "timeout" | "crash" | "stall" | "out_of_budget",
+    strategy?: "one_for_one" | "one_for_all" | "rest_for_one"
+  ) => Promise<{ success: boolean; affectedSubagents?: string[]; recovered?: boolean; message?: string } | null>;
 }
 
 export interface UseHostSessionOptions {
@@ -260,6 +356,30 @@ function upsertToolRun(prev: ToolRun[], next: ToolRun): ToolRun[] {
   return copy;
 }
 
+function upsertSubagent(prev: SubagentInfo[], next: SubagentInfo): SubagentInfo[] {
+  const i = prev.findIndex((s) => s.id === next.id);
+  if (i === -1) return [...prev, next];
+  const copy = prev.slice();
+  copy[i] = { ...prev[i], ...next };
+  return copy;
+}
+
+function upsertTask(prev: TaskSummary[], next: TaskSummary): TaskSummary[] {
+  const i = prev.findIndex((t) => t.taskId === next.taskId);
+  if (i === -1) return [...prev, next];
+  const copy = prev.slice();
+  copy[i] = { ...prev[i], ...next };
+  return copy;
+}
+
+function upsertMemoryEntry(prev: MemoryEntry[], next: MemoryEntry): MemoryEntry[] {
+  const i = prev.findIndex((e) => (e.namespace || "global") === (next.namespace || "global") && e.key === next.key);
+  if (i === -1) return [...prev, next];
+  const copy = prev.slice();
+  copy[i] = next;
+  return copy;
+}
+
 const originGrantKey = (origin: string) => `origin|${origin}`;
 const sensitiveGrantKey = (action: string, origin: string) => `sensitive|${action}@${origin}`;
 
@@ -283,7 +403,16 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
   const [toolRuns, setToolRuns] = useState<ToolRun[]>([]);
   const [route, setRoute] = useState<RouteDecisionState | null>(null);
   const [evidence, setEvidence] = useState<HostEvidence | null>(null);
-  const [integrations] = useState<HostIntegrationsState>(EMPTY_INTEGRATIONS);
+  const [integrations, setIntegrations] = useState<HostIntegrationsState>(EMPTY_INTEGRATIONS);
+
+  // Subagents & Tasks Control Plane State
+  const [subagents, setSubagents] = useState<SubagentInfo[]>([]);
+  const [activeSubagentId, setActiveSubagentId] = useState<string | null>(null);
+  const [interAgentMessages, setInterAgentMessages] = useState<SubagentMessage[]>([]);
+  const [daemonTasks, setDaemonTasks] = useState<TaskSummary[]>([]);
+  const [schedules, setSchedules] = useState<ScheduleResult[]>([]);
+  const [sharedMemory, setSharedMemoryState] = useState<MemoryEntry[]>([]);
+
   // Connect lifecycle: the connection effect below writes this ONLY from
   // async promise callbacks (react-hooks/set-state-in-effect); `status` is
   // derived rather than stored.
@@ -463,8 +592,301 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
         case "run.event":
           handleRunEvent(msg);
           break;
+        case "integrations.snapshot":
+          setIntegrations(msg.snapshot);
+          break;
         case "error":
           setLastError(`${msg.code}: ${msg.message}`);
+          break;
+
+        /* --- Subagent Wire Events --- */
+        case "subagent.event": {
+          const ev = msg.event;
+          if (ev.type === "subagent.spawned") {
+            setSubagents((prev) => upsertSubagent(prev, ev.subagent));
+          } else if (ev.type === "subagent.state_changed") {
+            setSubagents((prev) =>
+              prev.map((s) =>
+                s.id === ev.subagentId
+                  ? {
+                      ...s,
+                      state: ev.newState,
+                      ...(ev.reason ? { lastProgressSummary: ev.reason } : {}),
+                      lastHeartbeat: ev.at,
+                    }
+                  : s,
+              ),
+            );
+          } else if (ev.type === "subagent.message_sent") {
+            setInterAgentMessages((prev) => [...prev, ev.message]);
+          } else if (ev.type === "subagent.heartbeat") {
+            setSubagents((prev) =>
+              prev.map((s) =>
+                s.id === ev.subagentId
+                  ? {
+                      ...s,
+                      lastHeartbeat: ev.lastVisited,
+                      ...(ev.progressSummary ? { lastProgressSummary: ev.progressSummary } : {}),
+                    }
+                  : s,
+              ),
+            );
+          } else if (ev.type === "subagent.completed") {
+            setSubagents((prev) =>
+              prev.map((s) =>
+                s.id === ev.subagentId
+                  ? {
+                      ...s,
+                      state: "idle",
+                      completedAt: ev.at,
+                      tokensUsed: ev.tokensUsed,
+                      turnCount: ev.turnCount,
+                    }
+                  : s,
+              ),
+            );
+          } else if (ev.type === "subagent.errored") {
+            setSubagents((prev) =>
+              prev.map((s) =>
+                s.id === ev.subagentId
+                  ? {
+                      ...s,
+                      state: "errored",
+                      error: ev.error,
+                    }
+                  : s,
+              ),
+            );
+          } else if (ev.type === "subagent.tree_updated") {
+            setSubagents(ev.tree);
+          }
+          break;
+        }
+        case "subagent.spawned":
+          setSubagents((prev) => upsertSubagent(prev, msg.subagent));
+          break;
+        case "subagent.state_changed":
+        case "subagent.state":
+          setSubagents((prev) =>
+            prev.map((s) =>
+              s.id === msg.subagentId
+                ? {
+                    ...s,
+                    state: msg.newState ?? msg.state ?? s.state,
+                    ...(msg.tokensUsed !== undefined ? { tokensUsed: msg.tokensUsed } : {}),
+                    ...(msg.reason ? { lastProgressSummary: msg.reason } : {}),
+                    lastHeartbeat: msg.at ?? new Date().toISOString(),
+                  }
+                : s,
+            ),
+          );
+          break;
+        case "subagent.message_sent":
+        case "subagent.message":
+          setInterAgentMessages((prev) => [...prev, msg.message]);
+          break;
+        case "subagent.heartbeat":
+          setSubagents((prev) =>
+            prev.map((s) =>
+              s.id === msg.subagentId
+                ? {
+                    ...s,
+                    lastHeartbeat: msg.lastVisited,
+                    ...(msg.progressSummary ? { lastProgressSummary: msg.progressSummary } : {}),
+                  }
+                : s,
+            ),
+          );
+          break;
+        case "subagent.completed":
+          setSubagents((prev) =>
+            prev.map((s) =>
+              s.id === msg.subagentId
+                ? {
+                    ...s,
+                    state: "idle",
+                    completedAt: msg.at,
+                    tokensUsed: msg.tokensUsed,
+                    turnCount: msg.turnCount,
+                  }
+                : s,
+            ),
+          );
+          break;
+        case "subagent.errored":
+          setSubagents((prev) =>
+            prev.map((s) =>
+              s.id === msg.subagentId
+                ? {
+                    ...s,
+                    state: "errored",
+                    error: msg.error,
+                  }
+                : s,
+            ),
+          );
+          break;
+        case "subagent.tree_updated":
+          setSubagents(msg.tree);
+          break;
+        case "subagents.snapshot":
+          setSubagents(msg.snapshot ?? (msg as unknown as { subagents?: SubagentInfo[] }).subagents ?? []);
+          break;
+
+        /* --- Task & Scheduler Wire Events --- */
+        case "task.event": {
+          const ev = msg.event;
+          if (ev.type === "task.spawned") {
+            setDaemonTasks((prev) => upsertTask(prev, ev.task));
+          } else if (ev.type === "task.output") {
+            setDaemonTasks((prev) =>
+              prev.map((t) =>
+                t.taskId === ev.taskId
+                  ? { ...t, recentLogs: (t.recentLogs ?? "") + ev.chunk }
+                  : t,
+              ),
+            );
+          } else if (ev.type === "task.completed") {
+            setDaemonTasks((prev) =>
+              prev.map((t) =>
+                t.taskId === ev.taskId
+                  ? { ...t, status: "completed", exitCode: ev.exitCode, completedAt: ev.at }
+                  : t,
+              ),
+            );
+          } else if (ev.type === "task.killed") {
+            setDaemonTasks((prev) =>
+              prev.map((t) =>
+                t.taskId === ev.taskId
+                  ? { ...t, status: "killed", completedAt: ev.at }
+                  : t,
+              ),
+            );
+          } else if (ev.type === "schedule.triggered") {
+            setSchedules((prev) =>
+              prev.map((sc) =>
+                sc.scheduleId === ev.scheduleId
+                  ? { ...sc, status: "active" }
+                  : sc,
+              ),
+            );
+          } else if (ev.type === "schedule.cancelled") {
+            setSchedules((prev) =>
+              prev.map((sc) =>
+                sc.scheduleId === ev.scheduleId
+                  ? { ...sc, status: "cancelled" }
+                  : sc,
+              ),
+            );
+          }
+          break;
+        }
+        case "task.spawned":
+          setDaemonTasks((prev) => upsertTask(prev, msg.task));
+          break;
+        case "task.completed":
+          setDaemonTasks((prev) =>
+            prev.map((t) =>
+              t.taskId === msg.taskId
+                ? { ...t, status: "completed", exitCode: msg.exitCode, completedAt: msg.at }
+                : t,
+            ),
+          );
+          break;
+        case "task.killed":
+          setDaemonTasks((prev) =>
+            prev.map((t) =>
+              t.taskId === msg.taskId
+                ? { ...t, status: "killed", completedAt: msg.at }
+                : t,
+            ),
+          );
+          break;
+        case "schedule.triggered":
+          setSchedules((prev) =>
+            prev.map((sc) =>
+              sc.scheduleId === msg.scheduleId
+                ? { ...sc, status: "active" }
+                : sc,
+            ),
+          );
+          break;
+        case "schedule.cancelled":
+          setSchedules((prev) =>
+            prev.map((sc) =>
+              sc.scheduleId === msg.scheduleId
+                ? { ...sc, status: "cancelled" }
+                : sc,
+            ),
+          );
+          break;
+        case "tasks.snapshot":
+          setDaemonTasks(msg.snapshot ?? (msg as unknown as { tasks?: TaskSummary[] }).tasks ?? []);
+          break;
+        case "schedules.snapshot":
+          setSchedules(msg.snapshot ?? (msg as unknown as { schedules?: ScheduleResult[] }).schedules ?? []);
+          break;
+
+        /* --- Shared Memory & Telemetry Wire Events --- */
+        case "memory.entry_set":
+          setSharedMemoryState((prev) => upsertMemoryEntry(prev, msg.entry));
+          break;
+        case "memory.entry_deleted":
+          setSharedMemoryState((prev) =>
+            prev.filter((e) => !((e.namespace || "global") === (msg.namespace || "global") && e.key === msg.key))
+          );
+          break;
+        case "memory.cleared":
+          setSharedMemoryState((prev) =>
+            msg.namespace ? prev.filter((e) => (e.namespace || "global") !== msg.namespace) : []
+          );
+          break;
+        case "memory.snapshot":
+          setSharedMemoryState(msg.snapshot ?? []);
+          break;
+        case "subagent.telemetry_updated":
+          setSubagents((prev) =>
+            prev.map((s) =>
+              s.id === msg.subagentId
+                ? {
+                    ...s,
+                    telemetry: msg.telemetry,
+                    tokensUsed: msg.telemetry.totalTokens ?? s.tokensUsed,
+                    turnCount: msg.telemetry.turnCount ?? s.turnCount,
+                  }
+                : s
+            )
+          );
+          break;
+        case "subagent.turn_started":
+          setSubagents((prev) =>
+            prev.map((s) =>
+              s.id === msg.subagentId
+                ? {
+                    ...s,
+                    state: "running",
+                    lastHeartbeat: msg.at ?? new Date().toISOString(),
+                    ...(msg.prompt ? { lastProgressSummary: `Turn prompt: ${msg.prompt.slice(0, 100)}...` } : {}),
+                  }
+                : s
+            )
+          );
+          break;
+        case "subagent.turn_completed":
+          setSubagents((prev) =>
+            prev.map((s) =>
+              s.id === msg.subagentId
+                ? {
+                    ...s,
+                    state: "idle",
+                    tokensUsed: (s.tokensUsed || 0) + (msg.tokensUsed || 0),
+                    turnCount: (s.turnCount || 0) + 1,
+                    ...(msg.output ? { lastProgressSummary: msg.output.slice(0, 100) } : {}),
+                    lastHeartbeat: msg.at ?? new Date().toISOString(),
+                  }
+                : s
+            )
+          );
           break;
       }
     },
@@ -578,8 +1000,368 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
     [perms, sendGrant],
   );
 
-  // Task 14: no integration protocol frames exist yet — toggles are no-ops.
-  const noopToggle = useCallback(() => {}, []);
+  const toggleIntegration = useCallback((kind: "rules" | "skill" | "mcp", id: string, enabled: boolean) => {
+    setIntegrations((prev) => ({
+      rulesPacks:
+        kind === "rules" ? prev.rulesPacks.map((row) => (row.id === id ? { ...row, enabled } : row)) : prev.rulesPacks,
+      skills:
+        kind === "skill" ? prev.skills.map((row) => (row.id === id ? { ...row, enabled } : row)) : prev.skills,
+      mcpServers:
+        kind === "mcp" ? prev.mcpServers.map((row) => (row.id === id ? { ...row, enabled } : row)) : prev.mcpServers,
+    }));
+    const p = clientRef.current?.toggleIntegration?.(kind, id, enabled);
+    void p?.catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      setLastError(message);
+    });
+  }, []);
+
+  /* ------------------------- Subagent & Task RPC Dispatchers ------------------------- */
+
+  const spawnSubagent = useCallback(
+    async (params: InvokeSubagentParams, parentId?: string): Promise<InvokeSubagentResult | null> => {
+      const client = clientRef.current;
+      if (!client || !client.invokeSubagent) return null;
+      try {
+        const res = await client.invokeSubagent(params, parentId);
+        setSubagents((prev) =>
+          upsertSubagent(prev, {
+            id: res.subagentId,
+            parentId: parentId ?? null,
+            name: res.name,
+            archetype: res.archetype,
+            roles: params.roles ?? [],
+            state: res.state,
+            workingDirectory: res.workingDirectory,
+            isolationMode: params.workspaceIsolation ?? "inherit",
+            startedAt: res.startedAt,
+            lastHeartbeat: res.startedAt,
+            tokensUsed: 0,
+            turnCount: 0,
+          }),
+        );
+        return res;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setLastError(message);
+        throw err;
+      }
+    },
+    [],
+  );
+
+  const manageSubagentsAction = useCallback(
+    async (params: ManageSubagentsParams): Promise<ManageSubagentsResult | null> => {
+      const client = clientRef.current;
+      if (!client || !client.manageSubagents) return null;
+      try {
+        const res = await client.manageSubagents(params);
+        if (params.action === "list" && res.subagents) {
+          setSubagents(res.subagents);
+        } else if (params.action === "status" && res.detail) {
+          setSubagents((prev) => upsertSubagent(prev, res.detail!));
+        } else if (params.action === "kill" && params.subagentId) {
+          if (params.recursive) {
+            setSubagents((prev) =>
+              prev.map((s) =>
+                s.id === params.subagentId || s.parentId === params.subagentId
+                  ? { ...s, state: "errored", error: "Terminated by user" }
+                  : s,
+              ),
+            );
+          } else {
+            setSubagents((prev) =>
+              prev.map((s) =>
+                s.id === params.subagentId
+                  ? { ...s, state: "errored", error: "Terminated by user" }
+                  : s,
+              ),
+            );
+          }
+        }
+        return res;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setLastError(message);
+        throw err;
+      }
+    },
+    [],
+  );
+
+  const killSubagent = useCallback(
+    async (subagentId: string): Promise<ManageSubagentsResult | null> => {
+      return manageSubagentsAction({ action: "kill", subagentId, recursive: false });
+    },
+    [manageSubagentsAction],
+  );
+
+  const killSubagentTree = useCallback(
+    async (subagentId: string): Promise<ManageSubagentsResult | null> => {
+      return manageSubagentsAction({ action: "kill", subagentId, recursive: true });
+    },
+    [manageSubagentsAction],
+  );
+
+  const sendAgentMessage = useCallback(
+    async (
+      recipientId: string,
+      body: string,
+      options?: { subject?: string; referencedArtifacts?: string[]; priority?: "high" | "normal" | "low" },
+    ): Promise<SendMessageResult | null> => {
+      const client = clientRef.current;
+      if (!client || !client.sendMessage) return null;
+      try {
+        const res = await client.sendMessage({
+          recipientId,
+          subject: options?.subject ?? "Direct Message",
+          body,
+          referencedArtifacts: options?.referencedArtifacts ?? [],
+          priority: options?.priority ?? "normal",
+        });
+        const msgFrame: SubagentMessage = {
+          messageId: res.messageId,
+          senderId: "00000000-0000-0000-0000-000000000000",
+          senderName: "Operator / UI",
+          recipientId,
+          timestamp: res.deliveryTimestamp,
+          subject: options?.subject ?? "Direct Message",
+          body,
+          referencedArtifacts: options?.referencedArtifacts ?? [],
+          priority: options?.priority ?? "normal",
+        };
+        setInterAgentMessages((prev) => [...prev, msgFrame]);
+        return res;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setLastError(message);
+        throw err;
+      }
+    },
+    [],
+  );
+
+  const defineSubagent = useCallback(
+    async (params: DefineSubagentParams): Promise<DefineSubagentResult | null> => {
+      const client = clientRef.current;
+      if (!client || !client.defineSubagent) return null;
+      try {
+        return await client.defineSubagent(params);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setLastError(message);
+        throw err;
+      }
+    },
+    [],
+  );
+
+  const manageTask = useCallback(
+    async (params: ManageTaskParams): Promise<ManageTaskResult | null> => {
+      const client = clientRef.current;
+      if (!client || !client.manageTask) return null;
+      try {
+        const res = await client.manageTask(params);
+        if (params.action === "list" && res.tasks) {
+          setDaemonTasks(res.tasks);
+        } else if (params.action === "status" && res.task) {
+          setDaemonTasks((prev) => upsertTask(prev, res.task!));
+        } else if (params.action === "kill" && params.taskId) {
+          setDaemonTasks((prev) =>
+            prev.map((t) => (t.taskId === params.taskId ? { ...t, status: "killed" } : t)),
+          );
+        }
+        return res;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setLastError(message);
+        throw err;
+      }
+    },
+    [],
+  );
+
+  const createSchedule = useCallback(
+    async (params: ScheduleParams): Promise<ScheduleResult | null> => {
+      const client = clientRef.current;
+      if (!client || !client.createSchedule) return null;
+      try {
+        const res = await client.createSchedule(params);
+        setSchedules((prev) => {
+          const idx = prev.findIndex((s) => s.scheduleId === res.scheduleId);
+          if (idx === -1) return [...prev, res];
+          const copy = prev.slice();
+          copy[idx] = res;
+          return copy;
+        });
+        return res;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setLastError(message);
+        throw err;
+      }
+    },
+    [],
+  );
+
+  const cancelSchedule = useCallback(
+    async (scheduleId: string): Promise<ManageTaskResult | null> => {
+      setSchedules((prev) =>
+        prev.map((s) => (s.scheduleId === scheduleId ? { ...s, status: "cancelled" } : s)),
+      );
+      return manageTask({ action: "kill", taskId: scheduleId });
+    },
+    [manageTask],
+  );
+
+  const sendTaskInput = useCallback(
+    async (taskId: string, input: string): Promise<ManageTaskResult | null> => {
+      return manageTask({ action: "send_input", taskId, input });
+    },
+    [manageTask],
+  );
+
+  const killTask = useCallback(
+    async (taskId: string): Promise<ManageTaskResult | null> => {
+      return manageTask({ action: "kill", taskId });
+    },
+    [manageTask],
+  );
+
+  /* ------------------------- Shared Memory & Playground RPCs ------------------------- */
+
+  const setSharedMemory = useCallback(
+    async (
+      key: string,
+      value: unknown,
+      namespace = "global",
+      ttlSeconds?: number,
+      tags: string[] = []
+    ): Promise<MemorySetResult | null> => {
+      const client = clientRef.current;
+      if (!client || !client.setSharedMemory) return null;
+      try {
+        const res = await client.setSharedMemory({
+          key,
+          value,
+          namespace,
+          ttlSeconds,
+          tags,
+        });
+        if (res?.entry) {
+          setSharedMemoryState((prev) => upsertMemoryEntry(prev, res.entry));
+        }
+        return res;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setLastError(message);
+        throw err;
+      }
+    },
+    [],
+  );
+
+  const getSharedMemory = useCallback(
+    async (key: string, namespace = "global"): Promise<MemoryGetResult | null> => {
+      const client = clientRef.current;
+      if (!client || !client.getSharedMemory) return null;
+      try {
+        return await client.getSharedMemory({ key, namespace });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setLastError(message);
+        throw err;
+      }
+    },
+    [],
+  );
+
+  const querySharedMemory = useCallback(
+    async (params: MemoryQueryParams): Promise<MemoryQueryResult | null> => {
+      const client = clientRef.current;
+      if (!client || !client.querySharedMemory) return null;
+      try {
+        const res = await client.querySharedMemory(params);
+        if (res?.entries && !params.query && !params.namespace && !params.tags?.length) {
+          setSharedMemoryState(res.entries);
+        }
+        return res;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setLastError(message);
+        throw err;
+      }
+    },
+    [],
+  );
+
+  const deleteSharedMemory = useCallback(
+    async (key: string, namespace = "global"): Promise<MemoryDeleteResult | null> => {
+      const client = clientRef.current;
+      if (!client || !client.deleteSharedMemory) return null;
+      try {
+        const res = await client.deleteSharedMemory({ key, namespace });
+        setSharedMemoryState((prev) =>
+          prev.filter((e) => !((e.namespace || "global") === (namespace || "global") && e.key === key))
+        );
+        return res;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setLastError(message);
+        throw err;
+      }
+    },
+    [],
+  );
+
+  const dispatchPlaygroundTurn = useCallback(
+    async (subagentId: string, prompt: string) => {
+      const client = clientRef.current;
+      if (!client || !client.dispatchPlaygroundTurn) return null;
+      try {
+        return await client.dispatchPlaygroundTurn(subagentId, prompt);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setLastError(message);
+        throw err;
+      }
+    },
+    [],
+  );
+
+  const simulateAgentTurn = useCallback(
+    async (subagentId: string, scenario: string) => {
+      const client = clientRef.current;
+      if (!client || !client.simulateAgentTurn) return null;
+      try {
+        return await client.simulateAgentTurn(subagentId, scenario);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setLastError(message);
+        throw err;
+      }
+    },
+    [],
+  );
+
+  const injectAgentFailure = useCallback(
+    async (
+      subagentId: string,
+      failureType: "timeout" | "crash" | "stall" | "out_of_budget",
+      strategy?: "one_for_one" | "one_for_all" | "rest_for_one"
+    ) => {
+      const client = clientRef.current;
+      if (!client || !client.injectAgentFailure) return null;
+      try {
+        return await client.injectAgentFailure(subagentId, failureType, strategy);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setLastError(message);
+        throw err;
+      }
+    },
+    [],
+  );
 
   /* ------------------------- derived props ---------------------------- */
 
@@ -604,6 +1386,12 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
     integrations,
     evidence,
     permissionPending: perms.pending,
+    subagents,
+    activeSubagentId,
+    interAgentMessages,
+    daemonTasks,
+    schedules,
+    sharedMemory,
     setPlan,
     approveStep,
     runApproved,
@@ -611,9 +1399,28 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
     cancel,
     stopToolRun,
     decidePermission,
-    toggleRulesPack: noopToggle,
-    toggleSkill: noopToggle,
-    toggleMcpServer: noopToggle,
+    toggleRulesPack: (id, enabled) => toggleIntegration("rules", id, enabled),
+    toggleSkill: (id, enabled) => toggleIntegration("skill", id, enabled),
+    toggleMcpServer: (id, enabled) => toggleIntegration("mcp", id, enabled),
+    setActiveSubagentId,
+    spawnSubagent,
+    killSubagent,
+    killSubagentTree,
+    sendAgentMessage,
+    manageSubagentsAction,
+    defineSubagent,
+    manageTask,
+    createSchedule,
+    cancelSchedule,
+    sendTaskInput,
+    killTask,
+    setSharedMemory,
+    getSharedMemory,
+    querySharedMemory,
+    deleteSharedMemory,
+    dispatchPlaygroundTurn,
+    simulateAgentTurn,
+    injectAgentFailure,
   };
 
   const onApi = options?.onApi;
@@ -623,3 +1430,4 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
 
   return api;
 }
+

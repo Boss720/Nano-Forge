@@ -95,6 +95,112 @@ export const gitFileStatusSchema = z.object({
 export type GitFileStatus = z.infer<typeof gitFileStatusSchema>;
 
 /* ------------------------------------------------------------------------ */
+/* Integrations Types                                                       */
+/* ------------------------------------------------------------------------ */
+
+export const integrationHealthSchema = z.enum(["ok", "error", "checking", "unknown"]);
+export const integrationKindSchema = z.enum(["rules", "skill", "mcp"]);
+
+export const rulesPackSnapshotSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  enabled: z.boolean(),
+  health: integrationHealthSchema,
+  lastError: z.string().nullable().optional(),
+  source: z.string(),
+  digest: z.string(),
+  priority: z.number().optional(),
+});
+
+export const skillSnapshotSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  description: z.string(),
+  allowedTools: z.array(z.string()),
+  instructions: z.string(),
+  hashValid: z.boolean(),
+  enabled: z.boolean(),
+  health: integrationHealthSchema,
+  lastError: z.string().nullable().optional(),
+});
+
+export const mcpServerSnapshotSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  command: z.string(),
+  args: z.array(z.string()).optional(),
+  tools: z.array(z.string()),
+  secretRefs: z.array(z.string()).optional(),
+  enabled: z.boolean(),
+  health: integrationHealthSchema,
+  lastError: z.string().nullable().optional(),
+});
+
+export const integrationsSnapshotSchema = z.object({
+  rulesPacks: z.array(rulesPackSnapshotSchema),
+  skills: z.array(skillSnapshotSchema),
+  mcpServers: z.array(mcpServerSnapshotSchema),
+});
+export type IntegrationsSnapshot = z.infer<typeof integrationsSnapshotSchema>;
+
+import {
+  invokeSubagentParamsSchema,
+  invokeSubagentResultSchema,
+  manageSubagentsParamsSchema,
+  manageSubagentsResultSchema,
+  sendMessageParamsSchema,
+  sendMessageResultSchema,
+  defineSubagentParamsSchema,
+  defineSubagentResultSchema,
+  subagentInfoSchema,
+  subagentMessageSchema,
+  subagentLifecycleEventSchema,
+} from "@protocol/subagents";
+import {
+  manageTaskParamsSchema,
+  manageTaskResultSchema,
+  scheduleParamsSchema,
+  scheduleResultSchema,
+  taskSummarySchema,
+  taskLifecycleEventSchema,
+} from "@protocol/tasks";
+import {
+  memorySetParamsSchema,
+  memorySetResultSchema,
+  memoryGetParamsSchema,
+  memoryGetResultSchema,
+  memoryQueryParamsSchema,
+  memoryQueryResultSchema,
+  memoryDeleteParamsSchema,
+  memoryDeleteResultSchema,
+  memoryLifecycleEventSchema,
+} from "@protocol/memory";
+import {
+  voiceCallStatusSchema,
+  voiceCallEndReasonSchema,
+  voiceInterruptReasonSchema,
+  voiceProfileSchema,
+  voiceParticipantSchema,
+  voiceCallSessionSchema,
+  voiceTranscriptFrameSchema,
+  voiceTtsChunkSchema,
+  voiceTurnSyncSchema,
+  voiceInterruptFrameSchema,
+  type VoiceCallStatus,
+  type VoiceCallEndReason,
+  type VoiceInterruptReason,
+  type VoiceProfile,
+  type VoiceParticipant,
+  type VoiceCallSession,
+  type VoiceTranscriptFrame,
+  type VoiceTtsChunk,
+  type VoiceTurnSync,
+  type VoiceInterruptFrame,
+  type VoiceClientMessage,
+  type VoiceHostEvent,
+} from "@protocol/voice";
+
+/* ------------------------------------------------------------------------ */
 /* Client -> Host                                                           */
 /* ------------------------------------------------------------------------ */
 
@@ -138,6 +244,139 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   }),
   z.object({ type: z.literal("workspace.gitStatus"), requestId: idSchema }),
   z.object({ type: z.literal("workspace.watch"), enabled: z.boolean() }),
+  z.object({
+    type: z.literal("integration.toggle"),
+    requestId: idSchema,
+    kind: integrationKindSchema,
+    id: idSchema,
+    enabled: z.boolean(),
+  }),
+  // Subagent RPCs
+  z.object({
+    type: z.literal("subagent.invoke"),
+    requestId: idSchema,
+    params: invokeSubagentParamsSchema,
+    parentId: z.string().optional(),
+  }),
+  z.object({
+    type: z.literal("subagent.manage"),
+    requestId: idSchema,
+    params: manageSubagentsParamsSchema,
+    callerId: z.string().optional(),
+  }),
+  z.object({
+    type: z.literal("subagent.sendMessage"),
+    requestId: idSchema,
+    params: sendMessageParamsSchema,
+    senderId: z.string(),
+  }),
+  z.object({
+    type: z.literal("subagent.define"),
+    requestId: idSchema,
+    params: defineSubagentParamsSchema,
+  }),
+  // Daemon & Schedule RPCs
+  z.object({
+    type: z.literal("task.manage"),
+    requestId: idSchema,
+    params: manageTaskParamsSchema,
+  }),
+  z.object({
+    type: z.literal("schedule.create"),
+    requestId: idSchema,
+    params: scheduleParamsSchema,
+    creatorSubagentId: z.string().optional(),
+  }),
+  // Memory RPCs
+  z.object({
+    type: z.literal("memory.set"),
+    requestId: idSchema,
+    params: memorySetParamsSchema,
+    authorInfo: z
+      .object({
+        id: z.string().optional(),
+        name: z.string().optional(),
+      })
+      .optional(),
+  }),
+  z.object({
+    type: z.literal("memory.get"),
+    requestId: idSchema,
+    params: memoryGetParamsSchema,
+  }),
+  z.object({
+    type: z.literal("memory.query"),
+    requestId: idSchema,
+    params: memoryQueryParamsSchema,
+  }),
+  z.object({
+    type: z.literal("memory.delete"),
+    requestId: idSchema,
+    params: memoryDeleteParamsSchema,
+  }),
+  // Voice Call RPCs
+  z.object({
+    type: z.literal("voice.session.start"),
+    requestId: idSchema,
+    voiceProfile: voiceProfileSchema.partial().optional(),
+    participant: voiceParticipantSchema.partial().optional(),
+    inputGain: z.number().min(0).max(2).optional(),
+    outputVolume: z.number().min(0).max(1).optional(),
+  }),
+  z.object({
+    type: z.literal("voice.session.pause"),
+    requestId: idSchema,
+    sessionId: idSchema,
+  }),
+  z.object({
+    type: z.literal("voice.session.resume"),
+    requestId: idSchema,
+    sessionId: idSchema,
+  }),
+  z.object({
+    type: z.literal("voice.session.end"),
+    requestId: idSchema,
+    sessionId: idSchema,
+    reason: voiceCallEndReasonSchema.optional(),
+  }),
+  z.object({
+    type: z.literal("voice.session.mute"),
+    requestId: idSchema,
+    sessionId: idSchema,
+    muted: z.boolean(),
+  }),
+  z.object({
+    type: z.literal("voice.session.gain"),
+    requestId: idSchema,
+    sessionId: idSchema,
+    inputGain: z.number().min(0).max(2).optional(),
+    outputVolume: z.number().min(0).max(1).optional(),
+  }),
+  z.object({
+    type: z.literal("voice.transcript.submit"),
+    requestId: idSchema,
+    sessionId: idSchema,
+    turnId: idSchema,
+    text: z.string().max(32768),
+    isFinal: z.boolean(),
+    confidence: z.number().min(0).max(1).optional(),
+  }),
+  z.object({
+    type: z.literal("voice.interrupt"),
+    requestId: idSchema,
+    sessionId: idSchema,
+    turnId: idSchema.optional(),
+    reason: voiceInterruptReasonSchema,
+    spokenTextSnippet: z.string().max(4096).optional(),
+  }),
+  z.object({
+    type: z.literal("voice.audio.chunk"),
+    requestId: idSchema,
+    sessionId: idSchema,
+    turnId: idSchema.optional(),
+    data: z.string(),
+    format: z.string().optional(),
+  }),
 ]);
 export type ClientMessage = z.infer<typeof clientMessageSchema>;
 export type ClientMessageType = ClientMessage["type"];
@@ -205,7 +444,65 @@ export const hostMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("workspace.search.result"), requestId: idSchema, matches: z.array(searchMatchSchema) }),
   z.object({ type: z.literal("workspace.gitStatus.result"), requestId: idSchema, files: z.array(gitFileStatusSchema) }),
   z.object({ type: z.literal("workspace.fileChanged"), path: z.string(), changeType: z.enum(["created", "modified", "deleted"]) }),
+  z.object({
+    type: z.literal("integrations.snapshot"),
+    requestId: idSchema.optional(),
+    snapshot: integrationsSnapshotSchema,
+    at: atSchema,
+  }),
+  // Subagent RPC Results & Events
+  z.object({ type: z.literal("subagent.invoke.result"), requestId: idSchema, result: invokeSubagentResultSchema }),
+  z.object({ type: z.literal("subagent.manage.result"), requestId: idSchema, result: manageSubagentsResultSchema }),
+  z.object({ type: z.literal("subagent.sendMessage.result"), requestId: idSchema, result: sendMessageResultSchema }),
+  z.object({ type: z.literal("subagent.define.result"), requestId: idSchema, result: defineSubagentResultSchema }),
+  z.object({ type: z.literal("subagent.event"), event: subagentLifecycleEventSchema, at: atSchema }),
+  // Task & Schedule RPC Results & Events
+  z.object({ type: z.literal("task.manage.result"), requestId: idSchema, result: manageTaskResultSchema }),
+  z.object({ type: z.literal("schedule.create.result"), requestId: idSchema, result: scheduleResultSchema }),
+  z.object({ type: z.literal("task.event"), event: taskLifecycleEventSchema, at: atSchema }),
+  // Memory RPC Results & Events
+  z.object({ type: z.literal("memory.set.result"), requestId: idSchema, result: memorySetResultSchema }),
+  z.object({ type: z.literal("memory.get.result"), requestId: idSchema, result: memoryGetResultSchema }),
+  z.object({ type: z.literal("memory.query.result"), requestId: idSchema, result: memoryQueryResultSchema }),
+  z.object({ type: z.literal("memory.delete.result"), requestId: idSchema, result: memoryDeleteResultSchema }),
+  z.object({ type: z.literal("memory.event"), event: memoryLifecycleEventSchema, at: atSchema }),
+  // Voice Call RPC Results & Events
+  z.object({
+    type: z.literal("voice.session.ready"),
+    requestId: idSchema.optional(),
+    session: voiceCallSessionSchema,
+    at: atSchema,
+  }),
+  z.object({
+    type: z.literal("voice.session.state"),
+    requestId: idSchema.optional(),
+    sessionId: idSchema,
+    status: voiceCallStatusSchema,
+    at: atSchema,
+    detail: z.string().max(4096).optional(),
+  }),
+  z.object({
+    type: z.literal("voice.transcript.event"),
+    frame: voiceTranscriptFrameSchema,
+    at: atSchema,
+  }),
+  z.object({
+    type: z.literal("voice.tts.chunk"),
+    chunk: voiceTtsChunkSchema,
+    at: atSchema,
+  }),
+  z.object({
+    type: z.literal("voice.turn.event"),
+    turn: voiceTurnSyncSchema,
+    at: atSchema,
+  }),
+  z.object({
+    type: z.literal("voice.interrupted"),
+    frame: voiceInterruptFrameSchema,
+    at: atSchema,
+  }),
 ]);
+
 export type HostMessage = z.infer<typeof hostMessageSchema>;
 export type HostMessageType = HostMessage["type"];
 

@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { BookOpen, Hash, ScrollText, Server, Plug } from "lucide-react";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
@@ -321,27 +322,59 @@ function SkillRowView({
   onToggle: (id: string, enabled: boolean) => void;
   onCheck?: (kind: IntegrationKind, id: string) => void;
 }) {
+  const [expanded, setExpanded] = useState(false);
+  const [viewed, setViewed] = useState(false);
+
+  const handleToggleExpand = () => {
+    setExpanded((prev) => !prev);
+    setViewed(true);
+  };
+
+  const isBlocked = !row.hashValid;
+  const toggleDisabled = isBlocked || (!viewed && !row.enabled);
+  const toggleTitle = isBlocked
+    ? "Blocked: skill content hash does not match"
+    : !viewed && !row.enabled
+    ? "View instructions before enabling"
+    : undefined;
+
   return (
     <RowShell
       name={row.name}
       sub={row.id}
       enabled={row.enabled}
       onToggle={(v) => onToggle(row.id, v)}
-      toggleDisabled={!row.hashValid}
-      toggleTitle={row.hashValid ? undefined : "Blocked: skill content hash does not match"}
+      toggleDisabled={toggleDisabled}
+      toggleTitle={toggleTitle}
       health={row.health}
       lastError={row.lastError}
       kind="skill"
       id={row.id}
       onCheck={onCheck}
     >
-      <div className="mt-1.5 flex flex-wrap gap-1">
+      <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+        <button
+          onClick={handleToggleExpand}
+          className="rounded border border-border px-1.5 py-0.5 font-mono text-[9.5px] text-muted-foreground hover:text-foreground"
+          aria-label="view instructions"
+        >
+          {expanded ? "hide instructions" : "view instructions"}
+        </button>
         {row.allowedTools.map((tool) => (
           <span key={tool} className="rounded bg-secondary px-1 py-px font-mono text-[9.5px] text-muted-foreground">
             {tool}
           </span>
         ))}
       </div>
+      {expanded && (
+        <div className="mt-2 rounded border border-border/60 bg-secondary/20 p-2 font-mono text-[11px] text-foreground">
+          {isBlocked ? (
+            <p className="font-semibold text-rose-400">hash mismatch</p>
+          ) : (
+            <pre className="whitespace-pre-wrap text-muted-foreground">{row.instructions}</pre>
+          )}
+        </div>
+      )}
     </RowShell>
   );
 }
@@ -371,6 +404,11 @@ function McpRowView({
         {row.tools.map((tool) => (
           <span key={tool} className="rounded bg-secondary px-1 py-px font-mono text-[9.5px] text-muted-foreground">
             {tool}
+          </span>
+        ))}
+        {row.secretRefs?.map((ref) => (
+          <span key={ref} className="rounded bg-primary/10 px-1 py-px font-mono text-[9.5px] text-primary">
+            {ref}
           </span>
         ))}
       </div>

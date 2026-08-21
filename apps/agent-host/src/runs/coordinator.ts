@@ -231,7 +231,7 @@ function defaultRouteRequest(step: PlanStep): RouteRequest {
   };
 }
 
-function defaultChatRequest(step: PlanStep, plan: ExecutionPlan): ChatRequest {
+export function buildDefaultChatRequest(step: PlanStep, plan: ExecutionPlan): ChatRequest {
   const scopes =
     step.affectedScopes && step.affectedScopes.length > 0
       ? `\nAffected scopes: ${step.affectedScopes.join(", ")}`
@@ -329,13 +329,13 @@ export class RunCoordinator {
 
     this.config.auditStore.startRun({
       id: runId,
-      goal: plan.goal,
+      goal: plan.goal ?? plan.title ?? "",
       startedAt: this.clock().toISOString(),
     });
     this.emit(ctx, {
       type: "plan.submitted",
       planId: plan.id,
-      goal: plan.goal,
+      goal: plan.goal ?? plan.title ?? "",
       stepCount: plan.steps.length,
       steps: plan.steps.map((s) => ({
         id: s.id,
@@ -847,7 +847,7 @@ export class RunCoordinator {
   ): Promise<StreamOutcome> {
     const chat =
       this.config.chatForStep?.(step, ctx.plan) ??
-      defaultChatRequest(step, ctx.plan);
+      buildDefaultChatRequest(step, ctx.plan);
     const proposals: ProposedToolCall[] = [];
     let text = "";
     let usage: { inputTokens: number; outputTokens: number } | undefined;

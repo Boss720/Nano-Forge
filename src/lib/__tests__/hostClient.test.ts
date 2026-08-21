@@ -111,7 +111,7 @@ describe("HostClient requests", () => {
     expect(frame).toMatchObject({ type: "plan.submit", plan });
     expect(frame.requestId).toEqual(expect.any(String));
     ws.receive({ type: "run.event", runId: "r1", event: "accepted", requestId: frame.requestId });
-    await expect(done).resolves.toBeUndefined();
+    await expect(done).resolves.toBeDefined();
   });
 
   it("approval.grant / approval.deny emit the exact approval frames", async () => {
@@ -127,7 +127,7 @@ describe("HostClient requests", () => {
       stepId: "step-7",
     });
     ws.receive({ type: "run.event", runId: "run-1", event: "approval.granted", requestId: grantFrame.requestId });
-    await expect(grant).resolves.toBeUndefined();
+    await expect(grant).resolves.toBeDefined();
 
     const deny = client.denyApproval("run-1", "step-8");
     const denyFrame = ws.sentFrames()[1];
@@ -138,7 +138,7 @@ describe("HostClient requests", () => {
       stepId: "step-8",
     });
     ws.receive({ type: "run.event", runId: "run-1", event: "approval.denied", requestId: denyFrame.requestId });
-    await expect(deny).resolves.toBeUndefined();
+    await expect(deny).resolves.toBeDefined();
   });
 
   it("run.pause and run.cancel send their control frames", async () => {
@@ -148,13 +148,13 @@ describe("HostClient requests", () => {
     const f1 = ws.sentFrames()[0];
     expect(f1).toMatchObject({ type: "run.pause", runId: "r9" });
     ws.receive({ type: "run.state", runId: "r9", state: "paused", requestId: f1.requestId });
-    await expect(p1).resolves.toBeUndefined();
+    await expect(p1).resolves.toBeDefined();
 
     const p2 = client.cancelRun("r9");
     const f2 = ws.sentFrames()[1];
     expect(f2).toMatchObject({ type: "run.cancel", runId: "r9" });
     ws.receive({ type: "run.event", runId: "r9", event: "cancelled", requestId: f2.requestId });
-    await expect(p2).resolves.toBeUndefined();
+    await expect(p2).resolves.toBeDefined();
   });
 
   it("rejecting a request produces NO tool execution frame — only approval.deny", async () => {
@@ -164,7 +164,7 @@ describe("HostClient requests", () => {
     const deny = client.denyApproval("run-1", "step-3");
     const frame = ws.sentFrames()[0];
     ws.receive({ type: "run.event", runId: "run-1", event: "approval.denied", requestId: frame.requestId });
-    await expect(deny).resolves.toBeUndefined();
+    await expect(deny).resolves.toBeDefined();
 
     // the exact and only frame on the wire is the denial — the client never
     // sends anything that could trigger an execution

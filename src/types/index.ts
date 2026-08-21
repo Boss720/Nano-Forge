@@ -129,16 +129,25 @@ export type PlanUIState = "draft" | "awaiting_approval" | "executing" | "paused"
 
 export type PlanStepStatus = "pending" | "running" | "succeeded" | "failed" | "blocked";
 
+export interface PlanPhase {
+  id: string;
+  title: string;
+  description?: string;
+  order: number;
+}
+
 export interface PlanStep {
   id: string;
   title: string;
+  description?: string;
+  phaseId?: string;
   dependsOn: string[];
   status: PlanStepStatus;
   /**
    * When present, this step may NEVER enter "running" on the strength of
    * model output or chat text — only an explicit user click counts.
    */
-  approval?: "required";
+  approval?: "required" | "auto";
   sideEffecting?: boolean;
   /** Exact workspace-relative paths / scopes this step touches. */
   affectedScopes?: string[];
@@ -148,9 +157,14 @@ export interface PlanStep {
 
 export interface ExecutionPlan {
   id: string;
+  title?: string;
   goal: string;
+  phases?: PlanPhase[];
   steps: PlanStep[];
   state: PlanUIState;
+  revision?: number;
+  createdAt?: number;
+  updatedAt?: number;
 }
 
 /* ------------------------------------------------------------------ */
@@ -183,3 +197,7 @@ export interface ToolRun {
   truncated?: boolean;
   exitCode?: number;
 }
+
+export * from "./artifacts";
+export * from "@protocol/subagents";
+export * from "@protocol/tasks";

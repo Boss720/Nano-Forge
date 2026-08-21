@@ -1,16 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import {
   Ban, Bot, Brain, Check, ChevronDown, ChevronRight, CircleDollarSign, Clock, FileEdit, FileSearch,
-  Play, SendHorizonal, Settings2, ShieldAlert, Square, TerminalSquare, X,
+  SendHorizonal, ShieldAlert, Square, TerminalSquare, X,
 } from "lucide-react";
-import type { GenerationPrefs, Message, NanoModel, Patch, ToolCall, ToolRun, ToolRunState } from "@/types";
+import type { GenerationPrefs, Message, NanoModel, Patch, ToolCall, ToolRun, ToolRunState, VirtualFile } from "@/types";
 import { AGENT_SYSTEM_PROMPT } from "@/lib/catalog";
 import { estimateTokens } from "@/lib/context";
 import { RichText } from "@/components/RichText";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { Slider } from "@/components/ui/slider";
+import { ChatComposer } from "@/sections/ChatComposer";
 
-interface Props {
+export interface ChatPanelProps {
   messages: Message[];
   running: boolean;
   model: NanoModel | undefined;
@@ -28,6 +27,13 @@ interface Props {
   toolRuns?: ToolRun[];
   /** Stop (cancel) one terminal job; typically wired to HostClient.cancelRun. */
   onToolStop?: (toolRunId: string) => void;
+  /** Planning mode trigger */
+  onTriggerPlan?: (goal: string) => void;
+  /** Workspace files for @file mentions */
+  workspaceFiles?: VirtualFile[];
+  /** Milestone 3: Voice Call triggers */
+  onTriggerVoiceCall?: () => void;
+  isVoiceCallActive?: boolean;
 }
 
 const TOOL_ICON: Record<ToolCall["kind"], typeof Brain> = {
@@ -38,13 +44,23 @@ const TOOL_ICON: Record<ToolCall["kind"], typeof Brain> = {
   search: FileSearch,
 };
 
-/** Compact "3.2k" / "256k" formatting for the context meter. */
-function fmtK(n: number): string {
-  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
-}
-
-export function ChatPanel({ messages, running, model, connected, onSend, onStop, onPatchDecision, genPrefs, onGenPrefsChange, toolRuns, onToolStop }: Props) {
-  const [draft, setDraft] = useState("");
+export function ChatPanel({
+  messages,
+  running,
+  model,
+  connected,
+  onSend,
+  onStop,
+  onPatchDecision,
+  genPrefs,
+  onGenPrefsChange,
+  toolRuns,
+  onToolStop,
+  onTriggerPlan,
+  workspaceFiles,
+  onTriggerVoiceCall,
+  isVoiceCallActive = false,
+}: ChatPanelProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -52,28 +68,22 @@ export function ChatPanel({ messages, running, model, connected, onSend, onStop,
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages]);
 
-  const submit = () => {
-    const text = draft.trim();
-    if (!text || running) return;
-    setDraft("");
-    onSend(text);
-  };
-
-  // Task 1.2: live context meter — estimate over the same system+history the
-  // send path packs (via buildContext), plus the current draft since it
-  // becomes the next user message on send.
+  // Live context meter — estimate over the same system+history the
+  // send path packs (via buildContext)
   const budgetTokens = model ? model.contextK * 1000 : 0;
   const usedTokens =
     estimateTokens(AGENT_SYSTEM_PROMPT) +
-    messages.reduce((sum, m) => (m.role === "system" || !m.content ? sum : sum + estimateTokens(m.content)), 0) +
-    estimateTokens(draft);
+    messages.reduce(
+      (sum, m) => (m.role === "system" || !m.content ? sum : sum + estimateTokens(m.content)),
+      0,
+    );
   const usedPct = budgetTokens > 0 ? (usedTokens / budgetTokens) * 100 : 0;
 
   return (
     <section className="flex min-w-0 flex-1 flex-col bg-background">
       {/* transcript */}
       <div ref={scrollRef} className="scrollbar-thin flex-1 space-y-5 overflow-y-auto px-5 py-5">
-        {messages.length === 0 && <EmptyState onPick={onSend} connected={connected} />}
+        {messages.length === 0 && <EmptyState onPick={(t) => onSend(t)} connected={connected} />}
         {messages.map((m) => (
           <MessageView key={m.id} m={m} onPatchDecision={onPatchDecision} />
         ))}
@@ -86,68 +96,23 @@ export function ChatPanel({ messages, running, model, connected, onSend, onStop,
         )}
       </div>
 
-      {/* composer */}
-      <div className="shrink-0 border-t border-border bg-card/60 px-5 py-3">
-        <div className="rounded-lg border border-input bg-secondary/40 transition-colors focus-within:border-primary/60">
-          <textarea
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                submit();
-              }
-            }}
-            rows={3}
-            placeholder={
-              connected
-                ? "Describe the change — the agent plans, edits, and verifies…"
-                : "Demo mode — try: “add rate limiting to the server”"
-            }
-            className="w-full resize-none bg-transparent px-3.5 pt-3 text-[13px] leading-relaxed text-foreground outline-none placeholder:text-muted-foreground/70"
-          />
-          <div className="flex items-center gap-2 px-3 pb-2.5">
-            <span className="rounded border border-border bg-card px-1.5 py-0.5 font-mono text-[10.5px] text-primary">
-              {model?.name ?? "no model"}
-            </span>
-            <span className="micro-label normal-case tracking-normal">
-              {connected ? "live · nano-gpt.com/api/v1" : "demo script · no tokens burned"}
-            </span>
-            {budgetTokens > 0 && (
-              <span className="flex items-center gap-1.5" title="estimated context usage vs model window">
-                <span className="h-1 w-16 overflow-hidden rounded-full bg-secondary sm:w-24">
-                  <span
-                    className={`block h-full transition-all ${usedPct > 85 ? "bg-destructive" : "bg-primary"}`}
-                    style={{ width: `${Math.min(100, usedPct)}%` }}
-                  />
-                </span>
-                <span className="hidden font-mono text-[10px] text-muted-foreground md:block">
-                  {fmtK(usedTokens)} / {fmtK(budgetTokens)}
-                </span>
-              </span>
-            )}
-            <div className="flex-1" />
-            <GenSettings genPrefs={genPrefs} onChange={onGenPrefsChange} />
-            <span className="micro-label hidden sm:block">⏎ send · ⇧⏎ newline</span>
-            {running ? (
-              <button
-                onClick={onStop}
-                className="flex items-center gap-1.5 rounded-md border border-destructive/50 bg-destructive/15 px-3 py-1.5 font-mono text-[11.5px] text-red-300 transition-colors hover:bg-destructive/25"
-              >
-                <Square className="h-3 w-3" /> stop
-              </button>
-            ) : (
-              <button
-                onClick={submit}
-                disabled={!draft.trim()}
-                className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 font-mono text-[11.5px] font-semibold text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-30"
-              >
-                <Play className="h-3 w-3" /> run agent
-              </button>
-            )}
-          </div>
-        </div>
-      </div>
+      {/* composer with floating caret popover slash engine & @file autocomplete */}
+      <ChatComposer
+        onSendMessage={(text) => onSend(text)}
+        onTriggerPlan={onTriggerPlan}
+        onTriggerVoiceCall={onTriggerVoiceCall}
+        isVoiceCallActive={isVoiceCallActive}
+        running={running}
+        onStop={onStop}
+        model={model}
+        connected={connected}
+        budgetTokens={budgetTokens}
+        usedTokens={usedTokens}
+        usedPct={usedPct}
+        genPrefs={genPrefs}
+        onGenPrefsChange={onGenPrefsChange}
+        workspaceFiles={workspaceFiles}
+      />
     </section>
   );
 }
@@ -187,7 +152,7 @@ function EmptyState({ onPick, connected }: { onPick: (t: string) => void; connec
   );
 }
 
-function MessageView({ m, onPatchDecision }: { m: Message; onPatchDecision: Props["onPatchDecision"] }) {
+function MessageView({ m, onPatchDecision }: { m: Message; onPatchDecision: ChatPanelProps["onPatchDecision"] }) {
   // Task 2.2: edit-verify auto-turns render collapsed; a pending patch (if the
   // verification reply emitted a follow-up diff) stays fully visible with
   // working Apply/Reject.
@@ -221,72 +186,7 @@ function MessageView({ m, onPatchDecision }: { m: Message; onPatchDecision: Prop
   );
 }
 
-/** Task 2.3: generation-settings popover (temperature + max-tokens cap). */
-function GenSettings({ genPrefs, onChange }: { genPrefs: GenerationPrefs; onChange: (p: GenerationPrefs) => void }) {
-  return (
-    <Popover>
-      <PopoverTrigger asChild>
-        <button
-          aria-label="Generation settings"
-          title={`temperature ${genPrefs.temperature.toFixed(2)} · max ${genPrefs.maxTokens} tokens`}
-          className="rounded p-1 text-muted-foreground transition-colors hover:text-foreground"
-        >
-          <Settings2 className="h-3.5 w-3.5" />
-        </button>
-      </PopoverTrigger>
-      <PopoverContent side="top" align="end" className="w-64 border-border bg-card p-3.5">
-        <div className="space-y-4">
-          <div>
-            <div className="mb-2 flex items-center justify-between">
-              <span className="micro-label">temperature</span>
-              <span className="font-mono text-[11px] text-foreground">{genPrefs.temperature.toFixed(2)}</span>
-            </div>
-            <Slider
-              value={[genPrefs.temperature]}
-              min={0}
-              max={1.5}
-              step={0.05}
-              onValueChange={([v]) => onChange({ ...genPrefs, temperature: v })}
-              aria-label="Temperature"
-            />
-            <div className="mt-1 flex justify-between font-mono text-[9.5px] text-muted-foreground">
-              <span>precise</span>
-              <span>creative</span>
-            </div>
-          </div>
-          <div>
-            <div className="mb-2 flex items-center justify-between">
-              <span className="micro-label">max tokens</span>
-              <span className="font-mono text-[11px] text-foreground">{genPrefs.maxTokens.toLocaleString()}</span>
-            </div>
-            <Slider
-              value={[genPrefs.maxTokens]}
-              min={256}
-              max={8192}
-              step={256}
-              onValueChange={([v]) => onChange({ ...genPrefs, maxTokens: v })}
-              aria-label="Max tokens"
-            />
-            <div className="mt-1 flex justify-between font-mono text-[9.5px] text-muted-foreground">
-              <span>256</span>
-              <span>8,192</span>
-            </div>
-          </div>
-          <p className="text-[10.5px] leading-relaxed text-muted-foreground">
-            Saved per model · applied to the next live request.
-          </p>
-        </div>
-      </PopoverContent>
-    </Popover>
-  );
-}
-
-/**
- * Task 2.2: a collapsed, system-style transcript row for an edit-verify
- * auto-turn. The prompt/reply text hides behind an expander; a pending
- * follow-up patch is always rendered in full so the user can Apply/Reject.
- */
-function AutoTurnView({ m, onPatchDecision }: { m: Message; onPatchDecision: Props["onPatchDecision"] }) {
+function AutoTurnView({ m, onPatchDecision }: { m: Message; onPatchDecision: ChatPanelProps["onPatchDecision"] }) {
   const [open, setOpen] = useState(false);
   const snippet = m.content.replace(/\s+/g, " ").trim().slice(0, 72);
   return (
@@ -323,7 +223,8 @@ function AutoTurnView({ m, onPatchDecision }: { m: Message; onPatchDecision: Pro
   );
 }
 
-function ToolCard({ t }: { t: ToolCall }) {  const [open, setOpen] = useState(false);
+function ToolCard({ t }: { t: ToolCall }) {
+  const [open, setOpen] = useState(false);
   const Icon = TOOL_ICON[t.kind];
   return (
     <div className="rounded-md border border-border bg-card/70">
@@ -377,11 +278,6 @@ function ToolRunStatusIcon({ state }: { state: ToolRunState }) {
   }
 }
 
-/**
- * One host-supervised terminal job. Structured `executable + args[]` only
- * (never a shell string); Stop is offered while the job can still be halted
- * and is wired to the host cancel callback.
- */
 function ToolRunCard({ t, onStop }: { t: ToolRun; onStop?: (toolRunId: string) => void }) {
   const [open, setOpen] = useState(t.state === "running" || t.state === "error");
   const stoppable = t.state === "queued" || t.state === "running" || t.state === "approval_required";

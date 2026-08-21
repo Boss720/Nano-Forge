@@ -28,6 +28,10 @@ import {
   type HostMessage,
   type RunState,
 } from "./protocol";
+import {
+  safeParseTerminalClientMessage,
+  type TerminalServerMessage,
+} from "@protocol/terminal";
 
 export const HOST_VERSION = "0.1.0";
 
@@ -201,11 +205,11 @@ export function attachAgentProtocol(
 ): void {
   const runStates = new Map<string, RunState>();
 
-  const send = (message: HostMessage): void => {
+  const send = (message: HostMessage | TerminalServerMessage): void => {
     const payload = JSON.stringify(message);
     // The ws socket may still be CONNECTING when the route handler runs;
     // queue the frame until the upgrade completes instead of dropping it.
-    if (socket.readyState === socket.OPEN) socket.send(payload);
+    if (socket.readyState === 1) socket.send(payload);
     else socket.once("open", () => socket.send(payload));
   };
   const now = () => new Date().toISOString();
@@ -215,6 +219,37 @@ export function attachAgentProtocol(
   socket.on("message", (data: unknown) => {
     const decoded = decodeClientMessage(data);
     if (!decoded.ok) {
+      if (typeof data === "string" || data instanceof Buffer || Array.isArray(data)) {
+        try {
+          const parsed = JSON.parse(String(data));
+          if (
+            typeof parsed === "object" &&
+            parsed !== null &&
+            "type" in parsed &&
+            typeof (parsed as { type: unknown }).type === "string" &&
+            ((parsed as { type: string }).type).startsWith("terminal.")
+          ) {
+            const terminalResult = safeParseTerminalClientMessage(parsed);
+            if (terminalResult.success) {
+              const tMsg = terminalResult.data;
+              if (tMsg.type === "terminal.create") {
+                send({
+                  type: "terminal.created",
+                  id: tMsg.id ?? randomUUID(),
+                  sessionId: tMsg.sessionId,
+                  title: tMsg.title ?? "terminal-1",
+                  pid: process.pid,
+                  cols: tMsg.cols ?? 80,
+                  rows: tMsg.rows ?? 24,
+                });
+              }
+              return;
+            }
+          }
+        } catch {
+          /* ignore */
+        }
+      }
       socket.close(CLOSE_INVALID_MESSAGE, "invalid message");
       return;
     }

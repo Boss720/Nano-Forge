@@ -12,6 +12,12 @@
     "paths": {
       "@/*": [
         "./src/*"
+      ],
+      "@protocol/*": [
+        "./packages/protocol/src/*"
+      ],
+      "@protocol": [
+        "./packages/protocol/src/index.ts"
       ]
     },
     /* Bundler mode */
