@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
 import { execa } from 'execa';
 import { resolveWithinWorkspace } from '../policy/policy.js';
 import type { DirEntry, FileStat, SearchMatch, GitFileStatus } from '../protocol.js';
@@ -15,9 +16,36 @@ const EXT_LANG_MAP: Record<string, string> = {
   '.xml': 'xml', '.svg': 'xml', '.gitignore': 'ignore',
 };
 
-export async function handleReadDir(workspaceRoot: string, relativePath: string): Promise<DirEntry[]> {
+export const MAX_WORKSPACE_FILE_BYTES = 1024 * 1024;
+
+export class WorkspaceFileError extends Error {
+  constructor(
+    readonly code:
+      | 'path_outside_workspace'
+      | 'file_too_large'
+      | 'binary_file'
+      | 'write_conflict'
+      | 'io_error',
+    message: string,
+  ) {
+    super(message);
+    this.name = 'WorkspaceFileError';
+  }
+}
+
+const sha256 = (content: string | Buffer): string =>
+  createHash('sha256').update(content).digest('hex');
+
+const confinedPath = (workspaceRoot: string, relativePath: string): string => {
   const fullPath = resolveWithinWorkspace(workspaceRoot, relativePath);
-  if (!fullPath) throw new Error("Path is outside workspace");
+  if (!fullPath) {
+    throw new WorkspaceFileError('path_outside_workspace', 'Path is outside workspace');
+  }
+  return fullPath;
+};
+
+export async function handleReadDir(workspaceRoot: string, relativePath: string): Promise<DirEntry[]> {
+  const fullPath = confinedPath(workspaceRoot, relativePath);
   const entries = await fs.readdir(fullPath, { withFileTypes: true });
   
   const result: DirEntry[] = [];
@@ -56,13 +84,15 @@ export async function handleReadDir(workspaceRoot: string, relativePath: string)
   });
 }
 
-export async function handleReadFile(workspaceRoot: string, relativePath: string): Promise<{ content: string; language: string; size: number }> {
-  const fullPath = resolveWithinWorkspace(workspaceRoot, relativePath);
-  if (!fullPath) throw new Error("Path is outside workspace");
+export async function handleReadFile(workspaceRoot: string, relativePath: string): Promise<{ content: string; language: string; size: number; modified: string; sha256: string }> {
+  const fullPath = confinedPath(workspaceRoot, relativePath);
   const stat = await fs.stat(fullPath);
   
-  if (stat.size > 1024 * 1024) {
-    throw new Error('File too large (exceeds 1MB limit)');
+  if (stat.size > MAX_WORKSPACE_FILE_BYTES) {
+    throw new WorkspaceFileError('file_too_large', 'File too large (exceeds 1MB limit)');
+  }
+  if (typeof stat.isFile === 'function' && !stat.isFile()) {
+    throw new WorkspaceFileError('io_error', 'Path is not a file');
   }
 
   const content = await fs.readFile(fullPath, 'utf8');
@@ -71,31 +101,82 @@ export async function handleReadFile(workspaceRoot: string, relativePath: string
 
   // Basic binary check
   if (content.includes('\u0000')) {
-    return {
-      content: '<Binary file not displayed>',
-      language: 'plaintext',
-      size: stat.size,
-    };
+    throw new WorkspaceFileError('binary_file', 'Binary files cannot be read as text');
   }
 
   return {
     content,
     language,
     size: stat.size,
+    modified: stat.mtime.toISOString(),
+    sha256: sha256(content),
   };
 }
 
-export async function handleWriteFile(workspaceRoot: string, relativePath: string, content: string): Promise<{ success: boolean }> {
-  const fullPath = resolveWithinWorkspace(workspaceRoot, relativePath);
-  if (!fullPath) throw new Error("Path is outside workspace");
+export interface ReviewedWriteOptions {
+  expectedSha256?: string;
+  expectedModified?: string;
+  maxBytes?: number;
+}
+
+export async function handleWriteFile(
+  workspaceRoot: string,
+  relativePath: string,
+  content: string,
+  options: ReviewedWriteOptions = {},
+): Promise<{ success: true; sha256: string; size: number; modified: string }> {
+  const fullPath = confinedPath(workspaceRoot, relativePath);
+  const byteSize = Buffer.byteLength(content, 'utf8');
+  if (byteSize > (options.maxBytes ?? MAX_WORKSPACE_FILE_BYTES)) {
+    throw new WorkspaceFileError('file_too_large', 'File too large (exceeds 1MB write limit)');
+  }
+
+  let existing: { content: Buffer; modified: string; mode: number } | undefined;
+  try {
+    const stat = await fs.stat(fullPath);
+    if (!stat.isFile()) throw new WorkspaceFileError('io_error', 'Write target is not a file');
+    existing = {
+      content: await fs.readFile(fullPath),
+      modified: stat.mtime.toISOString(),
+      mode: stat.mode,
+    };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+
+  if (options.expectedSha256 !== undefined) {
+    const currentHash = existing ? sha256(existing.content) : undefined;
+    if (currentHash?.toLowerCase() !== options.expectedSha256.toLowerCase()) {
+      throw new WorkspaceFileError('write_conflict', 'File content changed since review');
+    }
+  }
+  if (options.expectedModified !== undefined) {
+    if (!existing || existing.modified !== options.expectedModified) {
+      throw new WorkspaceFileError('write_conflict', 'File modification time changed since review');
+    }
+  }
+
   await fs.mkdir(path.dirname(fullPath), { recursive: true });
-  await fs.writeFile(fullPath, content, 'utf8');
-  return { success: true };
+  const tempPath = path.join(path.dirname(fullPath), `.${path.basename(fullPath)}.${randomUUID()}.tmp`);
+  try {
+    await fs.writeFile(tempPath, content, { encoding: 'utf8', flag: 'wx', mode: existing?.mode });
+    await fs.rename(tempPath, fullPath);
+  } catch (error) {
+    await fs.unlink(tempPath).catch(() => undefined);
+    if (error instanceof WorkspaceFileError) throw error;
+    throw new WorkspaceFileError('io_error', error instanceof Error ? error.message : String(error));
+  }
+  const stat = await fs.stat(fullPath);
+  return {
+    success: true,
+    sha256: sha256(content),
+    size: byteSize,
+    modified: stat.mtime.toISOString(),
+  };
 }
 
 export async function handleStat(workspaceRoot: string, relativePath: string): Promise<FileStat> {
-  const fullPath = resolveWithinWorkspace(workspaceRoot, relativePath);
-  if (!fullPath) throw new Error("Path is outside workspace");
+  const fullPath = confinedPath(workspaceRoot, relativePath);
   const stat = await fs.stat(fullPath);
   return {
     size: stat.size,

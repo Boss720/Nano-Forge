@@ -215,6 +215,7 @@ describe("HostClient subagent & task RPC transport", () => {
   });
 });
 
+
 describe("useHostSession subagents state management", () => {
   it("initializes empty subagents, messages, daemonTasks, and schedules when host is off", () => {
     const { result } = renderHook(() => useHostSession({ settings: { enabled: false } }));

@@ -57,6 +57,7 @@ function parseArgs(argv = process.argv.slice(2)) {
     noOpen: process.env.NANOFORGE_NO_OPEN === '1' || process.env.NANOFORGE_NO_OPEN === 'true' || Boolean(process.env.CI),
     dryRun: false,
     distRoot: '',
+    workspaceRoot: process.env.NANOFORGE_WORKSPACE || '',
     help: false,
   };
 
@@ -81,6 +82,10 @@ function parseArgs(argv = process.argv.slice(2)) {
       args.noOpen = true;
     } else if (arg === '--root' || arg === '--dist') {
       args.distRoot = argv[++i];
+    } else if (arg === '--workspace') {
+      args.workspaceRoot = argv[++i];
+    } else if (arg.startsWith('--workspace=')) {
+      args.workspaceRoot = arg.slice('--workspace='.length);
     } else if (arg === '--help' || arg === '-h') {
       args.help = true;
     }
@@ -98,10 +103,14 @@ function resolveDistRoot(customRoot) {
     return path.resolve(customRoot);
   }
 
+  // When running as a SEA binary, __dirname points to the original source location
+  // at build time, which won't exist on the target machine. Use process.execPath instead.
+  const exeDir = path.dirname(process.execPath);
+
   const candidates = [
-    // 1. Process pkg / executable adjacent dist
-    process.pkg ? path.join(path.dirname(process.execPath), 'dist') : null,
-    // 2. Local sibling dist directory
+    // 1. Adjacent to executable (standalone / SEA / pkg distribution)
+    path.join(exeDir, 'dist'),
+    // 2. Local sibling dist directory (dev mode — scripts/dist)
     path.join(__dirname, 'dist'),
     // 3. Local parent dist directory (release/bundle/dist or root dist)
     path.join(__dirname, '..', 'dist'),
@@ -109,7 +118,7 @@ function resolveDistRoot(customRoot) {
     path.join(__dirname, '..', 'release', 'dist'),
     // 5. Release bundle dist directory
     path.join(__dirname, '..', 'release', 'bundle', 'dist'),
-  ].filter(Boolean);
+  ];
 
   for (const candidate of candidates) {
     if (fs.existsSync(candidate) && fs.existsSync(path.join(candidate, 'index.html'))) {
@@ -128,17 +137,24 @@ function resolveDistRoot(customRoot) {
 }
 
 function resolveHostEntry() {
+  // When running as a SEA binary, prioritize files adjacent to the executable
+  const exeDir = path.dirname(process.execPath);
+
   const candidates = [
-    // 1. Packaged bundle host script
+    // 1. Adjacent to executable (standalone / SEA / pkg distribution)
+    path.join(exeDir, 'server.mjs'),
+    path.join(exeDir, 'agent-host.mjs'),
+    path.join(exeDir, 'agent-host.cjs'),
+    path.join(exeDir, 'server.cjs'),
+    // 2. Packaged bundle host script (dev mode — scripts/)
     path.join(__dirname, 'agent-host.cjs'),
     path.join(__dirname, 'server.cjs'),
     path.join(__dirname, 'server.mjs'),
-    path.join(path.dirname(process.execPath), 'agent-host.cjs'),
-    // 2. Apps agent-host compiled dist
-    path.join(__dirname, '..', 'apps', 'agent-host', 'dist', 'server.cjs'),
+    // 3. Apps agent-host compiled dist
     path.join(__dirname, '..', 'apps', 'agent-host', 'dist', 'server.mjs'),
+    path.join(__dirname, '..', 'apps', 'agent-host', 'dist', 'server.cjs'),
     path.join(__dirname, '..', 'release', 'bundle', 'agent-host.cjs'),
-    // 3. TypeScript source (development / monorepo mode)
+    // 4. TypeScript source (development / monorepo mode)
     path.join(__dirname, '..', 'apps', 'agent-host', 'src', 'server.ts'),
   ];
 
@@ -151,8 +167,51 @@ function resolveHostEntry() {
   return null;
 }
 
-function createStaticServer(distRoot) {
+function resolveNodeExecutable() {
+  const isSEA = require('node:module').isBuiltin && process.execPath.toLowerCase().includes('nanoforge');
+  if (!isSEA && !process.pkg) return process.execPath;
+  try {
+    return require('node:child_process').execFileSync('where', ['node'], { encoding: 'utf8' }).trim().split(/\r?\n/)[0] || process.execPath;
+  } catch {
+    const candidates = [
+      'C:\\Program Files\\nodejs\\node.exe',
+      path.join(process.env.ProgramFiles || '', 'nodejs', 'node.exe'),
+      path.join(process.env.LOCALAPPDATA || '', 'fnm_multishells', 'node.exe'),
+    ];
+    return candidates.find((candidate) => fs.existsSync(candidate)) || process.execPath;
+  }
+}
+
+function createStaticServer(distRoot, api = {}) {
   return http.createServer((req, res) => {
+    const requestPath = (req.url || '/').split('?')[0];
+    if (req.method === 'POST' && requestPath === '/api/workspace' && typeof api.onWorkspaceOpen === 'function') {
+      const authorization = req.headers.authorization || '';
+      if (api.token && authorization !== `Bearer ${api.token}`) {
+        res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: 'unauthorized' }));
+        return;
+      }
+      let body = '';
+      req.setEncoding('utf8');
+      req.on('data', (chunk) => {
+        body += chunk;
+        if (body.length > 16 * 1024) req.destroy();
+      });
+      req.on('end', async () => {
+        try {
+          const payload = JSON.parse(body || '{}');
+          if (typeof payload.path !== 'string' || !payload.path.trim()) throw new Error('workspace path is required');
+          const result = await api.onWorkspaceOpen(payload.path.trim());
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+          res.end(JSON.stringify(result));
+        } catch (error) {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+        }
+      });
+      return;
+    }
     // Normalization & sanitization
     const rawUrl = req.url || '/';
     const cleanPath = decodeURIComponent(rawUrl.split('?')[0].split('#')[0]);
@@ -244,6 +303,7 @@ Options:
   --host-port <port>              Agent host daemon port (default: 4174)
   --token, -t <token>             Authentication session token (default: generated)
   --root <path>                   Custom static dist root directory
+  --workspace <path>              Canonical local workspace for host startup
   --no-open, --headless           Do not automatically open default browser
   --dry-run                       Validate configuration and exit cleanly
   --help, -h                      Show this help message
@@ -253,6 +313,19 @@ Options:
 
   const distRoot = resolveDistRoot(config.distRoot);
   const hostEntry = resolveHostEntry();
+  if (config.workspaceRoot) {
+    const workspaceRoot = path.resolve(config.workspaceRoot);
+    let workspaceStat;
+    try {
+      workspaceStat = fs.statSync(workspaceRoot);
+    } catch {
+      throw new Error(`Workspace does not exist: ${workspaceRoot}`);
+    }
+    if (!workspaceStat.isDirectory()) {
+      throw new Error(`Workspace is not a directory: ${workspaceRoot}`);
+    }
+    config.workspaceRoot = workspaceRoot;
+  }
 
   console.log('===================================================');
   console.log('       NanoForge Phase 6 - Platform Launcher       ');
@@ -261,6 +334,7 @@ Options:
   console.log(`[launcher] Host Entry:  ${hostEntry || 'None found (will start UI only)'}`);
   console.log(`[launcher] Host Port:   ${config.hostPort}`);
   console.log(`[launcher] UI Port:     ${config.uiPort}`);
+  console.log(`[launcher] Workspace:   ${config.workspaceRoot || process.cwd()}`);
   console.log(`[launcher] Auth Token:  ${config.token.slice(0, 8)}... (redacted)`);
 
   let hostProcess = null;
@@ -274,6 +348,8 @@ Options:
       PORT: String(config.hostPort),
       TOKEN: config.token,
       HOST: '127.0.0.1',
+      NANOFORGE_WORKSPACE: config.workspaceRoot || process.cwd(),
+      NANOFORGE_ALLOW_WORKSPACE_WRITES: '1',
     });
 
     if (isTypeScript) {
@@ -288,7 +364,29 @@ Options:
         windowsHide: true,
       });
     } else {
-      hostProcess = spawn(process.execPath, [hostEntry], {
+      // When running as a Node SEA binary, process.execPath points to NanoForge.exe,
+      // NOT to node.exe. We must find the real node.exe to spawn subprocesses.
+      let nodeExe = process.execPath;
+      const isSEA = require('node:module').isBuiltin && process.execPath.toLowerCase().includes('nanoforge');
+      if (isSEA || process.pkg) {
+        // Find system node.exe
+        const { execSync: execSyncLocal } = require('node:child_process');
+        try {
+          nodeExe = execSyncLocal('where node', { encoding: 'utf8' }).trim().split(/\r?\n/)[0];
+        } catch {
+          // Fallback: try common install locations
+          const candidates = [
+            'C:\\Program Files\\nodejs\\node.exe',
+            path.join(process.env.ProgramFiles || '', 'nodejs', 'node.exe'),
+            path.join(process.env.LOCALAPPDATA || '', 'fnm_multishells', 'node.exe'),
+          ];
+          for (const c of candidates) {
+            if (fs.existsSync(c)) { nodeExe = c; break; }
+          }
+        }
+      }
+
+      hostProcess = spawn(nodeExe, [hostEntry], {
         env,
         stdio: ['ignore', 'pipe', 'pipe'],
         shell: false,
@@ -319,8 +417,72 @@ Options:
     }
   }
 
+  const spawnReplacementHost = (workspaceRoot) => {
+    if (!hostEntry) throw new Error('Agent host entry is unavailable');
+    const env = Object.assign({}, process.env, {
+      PORT: String(config.hostPort),
+      TOKEN: config.token,
+      HOST: '127.0.0.1',
+      NANOFORGE_WORKSPACE: workspaceRoot,
+      NANOFORGE_ALLOW_WORKSPACE_WRITES: '1',
+    });
+    const isTypeScript = hostEntry.endsWith('.ts');
+    const isWindows = process.platform === 'win32';
+    if (isTypeScript) {
+      const tsxBin = path.join(__dirname, '..', 'node_modules', '.bin', isWindows ? 'tsx.cmd' : 'tsx');
+      const cmd = fs.existsSync(tsxBin) ? tsxBin : (isWindows ? 'npx.cmd' : 'npx');
+      const args = fs.existsSync(tsxBin) ? [hostEntry] : ['tsx', hostEntry];
+      return spawn(cmd, args, { env, stdio: ['ignore', 'pipe', 'pipe'], shell: isWindows, windowsHide: true });
+    }
+    return spawn(resolveNodeExecutable(), [hostEntry], { env, stdio: ['ignore', 'pipe', 'pipe'], shell: false, windowsHide: true });
+  };
+
+  const restartHostForWorkspace = async (requestedRoot) => {
+    const workspaceRoot = path.resolve(requestedRoot);
+    const stats = fs.statSync(workspaceRoot);
+    if (!stats.isDirectory()) throw new Error(`Workspace is not a directory: ${workspaceRoot}`);
+    if (hostProcess && !hostProcess.killed) {
+      await new Promise((resolve) => {
+        let settled = false;
+        const finish = () => { if (!settled) { settled = true; resolve(); } };
+        hostProcess.once('exit', finish);
+        if (process.platform === 'win32' && hostProcess.pid) exec(`taskkill /pid ${hostProcess.pid} /T /F`, finish);
+        else hostProcess.kill('SIGTERM');
+        setTimeout(finish, 5000);
+      });
+    }
+    config.workspaceRoot = workspaceRoot;
+    hostProcess = spawnReplacementHost(workspaceRoot);
+    hostProcess.stdout?.on('data', (data) => {
+      const text = data.toString().trim();
+      if (text) console.log(`[agent-host] ${text}`);
+    });
+    hostProcess.stderr?.on('data', (data) => {
+      const text = data.toString().trim();
+      if (text) console.error(`[agent-host] ${text}`);
+    });
+    await new Promise((resolve, reject) => {
+      const deadline = Date.now() + 5000;
+      const probe = () => {
+        const request = http.get(`http://127.0.0.1:${config.hostPort}/health`, (response) => {
+          response.resume();
+          if (response.statusCode === 200) { resolve(); return; }
+          retry();
+        });
+        request.on('error', retry);
+        request.setTimeout(500, () => { request.destroy(); retry(); });
+      };
+      const retry = () => {
+        if (Date.now() >= deadline) { reject(new Error('The replacement agent host did not become ready')); return; }
+        setTimeout(probe, 100);
+      };
+      probe();
+    });
+    return { workspaceRoot };
+  };
+
   // 2. Start Web UI Static Server
-  const uiServer = createStaticServer(distRoot);
+  const uiServer = createStaticServer(distRoot, { token: config.token, onWorkspaceOpen: restartHostForWorkspace });
 
   const serverPromise = new Promise((resolve, reject) => {
     uiServer.once('error', (err) => {

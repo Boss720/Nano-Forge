@@ -1,6 +1,5 @@
-import { BarChart3, Download, Image, KeyRound, Layers, Network, Palette, PanelLeft, PanelRight, PhoneCall, Settings, Zap } from "lucide-react";
+import { BarChart3, Download, Image, KeyRound, Layers, Network, Palette, PanelLeft, PanelRight, Settings, Zap } from "lucide-react";
 import type { ConnectionState, UsageTotals } from "@/types";
-import type { VoiceCallStatus } from "@protocol/voice";
 
 interface Props {
   connection: ConnectionState;
@@ -24,10 +23,6 @@ interface Props {
   subagentCount?: number;
   /** Milestone 4: open theme customizer dialog */
   onOpenTheme?: () => void;
-  /** Milestone 3: open voice call drawer */
-  onOpenVoiceCall?: () => void;
-  isVoiceCallActive?: boolean;
-  voiceCallStatus?: VoiceCallStatus;
 }
 
 export function TopBar({
@@ -45,9 +40,6 @@ export function TopBar({
   onOpenSubagents,
   subagentCount = 0,
   onOpenTheme,
-  onOpenVoiceCall,
-  isVoiceCallActive = false,
-  voiceCallStatus,
 }: Props) {
   const connected = connection.status === "connected";
   return (
@@ -153,26 +145,6 @@ export function TopBar({
         </button>
       )}
 
-      {/* Milestone 3: Voice Call trigger & active indicator */}
-      {onOpenVoiceCall && (
-        <button
-          onClick={onOpenVoiceCall}
-          data-testid="topbar-voice-call-button"
-          data-call-active={String(isVoiceCallActive)}
-          title={isVoiceCallActive ? `Voice Call (${voiceCallStatus || "active"})` : "Start Voice Call"}
-          className={`relative rounded-md border p-1.5 transition-all ${
-            isVoiceCallActive
-              ? "border-emerald-500/60 bg-emerald-500/15 text-emerald-400 shadow-sm"
-              : "border-border bg-secondary/60 text-muted-foreground hover:border-primary/50 hover:text-primary"
-          }`}
-          aria-label={isVoiceCallActive ? "Open active voice call" : "Start voice call"}
-        >
-          <PhoneCall className={`h-4 w-4 ${isVoiceCallActive ? "animate-pulse" : ""}`} />
-          {isVoiceCallActive && (
-            <span className="absolute -right-1 -top-1 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-emerald-500 text-[8px] text-white font-bold pulse-dot" />
-          )}
-        </button>
-      )}
       <div className="hidden items-center gap-4 font-mono text-[11px] text-muted-foreground md:flex">
         <span>
           <span className="text-foreground">{usage.requests}</span> runs

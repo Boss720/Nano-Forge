@@ -667,6 +667,34 @@ export class SubagentSupervisor extends EventEmitter {
     return () => this.off("event", listener);
   }
 
+  /**
+   * Gracefully terminates all subagents, cleans git worktrees, and releases all resources.
+   */
+  async dispose(): Promise<void> {
+    for (const node of this.registry.getAll()) {
+      if (node.state === "running" || node.state === "idle" || node.state === "waiting_for_input") {
+        this.registry.updateState(node.id, "errored", "Host server shutdown");
+      }
+      if (node.worktreePath) {
+        try {
+          await pruneWorktree(this.workspaceRoot, node.worktreePath);
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+
+    try {
+      await this.daemons.killAll();
+    } catch {
+      /* ignore */
+    }
+    this.scheduler.dispose();
+    this.memory.dispose();
+    this.mailbox.clear();
+    this.removeAllListeners();
+  }
+
   private emitLifecycleEvent(event: SubagentLifecycleEvent): void {
     this.emit("event", event);
     this.emit(event.type, event);

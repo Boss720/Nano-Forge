@@ -17,6 +17,7 @@ function renderComposer(overrides: Partial<Parameters<typeof ChatComposer>[0]> =
   const callbacks = {
     onSendMessage: vi.fn(),
     onTriggerPlan: vi.fn(),
+    onExecuteCommand: vi.fn(),
     onStop: vi.fn(),
     onGenPrefsChange: vi.fn(),
   };
@@ -25,6 +26,7 @@ function renderComposer(overrides: Partial<Parameters<typeof ChatComposer>[0]> =
     <ChatComposer
       onSendMessage={callbacks.onSendMessage}
       onTriggerPlan={callbacks.onTriggerPlan}
+      onExecuteCommand={callbacks.onExecuteCommand}
       onStop={callbacks.onStop}
       workspaceFiles={mockFiles}
       model={{ id: "gpt-5.2", name: "GPT-5.2", provider: "OpenAI", inputPrice: 1.75, outputPrice: 14.0, contextK: 400, tags: ["reasoning"] }}
@@ -158,6 +160,20 @@ describe("ChatComposer Floating Slash Command Palette", () => {
 
     expect(cb.onTriggerPlan).toHaveBeenCalledWith("Refactor authentication layer");
     expect(cb.onSendMessage).toHaveBeenCalledWith("/plan Refactor authentication layer", undefined);
+  });
+
+  it("routes swarm slash commands to the host command handler", async () => {
+    const user = userEvent.setup();
+    const cb = renderComposer();
+    const textarea = screen.getByTestId("chat-textarea");
+
+    await user.type(textarea, '/swarm run "Audit the auth flow"{Enter}');
+
+    expect(cb.onExecuteCommand).toHaveBeenCalledWith(expect.objectContaining({
+      command: "/swarm",
+      positional: ["run", "Audit the auth flow"],
+    }));
+    expect(cb.onSendMessage).not.toHaveBeenCalled();
   });
 });
 

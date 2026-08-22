@@ -24,6 +24,7 @@ export interface SpawnTaskOptions {
   isDaemon?: boolean;
   creatorSubagentId?: string;
   maxBufferBytes?: number;
+  timeoutMs?: number;
 }
 
 export interface SupervisedTaskRecord {
@@ -41,6 +42,7 @@ export interface SupervisedTaskRecord {
   childProcess?: ChildProcess;
   ringBuffer: CircularRingBufferInterface;
   durationMs?: number;
+  timeoutTimer?: NodeJS.Timeout;
 }
 
 export interface CircularRingBufferInterface {

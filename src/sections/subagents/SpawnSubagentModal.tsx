@@ -32,6 +32,9 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { formatLaunchIsolation, validateLaunchSettings } from "./launchConfig";
+
+export { validateLaunchSettings } from "./launchConfig";
 
 export interface SpawnSubagentModalProps {
   open: boolean;
@@ -115,6 +118,8 @@ export const ARCHETYPES: Array<{
   },
 ];
 
+export const ROLE_TEMPLATES = ARCHETYPES;
+
 export const TOOL_PERMISSIONS: Array<{ id: string; name: string; description: string }> = [
   { id: "file.read", name: "Read Files", description: "View workspace files & directories" },
   { id: "file.edit", name: "Edit Files", description: "Surgical block edits to existing files" },
@@ -156,6 +161,7 @@ export function SpawnSubagentModal({
   ]);
   const [timeoutSeconds, setTimeoutSeconds] = useState<number>(600);
   const [budgetTokens, setBudgetTokens] = useState<string>("50000");
+  const [concurrency, setConcurrency] = useState<number>(1);
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -167,6 +173,16 @@ export function SpawnSubagentModal({
   const proposedDepth = currentParentDepth + 1;
   const isDepthExceeded = proposedDepth > MAX_SUBAGENT_HIERARCHY_DEPTH;
   const isConcurrencyExceeded = subagents.filter((a) => a.state === "running").length >= MAX_CONCURRENT_SUBAGENTS;
+  const activeCount = subagents.filter((a) => a.state === "running").length;
+  const launchErrors = validateLaunchSettings({
+    missionGoal: prompt,
+    roles,
+    timeoutSeconds,
+    budgetTokens,
+    workspaceIsolation,
+    concurrency,
+    activeCount,
+  });
 
   const handleArchetypeSelect = (arch: typeof ARCHETYPES[number]) => {
     setArchetype(arch.id);
@@ -201,8 +217,8 @@ export function SpawnSubagentModal({
       return;
     }
 
-    if (!prompt.trim()) {
-      setErrorMsg("Mission prompt is required.");
+    if (launchErrors.length > 0) {
+      setErrorMsg(launchErrors[0]);
       return;
     }
 
@@ -221,7 +237,9 @@ export function SpawnSubagentModal({
         ...(isNaN(parsedTokens) || parsedTokens <= 0 ? {} : { budgetTokens: parsedTokens }),
       };
 
-      await onSpawn(params, parentId === "root" ? undefined : parentId);
+      for (let i = 0; i < concurrency; i += 1) {
+        await onSpawn(params, parentId === "root" ? undefined : parentId);
+      }
       onOpenChange(false);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -313,7 +331,7 @@ export function SpawnSubagentModal({
           {/* Archetype Selector Grid */}
           <div>
             <label className="block font-semibold text-foreground mb-1.5">
-              Select Archetype Preset
+              Role template
             </label>
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
               {ARCHETYPES.map((arch) => {
@@ -321,9 +339,12 @@ export function SpawnSubagentModal({
                 const isSelected = archetype === arch.id;
 
                 return (
-                  <div
+                  <button
+                    type="button"
                     key={arch.id}
                     onClick={() => handleArchetypeSelect(arch)}
+                    aria-pressed={isSelected}
+                    aria-label={`${arch.name} role template`}
                     className={`cursor-pointer rounded-lg border p-2.5 transition-all text-left flex flex-col justify-between ${
                       isSelected
                         ? "border-primary bg-primary/10 shadow-xs ring-1 ring-primary"
@@ -331,6 +352,7 @@ export function SpawnSubagentModal({
                     }`}
                     data-testid={`archetype-option-${arch.id}`}
                   >
+                    <span data-testid={`role-template-${arch.id}`} className="sr-only">Select {arch.name} role template</span>
                     <div className="flex items-center gap-1.5 mb-1">
                       <Icon className="h-3.5 w-3.5 text-primary" />
                       <span className="font-semibold text-xs text-foreground">{arch.name}</span>
@@ -338,7 +360,7 @@ export function SpawnSubagentModal({
                     <p className="text-[10px] text-muted-foreground line-clamp-2 leading-tight">
                       {arch.description}
                     </p>
-                  </div>
+                  </button>
                 );
               })}
             </div>
@@ -391,6 +413,7 @@ export function SpawnSubagentModal({
               </span>
             </div>
             <Textarea
+              data-testid="mission-goal"
               placeholder="Describe the agent's objective, instructions, and constraints in detail..."
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
@@ -515,7 +538,22 @@ export function SpawnSubagentModal({
           </div>
 
           {/* Resource Limits */}
-          <div className="grid grid-cols-2 gap-3 pt-1">
+          <div className="grid grid-cols-3 gap-3 pt-1">
+            <div>
+              <label className="block font-semibold text-foreground mb-1">
+                Concurrency
+              </label>
+              <Input
+                data-testid="launch-concurrency"
+                type="number"
+                value={concurrency}
+                onChange={(e) => setConcurrency(parseInt(e.target.value, 10) || 0)}
+                min={1}
+                max={MAX_CONCURRENT_SUBAGENTS}
+                className="h-8 font-mono text-xs bg-background"
+              />
+              <span className="text-[9px] text-muted-foreground">{activeCount}/{MAX_CONCURRENT_SUBAGENTS} active</span>
+            </div>
             <div>
               <label className="block font-semibold text-foreground mb-1">
                 Timeout: {timeoutSeconds}s ({Math.floor(timeoutSeconds / 60)} min)
@@ -546,6 +584,17 @@ export function SpawnSubagentModal({
             </div>
           </div>
 
+          <div data-testid="dry-run-preview" className="rounded border border-primary/20 bg-primary/5 p-2.5 text-[10px] text-muted-foreground">
+            <div className="flex items-center justify-between gap-2 mb-1">
+              <span className="font-semibold text-primary">Dry-run launch preview</span>
+              <Badge variant="outline" className="text-[9px]">No host call yet</Badge>
+            </div>
+            <p className="leading-relaxed">
+              {concurrency} {concurrency === 1 ? "agent" : "agents"} · {archetype} · {roles.length ? roles.join(", ") : "no role"} · {formatLaunchIsolation(workspaceIsolation)} · {budgetTokens || "—"} tokens · {timeoutSeconds}s
+            </p>
+            <p className="mt-1 text-foreground/80">Review the mission and settings above, then use the explicit confirmation action to spawn.</p>
+          </div>
+
           {/* Form Actions */}
           <div className="flex justify-end gap-2 pt-3 border-t border-border">
             <Button
@@ -559,10 +608,10 @@ export function SpawnSubagentModal({
             <Button
               type="submit"
               size="sm"
-              disabled={isSubmitting || isDepthExceeded || !prompt.trim()}
+              disabled={isSubmitting || isDepthExceeded || launchErrors.length > 0}
               className="font-mono text-xs"
             >
-              {isSubmitting ? "Spawning Subagent..." : "Spawn Agent"}
+              {isSubmitting ? "Spawning Subagent..." : "Confirm & Spawn Agent"}
             </Button>
           </div>
         </form>

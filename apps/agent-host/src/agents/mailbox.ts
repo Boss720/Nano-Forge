@@ -140,9 +140,14 @@ export class SubagentMailbox {
   }
 
   /**
-   * Clears a subagent's mailbox.
+   * Clears a subagent's mailbox or all mailboxes if no ID provided.
    */
-  clear(subagentId: string): void {
-    this.queues.delete(subagentId);
+  clear(subagentId?: string): void {
+    if (subagentId) {
+      this.queues.delete(subagentId);
+    } else {
+      this.queues.clear();
+      this.auditLedger.length = 0;
+    }
   }
 }

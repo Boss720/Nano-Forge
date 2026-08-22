@@ -21,6 +21,7 @@ import { DaemonTaskManager } from "./subagents/DaemonTaskManager";
 import { SpawnSubagentModal } from "./subagents/SpawnSubagentModal";
 import { AgentMemoryViewer } from "./subagents/AgentMemoryViewer";
 import { AgentSwarmPlayground } from "./subagents/AgentSwarmPlayground";
+import { SubagentsOverview } from "./subagents/SubagentsOverview";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -149,6 +150,16 @@ export function SubagentsPanel({
   const handleMessageAgent = (subagentId: string) => {
     setActiveSubagentId?.(subagentId);
     setActiveTab("messages");
+  };
+
+  const handleFocusAgent = (subagentId: string) => {
+    setActiveSubagentId?.(subagentId);
+    setActiveTab("tree");
+  };
+
+  const handleInspectAgent = (subagentId: string) => {
+    setActiveSubagentId?.(subagentId);
+    setActiveTab("tools");
   };
 
   const handleKillAgent = async (subagentId: string) => {
@@ -313,6 +324,13 @@ export function SubagentsPanel({
           </span>
         </div>
       </div>
+
+      <SubagentsOverview
+        subagents={subagents}
+        activeSubagentId={activeSubagentId}
+        onFocusAgent={handleFocusAgent}
+        onInspectAgent={handleInspectAgent}
+      />
 
       {/* Tabs Navigation */}
       <div className="flex items-center border-b border-border bg-card font-mono text-xs overflow-x-auto scrollbar-none">

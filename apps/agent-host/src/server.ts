@@ -6,38 +6,80 @@
  *   ws://127.0.0.1:<ephemeral-port>/agent?token=<single-use-token>
  *
  * Security contract enforced here:
- * - binds ONLY 127.0.0.1, on an ephemeral port by default;
+ * - binds 127.0.0.1 by default, or configurable via HOST/BIND_ADDRESS;
  * - cryptographic tokens, each consumable exactly once (`tokenStore.consume`);
  * - missing / malformed / unknown / reused tokens close the socket with 4401;
+ * - origin validation on WebSocket handshakes rejecting untrusted web origins;
+ * - max message payload limit configured to prevent memory exhaustion;
+ * - strict security headers on all HTTP responses;
  * - every inbound frame is validated against the Zod protocol (protocol.ts);
  *   violations close the socket with 4400.
  *
  * `createHost()` is the test/programmatic factory. Executed directly
- * (`npm run start:host` / tsx) it reads PORT and TOKEN from the environment
+ * (`npm run start:host` / tsx) it reads PORT, HOST, and TOKEN from the environment
  * (generating an ephemeral port and a fresh token when unset) and prints the
  * connection URL.
  */
 import { randomBytes, randomUUID } from "node:crypto";
+import path from "node:path";
 import { pathToFileURL } from "node:url";
 import Fastify, { type FastifyInstance } from "fastify";
 import websocket from "@fastify/websocket";
 import type { WebSocket } from "ws";
-import { attachAgentSession, type AgentSessionOptions } from "./session";
+import { attachAgentSession, type AgentSessionOptions } from "./session.js";
 import {
   decodeClientMessage,
   type HostMessage,
   type RunState,
-} from "./protocol";
+} from "./protocol.js";
 import {
   safeParseTerminalClientMessage,
   type TerminalServerMessage,
 } from "@protocol/terminal";
+import { SubagentSupervisor } from "./agents/supervisor.js";
+import { DaemonManager } from "./daemons/manager.js";
+import { PtyManager } from "./terminal/ptyManager.js";
+import { logger } from "./logger.js";
+import type { WorkspaceDescriptor } from "@protocol/workspace";
+import { validateWorkspaceRoot } from "./workspace/runtime.js";
 
 export const HOST_VERSION = "0.1.0";
 
 /** WebSocket close codes used by this host. */
 export const CLOSE_UNAUTHORIZED = 4401;
 export const CLOSE_INVALID_MESSAGE = 4400;
+
+export const MAX_WS_PAYLOAD_BYTES = 5 * 1024 * 1024; // 5MB
+
+export function isAllowedOrigin(
+  origin?: string,
+  allowedOrigins?: (string | RegExp)[],
+): boolean {
+  if (!origin || origin === "null") return true; // CLI / non-browser / file origin
+  try {
+    const url = new URL(origin);
+    const hostname = url.hostname.toLowerCase();
+    if (
+      hostname === "localhost" ||
+      hostname === "127.0.0.1" ||
+      hostname === "::1" ||
+      hostname === "0.0.0.0" ||
+      hostname === "nano-gpt.com" ||
+      hostname.endsWith(".nano-gpt.com")
+    ) {
+      return true;
+    }
+    if (allowedOrigins) {
+      for (const allowed of allowedOrigins) {
+        if (typeof allowed === "string" && (origin === allowed || hostname === allowed)) return true;
+        if (allowed instanceof RegExp && allowed.test(origin)) return true;
+      }
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
 
 /** Tokens are 192-bit random values, base64url-encoded (32 chars). */
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{32,128}$/;
@@ -107,12 +149,18 @@ export type ProtocolAttachment = (
 ) => void;
 
 export interface HostOptions {
+  /** Host/interface to bind (defaults to 127.0.0.1 or env HOST/BIND_ADDRESS). */
+  host?: string;
   /** Port to bind; 0 (default) picks an ephemeral port. */
   port?: number;
   /** Pre-shared token (e.g. from env); a fresh one is generated otherwise. */
   token?: string;
   /** Enable Fastify's logger. */
   logger?: boolean;
+  /** Maximum inbound WS message payload size in bytes (default: 5MB). */
+  maxPayload?: number;
+  /** Additional allowed origins for WebSocket connections. */
+  allowedOrigins?: (string | RegExp)[];
   /** Authenticated-socket handler; defaults to {@link attachAgentProtocol}. */
   attach?: ProtocolAttachment;
   /** Configuration for the real coordinator/workspace session. */
@@ -121,6 +169,8 @@ export interface HostOptions {
 
 export interface HostHandle {
   app: FastifyInstance;
+  /** Host interface bound. */
+  host: string;
   /** Actual bound port (resolved after listen). */
   port: number;
   /** The single-use token for the first connection. */
@@ -129,11 +179,23 @@ export interface HostHandle {
   tokenStore: TokenStore;
   /** Stable id of this host instance, sent in `host.ready`. */
   hostId: string;
+  /** Subsystems */
+  daemonManager: DaemonManager;
+  ptyManager: PtyManager;
+  subagentSupervisor: SubagentSupervisor;
+  /** Canonical workspace identity shared by every privileged subsystem. */
+  workspace: WorkspaceDescriptor;
+  /** Whether the host is shutting down. */
+  readonly isClosing: boolean;
   /** Close all sockets and shut the server down. */
-  close(): Promise<void>;
+  close(graceMs?: number): Promise<void>;
 }
 
 export async function createHost(options: HostOptions = {}): Promise<HostHandle> {
+  const validatedWorkspace = await validateWorkspaceRoot(
+    options.session?.workspaceRoot ?? process.env.NANOFORGE_WORKSPACE ?? process.cwd(),
+  );
+  const workspaceRoot = validatedWorkspace.canonicalRoot;
   const app = Fastify({ logger: options.logger ?? false });
   const tokenStore = createTokenStore();
   const token =
@@ -142,12 +204,126 @@ export async function createHost(options: HostOptions = {}): Promise<HostHandle>
       : tokenStore.issue();
   const hostId = randomUUID();
   const sockets = new Set<WebSocket>();
+  let isClosing = false;
 
-  await app.register(websocket);
+  const daemonManager = options.session?.daemonManager ?? new DaemonManager(undefined, undefined, workspaceRoot);
+  const ptyManager = options.session?.ptyManager ?? new PtyManager({ workspaceRoot });
+  const subagentSupervisor =
+    options.session?.subagentSupervisor ??
+    new SubagentSupervisor({
+      workspaceRoot,
+      daemonSupervisor: daemonManager.supervisor,
+      scheduler: daemonManager.scheduler,
+    });
 
-  app.get("/health", async () => ({ ok: true, version: HOST_VERSION }));
+  const sameRoot = (candidate: string | undefined): boolean =>
+    candidate !== undefined && path.resolve(candidate).toLowerCase() === path.resolve(workspaceRoot).toLowerCase();
+  if (!sameRoot(ptyManager.workspaceRoot)) {
+    throw new Error("PTY manager workspace root does not match the host workspace root");
+  }
+  if (!sameRoot(subagentSupervisor.workspaceRoot)) {
+    throw new Error("Subagent supervisor workspace root does not match the host workspace root");
+  }
+  if (daemonManager.workspaceRoot !== undefined && !sameRoot(daemonManager.workspaceRoot)) {
+    throw new Error("Daemon manager workspace root does not match the host workspace root");
+  }
+  if (!sameRoot(subagentSupervisor.memory.workspaceRoot)) {
+    throw new Error("Memory engine workspace root does not match the host workspace root");
+  }
 
-  app.get("/agent", { websocket: true }, (socket, req) => {
+  await app.register(websocket, {
+    options: {
+      maxPayload: options.maxPayload ?? MAX_WS_PAYLOAD_BYTES,
+    },
+  });
+
+  app.addHook("onSend", async (_request, reply) => {
+    reply.header("X-Content-Type-Options", "nosniff");
+    reply.header("X-Frame-Options", "DENY");
+    reply.header("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; sandbox;");
+    reply.header("Referrer-Policy", "no-referrer");
+    reply.header("Cross-Origin-Opener-Policy", "same-origin");
+    reply.header("Cross-Origin-Resource-Policy", "same-origin");
+  });
+
+  const bindHost =
+    options.host ??
+    process.env.BIND_ADDRESS ??
+    process.env.HOST ??
+    process.env.NANOFORGE_HOST ??
+    "127.0.0.1";
+  const portToBind = options.port ?? (process.env.PORT ? Number(process.env.PORT) : 0);
+
+  app.get("/health", async () => {
+    const mem = process.memoryUsage();
+    const subagentNodes = subagentSupervisor.registry.getAll();
+    const tasks = daemonManager.supervisor.listTasks();
+    const schedules = daemonManager.scheduler.listSchedules();
+    const terminals = ptyManager.listSessions();
+
+    return {
+      ok: true,
+      version: HOST_VERSION,
+      uptimeSeconds: Math.floor(process.uptime()),
+      timestamp: new Date().toISOString(),
+      hostId,
+      bindAddress: bindHost,
+      port: (app.server.address() as any)?.port ?? portToBind,
+      memory: {
+        rssMb: +(mem.rss / (1024 * 1024)).toFixed(2),
+        heapTotalMb: +(mem.heapTotal / (1024 * 1024)).toFixed(2),
+        heapUsedMb: +(mem.heapUsed / (1024 * 1024)).toFixed(2),
+        externalMb: +(mem.external / (1024 * 1024)).toFixed(2),
+        arrayBuffersMb: +(mem.arrayBuffers / (1024 * 1024)).toFixed(2),
+        rssBytes: mem.rss,
+        heapTotalBytes: mem.heapTotal,
+        heapUsedBytes: mem.heapUsed,
+        externalBytes: mem.external,
+        arrayBuffersBytes: mem.arrayBuffers,
+      },
+      subagents: {
+        total: subagentNodes.length,
+        running: subagentNodes.filter((n) => n.state === "running").length,
+        idle: subagentNodes.filter((n) => n.state === "idle").length,
+        errored: subagentNodes.filter((n) => n.state === "errored").length,
+        waiting: subagentNodes.filter((n) => n.state.startsWith("waiting_for_")).length,
+      },
+      daemons: {
+        totalTasks: tasks.length,
+        runningTasks: tasks.filter((t) => t.status === "running").length,
+        activeSchedules: schedules.filter((s) => s.status === "active").length,
+        tasks: tasks.map((t) => ({
+          taskId: t.taskId,
+          pid: t.pid,
+          command: t.command,
+          isDaemon: t.isDaemon,
+          status: t.status,
+          startedAt: t.startedAt,
+          truncated: t.truncated ?? false,
+        })),
+      },
+      connections: {
+        activeSockets: sockets.size,
+        outstandingTokens: tokenStore.size,
+      },
+      terminals: {
+        activeSessions: terminals.filter((t) => t.status === "running").length,
+        totalSessions: terminals.length,
+      },
+      workspace: validatedWorkspace.descriptor,
+    };
+  });
+
+  const handleWs = (socket: WebSocket, req: any) => {
+    if (isClosing) {
+      socket.close(1001, "Server shutting down");
+      return;
+    }
+    const origin = req.headers.origin;
+    if (!isAllowedOrigin(origin, options.allowedOrigins)) {
+      socket.close(CLOSE_UNAUTHORIZED, "unauthorized origin");
+      return;
+    }
     const queryToken = new URL(req.url ?? "/agent", "http://127.0.0.1")
       .searchParams.get("token");
     if (!tokenStore.consume(queryToken)) {
@@ -159,31 +335,103 @@ export async function createHost(options: HostOptions = {}): Promise<HostHandle>
     if (options.attach) {
       options.attach(socket, { hostId });
     } else {
-      attachAgentSession(socket, { hostId }, options.session);
+      attachAgentSession(socket, { hostId }, {
+        ...options.session,
+        workspaceRoot,
+        workspaceDescriptor: validatedWorkspace.descriptor,
+        daemonManager,
+        ptyManager,
+        subagentSupervisor,
+      });
     }
-  });
+  };
 
-  await app.listen({ host: "127.0.0.1", port: options.port ?? 0 });
+  app.get("/agent", { websocket: true }, handleWs);
+  app.get("/ws", { websocket: true }, handleWs);
+
+  await app.listen({ host: bindHost, port: portToBind });
   const address = app.server.address();
   const port =
     typeof address === "object" && address !== null
       ? address.port
-      : (options.port ?? 0);
+      : portToBind;
 
   return {
     app,
+    host: bindHost,
     port,
     token,
     tokenStore,
     hostId,
-    async close() {
+    daemonManager,
+    ptyManager,
+    subagentSupervisor,
+    workspace: validatedWorkspace.descriptor,
+    get isClosing() {
+      return isClosing;
+    },
+    async close(graceMs = 1000) {
+      if (isClosing) return;
+      isClosing = true;
+
+      const drainPromises: Promise<void>[] = [];
       for (const socket of sockets) {
         try {
-          socket.terminate();
+          if (socket.readyState === 1) {
+            socket.send(
+              JSON.stringify({
+                type: "host.closing",
+                reason: "Server shutting down",
+                at: new Date().toISOString(),
+              })
+            );
+            socket.close(1001, "Server shutting down");
+          }
+          drainPromises.push(
+            new Promise<void>((resolve) => {
+              const timer = setTimeout(() => {
+                try {
+                  socket.terminate();
+                } catch {
+                  /* ignore */
+                }
+                resolve();
+              }, graceMs);
+              socket.once("close", () => {
+                clearTimeout(timer);
+                resolve();
+              });
+            })
+          );
         } catch {
-          /* already closed */
+          try {
+            socket.terminate();
+          } catch {
+            /* ignore */
+          }
         }
       }
+      await Promise.allSettled(drainPromises);
+      sockets.clear();
+
+      try {
+        await subagentSupervisor.dispose();
+      } catch (err) {
+        logger.error("host.close.subagents_error", "Error disposing subagents", undefined, err);
+      }
+
+      try {
+        await daemonManager.dispose();
+      } catch (err) {
+        logger.error("host.close.daemons_error", "Error disposing daemons", undefined, err);
+      }
+
+      try {
+        ptyManager.dispose();
+      } catch (err) {
+        logger.error("host.close.pty_error", "Error disposing pty manager", undefined, err);
+      }
+
       await app.close();
     },
   };
@@ -305,11 +553,49 @@ const invokedDirectly =
 
 if (invokedDirectly) {
   const host = await createHost({
+    host: process.env.BIND_ADDRESS ?? process.env.HOST ?? "127.0.0.1",
     port: process.env.PORT ? Number(process.env.PORT) : 0,
     token: process.env.TOKEN,
     logger: true,
+    session: {
+      workspaceRoot: process.env.NANOFORGE_WORKSPACE,
+      allowWorkspaceWrites: process.env.NANOFORGE_ALLOW_WORKSPACE_WRITES === "1",
+    },
   });
   console.log(
-    `agent-host v${HOST_VERSION} listening: ws://127.0.0.1:${host.port}/agent?token=${host.token}`,
+    `agent-host v${HOST_VERSION} listening: ws://${host.host}:${host.port}/agent?token=${host.token}`,
   );
+
+  let isShuttingDown = false;
+  const handleSignal = async (sig: string) => {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    console.log(`\n[agent-host] Received ${sig}, initiating graceful shutdown...`);
+
+    const forceTimer = setTimeout(() => {
+      console.error("[agent-host] Shutdown timed out (5s), forcing process.exit(1)");
+      process.exit(1);
+    }, 5000);
+    forceTimer.unref();
+
+    try {
+      await host.close(1000);
+      clearTimeout(forceTimer);
+      console.log("[agent-host] Shutdown completed cleanly.");
+      process.exit(0);
+    } catch (err) {
+      console.error("[agent-host] Error during shutdown:", err);
+      process.exit(1);
+    }
+  };
+
+  process.once("SIGINT", () => void handleSignal("SIGINT"));
+  process.once("SIGTERM", () => void handleSignal("SIGTERM"));
+
+  process.on("unhandledRejection", (reason, promise) => {
+    logger.error("process.unhandled_rejection", "Unhandled promise rejection captured", { promise }, reason);
+  });
+  process.on("uncaughtException", (error) => {
+    logger.error("process.uncaught_exception", "Uncaught exception captured", undefined, error);
+  });
 }

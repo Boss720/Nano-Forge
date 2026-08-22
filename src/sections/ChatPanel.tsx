@@ -3,7 +3,8 @@ import {
   Ban, Bot, Brain, Check, ChevronDown, ChevronRight, CircleDollarSign, Clock, FileEdit, FileSearch,
   SendHorizonal, ShieldAlert, Square, TerminalSquare, X,
 } from "lucide-react";
-import type { GenerationPrefs, Message, NanoModel, Patch, ToolCall, ToolRun, ToolRunState, VirtualFile } from "@/types";
+import type { ChatSendInput, GenerationPrefs, Message, NanoModel, Patch, ToolCall, ToolRun, ToolRunState, VirtualFile, WorkspaceAttachmentResolver } from "@/types";
+import type { CommandResultFrame, SlashCommandWire } from "@protocol/commands";
 import { AGENT_SYSTEM_PROMPT } from "@/lib/catalog";
 import { estimateTokens } from "@/lib/context";
 import { RichText } from "@/components/RichText";
@@ -14,7 +15,7 @@ export interface ChatPanelProps {
   running: boolean;
   model: NanoModel | undefined;
   connected: boolean;
-  onSend: (text: string) => void;
+  onSend: (text: string | ChatSendInput) => void;
   onStop: () => void;
   onPatchDecision: (messageId: string, decision: "applied" | "rejected") => void;
   genPrefs: GenerationPrefs;
@@ -29,11 +30,13 @@ export interface ChatPanelProps {
   onToolStop?: (toolRunId: string) => void;
   /** Planning mode trigger */
   onTriggerPlan?: (goal: string) => void;
+  onExecuteCommand?: (wire: SlashCommandWire) => Promise<CommandResultFrame | void>;
   /** Workspace files for @file mentions */
   workspaceFiles?: VirtualFile[];
-  /** Milestone 3: Voice Call triggers */
-  onTriggerVoiceCall?: () => void;
-  isVoiceCallActive?: boolean;
+  /** Future host bridge for workspace-relative file reads. */
+  resolveWorkspaceAttachment?: WorkspaceAttachmentResolver;
+  workspaceAttachmentRequest?: string | null;
+  onWorkspaceAttachmentConsumed?: () => void;
 }
 
 const TOOL_ICON: Record<ToolCall["kind"], typeof Brain> = {
@@ -57,11 +60,14 @@ export function ChatPanel({
   toolRuns,
   onToolStop,
   onTriggerPlan,
+  onExecuteCommand,
   workspaceFiles,
-  onTriggerVoiceCall,
-  isVoiceCallActive = false,
+  resolveWorkspaceAttachment,
+  workspaceAttachmentRequest,
+  onWorkspaceAttachmentConsumed,
 }: ChatPanelProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
+  const [commandStatus, setCommandStatus] = useState<{ text: string; success: boolean } | null>(null);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -78,6 +84,22 @@ export function ChatPanel({
       0,
     );
   const usedPct = budgetTokens > 0 ? (usedTokens / budgetTokens) * 100 : 0;
+
+  const handleExecuteCommand = async (wire: SlashCommandWire) => {
+    if (!onExecuteCommand) {
+      setCommandStatus({ text: "Swarm commands require a connected agent host.", success: false });
+      return;
+    }
+    setCommandStatus({ text: `Running ${wire.command}…`, success: true });
+    try {
+      const result = await onExecuteCommand(wire);
+      if (result) {
+        setCommandStatus({ text: result.success ? result.output ?? `${result.command} completed.` : result.error ?? `${result.command} failed.`, success: result.success });
+      }
+    } catch (error) {
+      setCommandStatus({ text: error instanceof Error ? error.message : String(error), success: false });
+    }
+  };
 
   return (
     <section className="flex min-w-0 flex-1 flex-col bg-background">
@@ -97,11 +119,25 @@ export function ChatPanel({
       </div>
 
       {/* composer with floating caret popover slash engine & @file autocomplete */}
+      {commandStatus && (
+        <div
+          className={`mx-4 mb-2 rounded border px-3 py-2 font-mono text-[11px] ${commandStatus.success ? "border-primary/30 bg-primary/5 text-primary" : "border-red-500/30 bg-red-500/5 text-red-300"}`}
+          role="status"
+          data-testid="command-status"
+        >
+          {commandStatus.text}
+        </div>
+      )}
       <ChatComposer
-        onSendMessage={(text) => onSend(text)}
+        onSendMessage={(text, attachments) => {
+          if (!attachments || attachments.length === 0) {
+            onSend(text);
+            return;
+          }
+          onSend({ text, attachments });
+        }}
         onTriggerPlan={onTriggerPlan}
-        onTriggerVoiceCall={onTriggerVoiceCall}
-        isVoiceCallActive={isVoiceCallActive}
+        onExecuteCommand={handleExecuteCommand}
         running={running}
         onStop={onStop}
         model={model}
@@ -112,6 +148,9 @@ export function ChatPanel({
         genPrefs={genPrefs}
         onGenPrefsChange={onGenPrefsChange}
         workspaceFiles={workspaceFiles}
+        resolveWorkspaceAttachment={resolveWorkspaceAttachment}
+        workspaceAttachmentRequest={workspaceAttachmentRequest}
+        onWorkspaceAttachmentConsumed={onWorkspaceAttachmentConsumed}
       />
     </section>
   );
@@ -162,6 +201,7 @@ function MessageView({ m, onPatchDecision }: { m: Message; onPatchDecision: Chat
       <div className="flex justify-end">
         <div className="max-w-[75%] rounded-lg border border-primary/25 bg-primary/10 px-3.5 py-2.5 text-[13px] leading-relaxed text-foreground">
           {m.content}
+          {m.attachments && m.attachments.length > 0 && <MessageAttachmentChips attachments={m.attachments} />}
         </div>
       </div>
     );
@@ -182,6 +222,22 @@ function MessageView({ m, onPatchDecision }: { m: Message; onPatchDecision: Chat
           {m.model} · {m.usage.input.toLocaleString()} in / {m.usage.output.toLocaleString()} out · ≈ ${m.usage.costUsd.toFixed(5)}
         </div>
       )}
+    </div>
+  );
+}
+
+function MessageAttachmentChips({ attachments }: { attachments: NonNullable<Message["attachments"]> }) {
+  return (
+    <div className="mt-2 flex flex-wrap gap-1.5 border-t border-primary/15 pt-2" data-testid="message-attachments">
+      {attachments.map((attachment) => (
+        <span key={attachment.id} className="inline-flex max-w-full items-center gap-1 rounded border border-primary/25 bg-card/30 px-1.5 py-0.5 font-mono text-[10px] text-primary">
+          <FileSearch className="h-3 w-3 shrink-0" />
+          <span className="truncate">{attachment.relativePath ?? attachment.name}</span>
+          <span className="text-primary/65">{attachment.source} · {attachment.status}{attachment.truncated ? " · truncated" : ""}</span>
+          {attachment.status === "missing" && <span className="text-amber-300">snapshot unavailable</span>}
+          {attachment.status === "error" && attachment.error && <span className="truncate text-red-300">{attachment.error}</span>}
+        </span>
+      ))}
     </div>
   );
 }

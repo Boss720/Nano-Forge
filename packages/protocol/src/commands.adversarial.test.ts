@@ -6,6 +6,7 @@ import {
   commandExecuteFrameSchema,
   commandResultFrameSchema,
   BUILTIN_SLASH_COMMANDS,
+  swarmCommandResultSchema,
   type SlashCommandWire,
 } from "./commands";
 
@@ -307,7 +308,7 @@ describe("Adversarial Slash Command Engine Stress Harness", () => {
       expect(() => commandResultFrameSchema.parse(resFrame)).not.toThrow();
     });
 
-    it("ensures all 8 built-in commands have unique names and aliases", () => {
+    it("ensures all built-in commands have unique names and aliases", () => {
       const names = new Set<string>();
       const aliases = new Set<string>();
 
@@ -321,7 +322,36 @@ describe("Adversarial Slash Command Engine Stress Harness", () => {
         }
       }
 
-      expect(names.size).toBe(8);
+      expect(names.size).toBe(11);
+    });
+
+    it("keeps swarm aliases as ordinary deterministic command tokens", () => {
+      expect(parseSlashCommand('/sw "run" "goal with spaces"')).toEqual({
+        command: "/sw",
+        positional: ["run", "goal with spaces"],
+        flags: {},
+        rawInput: '/sw "run" "goal with spaces"',
+        mentions: { files: [], rules: [], symbols: [], agents: [] },
+      });
+
+      expect(parseSlashCommand("/agent-message @agent:worker-1 'ship it'")).toEqual({
+        command: "/agent-message",
+        positional: ["ship it"],
+        flags: {},
+        rawInput: "/agent-message @agent:worker-1 'ship it'",
+        mentions: { files: [], rules: [], symbols: [], agents: ["worker-1"] },
+      });
+    });
+
+    it("rejects unknown swarm result operations while parsing edge input safely", () => {
+      expect(() => swarmCommandResultSchema.parse({ action: "restart", success: true })).toThrow();
+      expect(parseSlashCommand('/swarm run "unterminated goal')).toEqual({
+        command: "/swarm",
+        positional: ["run", "unterminated", "goal"],
+        flags: {},
+        rawInput: '/swarm run "unterminated goal',
+        mentions: { files: [], rules: [], symbols: [], agents: [] },
+      });
     });
   });
 });

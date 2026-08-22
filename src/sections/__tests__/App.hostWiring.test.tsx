@@ -104,6 +104,8 @@ describe("App host-absent default", () => {
     expect(screen.queryByTestId("integrations-panel")).not.toBeInTheDocument();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(screen.queryByText("First navigation to a new origin")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /voice call/i })).not.toBeInTheDocument();
+    expect(screen.queryByText(/start voice call/i)).not.toBeInTheDocument();
   });
 });
 

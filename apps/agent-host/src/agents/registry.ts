@@ -151,6 +151,13 @@ export class SubagentRegistry {
   }
 
   /**
+   * Alias for getAll().
+   */
+  listSubagents(): SubagentNode[] {
+    return this.getAll();
+  }
+
+  /**
    * Returns all active (non-errored) subagents.
    */
   getActive(): SubagentNode[] {

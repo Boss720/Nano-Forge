@@ -3,6 +3,7 @@ import type { FileTreeNode, SearchMatch, GitFileStatus, DirEntry } from '@/types
 
 export interface WorkspaceClient {
   readDir(path?: string): Promise<DirEntry[]>;
+  readFile?(path: string): Promise<{ path: string; content: string; language: string; size: number }>;
   search(query: string, options?: { maxResults?: number }): Promise<SearchMatch[]>;
   gitStatus(): Promise<GitFileStatus[]>;
 }
@@ -21,15 +22,18 @@ export function useWorkspace(client?: WorkspaceClient) {
   const [searchResults, setSearchResults] = useState<SearchMatch[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [gitStatus, setGitStatus] = useState<GitFileStatus[]>([]);
+  const [error, setError] = useState<string | null>(null);
 
   const loadDirectory = useCallback(async (path: string) => {
     if (!client) return;
     setIsLoading(true);
+    setError(null);
     try {
       const entries = await client.readDir(path);
       const children = toNodes(entries, path);
       setTree((prev) => path ? replaceChildren(prev, path, children) : children);
-    } finally { setIsLoading(false); }
+    } catch (err) { setError(err instanceof Error ? err.message : "Unable to load workspace files"); }
+    finally { setIsLoading(false); }
   }, [client]);
 
   const selectFile = useCallback((path: string) => setActiveFile(path), []);
@@ -37,10 +41,15 @@ export function useWorkspace(client?: WorkspaceClient) {
     if (!client || !query.trim()) { setSearchResults([]); return; }
     setIsLoading(true);
     try { setSearchResults(await client.search(query, { maxResults: 200 })); }
+    catch (err) { setError(err instanceof Error ? err.message : "Unable to search workspace files"); }
     finally { setIsLoading(false); }
   }, [client]);
   const refreshTree = useCallback(() => loadDirectory(''), [loadDirectory]);
-  const refreshGitStatus = useCallback(async () => { if (client) setGitStatus(await client.gitStatus()); }, [client]);
+  const refreshGitStatus = useCallback(async () => {
+    if (!client) return;
+    try { setGitStatus(await client.gitStatus()); }
+    catch (err) { setError(err instanceof Error ? err.message : "Unable to load Git status"); }
+  }, [client]);
 
-  return { tree, activeFile, searchResults, isLoading, gitStatus, loadDirectory, selectFile, searchFiles, refreshTree, refreshGitStatus };
+  return { tree, activeFile, searchResults, isLoading, gitStatus, error, loadDirectory, selectFile, searchFiles, refreshTree, refreshGitStatus };
 }

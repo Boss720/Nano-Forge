@@ -10,6 +10,9 @@ export default defineConfig({
     alias: {
       "@": path.resolve(__dirname, "./src"),
       "@protocol": path.resolve(__dirname, "./packages/protocol/src"),
+      "@nanoforge/protocol": path.resolve(__dirname, "./packages/protocol/src"),
+      "@nanoforge/core": path.resolve(__dirname, "./packages/core/src"),
+      "@nanoforge/sdk": path.resolve(__dirname, "./packages/sdk/src"),
     },
   },
 })

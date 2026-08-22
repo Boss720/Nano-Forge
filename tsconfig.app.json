@@ -18,6 +18,24 @@
       ],
       "@protocol": [
         "./packages/protocol/src/index.ts"
+      ],
+      "@nanoforge/protocol/*": [
+        "./packages/protocol/src/*"
+      ],
+      "@nanoforge/protocol": [
+        "./packages/protocol/src/index.ts"
+      ],
+      "@nanoforge/core/*": [
+        "./packages/core/src/*"
+      ],
+      "@nanoforge/core": [
+        "./packages/core/src/index.ts"
+      ],
+      "@nanoforge/sdk/*": [
+        "./packages/sdk/src/*"
+      ],
+      "@nanoforge/sdk": [
+        "./packages/sdk/src/index.ts"
       ]
     },
     /* Bundler mode */

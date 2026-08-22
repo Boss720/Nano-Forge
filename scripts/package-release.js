@@ -77,7 +77,21 @@ export function copyDirectorySync(src, dest) {
 
 export function ensureDirectoryClean(dirPath) {
   if (fs.existsSync(dirPath)) {
-    fs.rmSync(dirPath, { recursive: true, force: true });
+    try {
+      fs.rmSync(dirPath, { recursive: true, force: true });
+    } catch (err) {
+      // On Windows, EPERM can occur if files are locked; try emptying contents instead
+      console.warn(`[packager] Warning: Could not remove ${dirPath} (${err.code}). Attempting to clean contents...`);
+      try {
+        const entries = fs.readdirSync(dirPath);
+        for (const entry of entries) {
+          const entryPath = path.join(dirPath, entry);
+          try {
+            fs.rmSync(entryPath, { recursive: true, force: true });
+          } catch { /* skip locked entries */ }
+        }
+      } catch { /* proceed with directory as-is */ }
+    }
   }
   fs.mkdirSync(dirPath, { recursive: true });
 }

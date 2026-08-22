@@ -345,7 +345,7 @@ function resolveDefaultShell(
 }
 
 export class PtyManager extends EventEmitter {
-  private readonly workspaceRoot: string;
+  readonly workspaceRoot: string;
   private readonly envAllowlist: readonly string[];
   private readonly hostEnv?: Record<string, string>;
   private readonly maxScrollbackBytes: number;

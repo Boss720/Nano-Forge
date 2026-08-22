@@ -1,9 +1,0 @@
-{
-  "name": "nanoforge-distribution",
-  "version": "0.6.0",
-  "description": "NanoForge Autonomous Swarm Development Platform",
-  "main": "nanoforge-launcher.cjs",
-  "scripts": {
-    "start": "node nanoforge-launcher.cjs"
-  }
-}

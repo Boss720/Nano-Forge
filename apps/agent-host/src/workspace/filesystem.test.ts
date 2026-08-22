@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { createHash } from 'node:crypto';
 import { handleReadDir, handleReadFile, handleWriteFile, handleStat, handleSearch, handleGitStatus } from './filesystem.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -9,9 +10,11 @@ vi.mock('execa');
 
 describe('workspace filesystem', () => {
   let tmpDir: string;
+  let extraTmpDirs: string[];
 
   beforeEach(async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'nanoforge-test-'));
+    extraTmpDirs = [];
     // Setup some test files
     await fs.mkdir(path.join(tmpDir, 'src'));
     await fs.writeFile(path.join(tmpDir, 'src', 'index.ts'), 'console.log("hello");', 'utf8');
@@ -22,6 +25,7 @@ describe('workspace filesystem', () => {
 
   afterEach(async () => {
     await fs.rm(tmpDir, { recursive: true, force: true });
+    for (const target of extraTmpDirs) await fs.rm(target, { recursive: true, force: true });
     vi.clearAllMocks();
   });
 
@@ -55,6 +59,16 @@ describe('workspace filesystem', () => {
       await expect(handleReadFile(tmpDir, '../etc/passwd')).rejects.toThrow();
     });
 
+    it('blocks symlinks or junctions that escape the workspace', async () => {
+      const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'nanoforge-outside-'));
+      extraTmpDirs.push(outside);
+      await fs.writeFile(path.join(outside, 'secret.txt'), 'outside');
+      const link = path.join(tmpDir, 'outside-link');
+      await fs.symlink(outside, link, process.platform === 'win32' ? 'junction' : 'dir');
+      await expect(handleReadFile(tmpDir, 'outside-link/secret.txt'))
+        .rejects.toMatchObject({ code: 'path_outside_workspace' });
+    });
+
     it('rejects files over 1MB', async () => {
       const _largeFile = path.join(tmpDir, 'large.txt');
       // Mock stat for this file to avoid actually creating a 1MB+ file
@@ -81,6 +95,32 @@ describe('workspace filesystem', () => {
 
     it('blocks writes outside workspace', async () => {
       await expect(handleWriteFile(tmpDir, '../../system.txt', 'hack')).rejects.toThrow();
+    });
+
+    it('rejects stale writes using the expected sha256', async () => {
+      await expect(handleWriteFile(tmpDir, 'README.md', '# Changed', {
+        expectedSha256: '0'.repeat(64),
+      })).rejects.toMatchObject({ code: 'write_conflict' });
+      expect(await fs.readFile(path.join(tmpDir, 'README.md'), 'utf8')).toBe('# Hello');
+    });
+
+    it('returns the new hash and writes by atomic replacement', async () => {
+      const previous = createHash('sha256').update('# Hello').digest('hex');
+      const result = await handleWriteFile(tmpDir, 'README.md', '# Updated', {
+        expectedSha256: previous,
+      });
+      expect(result).toEqual({
+        success: true,
+        sha256: createHash('sha256').update('# Updated').digest('hex'),
+        size: Buffer.byteLength('# Updated'),
+        modified: expect.any(String),
+      });
+      expect(await fs.readFile(path.join(tmpDir, 'README.md'), 'utf8')).toBe('# Updated');
+    });
+
+    it('rejects writes over the bounded write limit', async () => {
+      await expect(handleWriteFile(tmpDir, 'large.txt', 'x'.repeat(1024 * 1024 + 1)))
+        .rejects.toMatchObject({ code: 'file_too_large' });
     });
   });
 

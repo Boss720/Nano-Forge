@@ -1,4 +1,15 @@
 import type { X402Quote } from "@/lib/x402";
+import type { ChatAttachment } from "@/types/attachments";
+
+export type {
+  AttachmentSource,
+  AttachmentStatus,
+  ChatAttachment,
+  ChatAttachmentDraft,
+  ChatSendInput,
+  WorkspaceAttachmentContent,
+  WorkspaceAttachmentResolver,
+} from "@/types/attachments";
 
 export interface NanoModel {
   id: string;
@@ -14,6 +25,8 @@ export interface NanoModel {
   /** true when pricing came from the magnitude heuristic, not explicit per-token fields */
   priceEstimated?: boolean;
 }
+
+export type Model = NanoModel;
 
 export type ToolKind = "read_file" | "edit_file" | "run_command" | "search" | "think";
 
@@ -48,6 +61,8 @@ export interface Message {
   patch?: Patch;
   usage?: { input: number; output: number; costUsd: number };
   model?: string;
+  /** Content-free attachment metadata. Text belongs in the snapshot store. */
+  attachments?: ChatAttachment[];
   /**
    * Task 2.2: marks messages produced by the edit-verify auto-loop
    * (verification prompt + the model's reply). Stored with role
@@ -73,6 +88,36 @@ export interface Session {
   messages: Message[];
   model: string;
   createdAt: number;
+}
+
+/** A chat is the persisted, sidebar-addressable form of a session. */
+export interface Chat extends Session {
+  archived?: boolean;
+  pinned?: boolean;
+}
+
+/**
+ * Safe-to-persist identity for a host-backed local workspace. The canonical
+ * filesystem root deliberately stays inside the local host: browser storage
+ * only receives an opaque id and a display-safe path label.
+ */
+export interface WorkspaceLocation {
+  kind: "local";
+  hostWorkspaceId: string;
+  displayPath: string;
+  lastOpenedAt: number;
+  status?: "ready" | "unavailable" | "connecting";
+}
+
+/** A workspace owns chats; files remain global and are not owned by this record. */
+export interface Workspace {
+  id: string;
+  name: string;
+  chats: Chat[];
+  createdAt: number;
+  archived?: boolean;
+  pinned?: boolean;
+  location?: WorkspaceLocation;
 }
 
 export interface ConnectionState {

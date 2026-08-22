@@ -7,6 +7,8 @@ import {
   commandResultFrameSchema,
   slashCommandWireSchema,
   slashCommandCategorySchema,
+  swarmCommandActionSchema,
+  swarmCommandResultSchema,
   type SlashCommandWire,
 } from "./commands";
 
@@ -149,8 +151,8 @@ describe("Slash Command Engine Protocol & Tokenizer", () => {
   /* 6. Built-in Command Registry & Formatting Roundtrip                      */
   /* ------------------------------------------------------------------------ */
 
-  it("registers all 8 built-in commands with valid categories", () => {
-    expect(BUILTIN_SLASH_COMMANDS).toHaveLength(8);
+  it("registers all built-in commands with valid categories", () => {
+    expect(BUILTIN_SLASH_COMMANDS).toHaveLength(11);
     const names = BUILTIN_SLASH_COMMANDS.map((c) => c.name);
     expect(names).toContain("/plan");
     expect(names).toContain("/goal");
@@ -175,5 +177,81 @@ describe("Slash Command Engine Protocol & Tokenizer", () => {
 
     const formatted = formatSlashCommand(parsed);
     expect(formatted).toBe('/plan "Implement OAuth" --fast @file:src/auth.ts @rule:strict');
+  });
+
+  it("parses a swarm run with a quoted goal, typed flags, and agent mentions", () => {
+    const input =
+      '/swarm run "Refactor the auth gateway" --maxAgents=3 --parallel=true @agent:lead';
+    const parsed = parseSlashCommand(input);
+
+    expect(parsed).toEqual({
+      command: "/swarm",
+      positional: ["run", "Refactor the auth gateway"],
+      flags: { maxAgents: 3, parallel: true },
+      rawInput: input,
+      mentions: { files: [], rules: [], symbols: [], agents: ["lead"] },
+    });
+
+    expect(formatSlashCommand(parsed!)).toBe(
+      '/swarm run "Refactor the auth gateway" --maxAgents=3 --parallel @agent:lead',
+    );
+  });
+
+  it("exposes swarm commands, operation metadata, aliases, and typed results", () => {
+    expect(BUILTIN_SLASH_COMMANDS).toHaveLength(11);
+
+    const swarm = BUILTIN_SLASH_COMMANDS.find((command) => command.name === "/swarm");
+    const agents = BUILTIN_SLASH_COMMANDS.find((command) => command.name === "/agents");
+    const agent = BUILTIN_SLASH_COMMANDS.find((command) => command.name === "/agent");
+
+    expect(swarm?.aliases).toContain("/sw");
+    expect(swarm?.params?.find((param) => param.name === "action")?.enumValues).toEqual([
+      "run",
+      "list",
+      "tree",
+      "inspect",
+      "message",
+      "pause",
+      "resume",
+      "stop",
+      "focus",
+    ]);
+    expect(agents?.aliases).toEqual(["/agent-list", "/agent-tree", "/agent-inspect"]);
+    expect(agent?.aliases).toEqual([
+      "/a",
+      "/agent-message",
+      "/agent-pause",
+      "/agent-resume",
+      "/agent-stop",
+      "/agent-focus",
+    ]);
+
+    for (const action of [
+      "run",
+      "list",
+      "tree",
+      "inspect",
+      "message",
+      "pause",
+      "resume",
+      "stop",
+      "focus",
+    ] as const) {
+      expect(swarmCommandActionSchema.parse(action)).toBe(action);
+    }
+
+    expect(
+      swarmCommandResultSchema.parse({
+        action: "message",
+        success: true,
+        agentId: "worker-1",
+        message: "Message delivered",
+      }),
+    ).toEqual({
+      action: "message",
+      success: true,
+      agentId: "worker-1",
+      message: "Message delivered",
+    });
   });
 });

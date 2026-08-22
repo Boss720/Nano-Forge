@@ -50,7 +50,7 @@ export function normalizeHostUrl(host: string, token?: string): { url: string; t
     parsed.pathname = "/agent";
   }
 
-  let resolvedToken = token ?? parsed.searchParams.get("token") ?? undefined;
+  const resolvedToken = token ?? parsed.searchParams.get("token") ?? undefined;
   if (resolvedToken) {
     parsed.searchParams.set("token", resolvedToken);
   }

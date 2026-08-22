@@ -21,7 +21,8 @@
  * a tool execution frame; execution is the host's job after policy + grant.
  */
 import type { ExecutionPlan, PlanUIState, ToolRunState } from "@/types";
-import type { DirEntry, SearchMatch, GitFileStatus } from "@/types/workspace";
+import type { DirEntry, FileStat, SearchMatch, GitFileStatus } from "@/types/workspace";
+import type { WorkspaceDescriptor, WorkspaceErrorCode, WorkspaceWriteResult } from "@protocol/workspace";
 import type { HostIntegrationsState } from "@/lib/hostSession";
 import type {
   InvokeSubagentParams,
@@ -57,6 +58,7 @@ import type {
   MemoryDeleteParams,
   MemoryDeleteResult,
 } from "@protocol/memory";
+import type { CommandExecuteFrame, CommandResultFrame, SlashCommandWire } from "@protocol/commands";
 
 /* ------------------------------------------------------------------ */
 /* Wire message shapes                                                */
@@ -68,7 +70,12 @@ export type HostClientRequestType =
   | "approval.deny"
   | "run.pause"
   | "run.cancel"
+  | "workspace.open"
   | "workspace.readDir"
+  | "workspace.readFile"
+  | "workspace.writeFile"
+  | "workspace.stat"
+  | "workspace.watch"
   | "workspace.search"
   | "workspace.gitStatus"
   | "integration.toggle"
@@ -84,7 +91,10 @@ export type HostClientRequestType =
   | "memory.delete"
   | "playground.dispatchTurn"
   | "playground.simulateTurn"
-  | "playground.injectFailure";
+  | "playground.injectFailure"
+  | "command.execute";
+
+export type ExecuteCommandInput = Omit<CommandExecuteFrame, "type" | "requestId">;
 
 export interface HostClientRequest {
   type: HostClientRequestType;
@@ -100,6 +110,15 @@ export interface HostClientRequest {
   callerId?: string;
   senderId?: string;
   creatorSubagentId?: string;
+  command?: string;
+  args?: string[];
+  rawText?: string;
+  parsed?: SlashCommandWire;
+  path?: string;
+  generation?: number;
+  content?: string;
+  expectedSha256?: string;
+  expectedModified?: string;
 }
 
 export interface RunStateMessage {
@@ -478,9 +497,13 @@ export type HostMessage =
   | PlaygroundDispatchTurnResultMessage
   | PlaygroundSimulateTurnResultMessage
   | PlaygroundInjectFailureResultMessage
+  | CommandResultFrame
+  | WorkspaceReadyMessage
+  | WorkspaceErrorMessage
   | { type: "workspace.readDir.result"; requestId: string; path: string; entries: DirEntry[] }
   | { type: "workspace.search.result"; requestId: string; matches: SearchMatch[] }
   | { type: "workspace.gitStatus.result"; requestId: string; files: GitFileStatus[] }
+  | { type: "workspace.watch.result"; requestId?: string; enabled: boolean; generation: number }
   | { type: "workspace.fileChanged"; path: string; changeType: "created" | "modified" | "deleted" };
 
 /** Any host frame may carry a requestId correlating it to a client request. */
@@ -533,6 +556,27 @@ export interface HostClientOptions {
   token: string;
   /** Override for tests; defaults to the global WebSocket constructor. */
   WebSocketImpl?: WebSocketFactory;
+  /** Bounds failed workspace requests so a missing host reply cannot hang the UI. */
+  requestTimeoutMs?: number;
+}
+
+/** Safe browser-facing result of a future host workspace picker/select flow. */
+export type HostWorkspaceDescriptor = WorkspaceDescriptor;
+
+export interface WorkspaceReadyMessage {
+  type: "workspace.ready";
+  requestId?: string;
+  workspace: HostWorkspaceDescriptor;
+  at: string;
+}
+
+export interface WorkspaceErrorMessage {
+  type: "workspace.error";
+  requestId?: string;
+  code: WorkspaceErrorCode;
+  message: string;
+  generation: number;
+  recoverable: boolean;
 }
 
 const WS_OPEN = 1;
@@ -544,10 +588,16 @@ const HOST_MESSAGE_TYPES = new Set([
   "tool.output",
   "run.event",
   "error",
+  "workspace.ready",
+  "workspace.error",
   "workspace.readDir.result",
+  "workspace.readFile.result",
+  "workspace.writeFile.result",
+  "workspace.stat.result",
   "workspace.search.result",
   "workspace.gitStatus.result",
   "workspace.fileChanged",
+  "workspace.watch.result",
   "integrations.snapshot",
   "subagent.invoke.result",
   "subagent.manage.result",
@@ -588,6 +638,7 @@ const HOST_MESSAGE_TYPES = new Set([
   "playground.dispatchTurn.result",
   "playground.simulateTurn.result",
   "playground.injectFailure.result",
+  "command.result",
 ]);
 
 const isRecord = (v: unknown): v is Record<string, unknown> =>
@@ -637,6 +688,12 @@ export function parseHostMessage(raw: unknown): (HostMessage & WithRequestId) | 
     case "error":
       if (!isString(data.code) || !isString(data.message)) return null;
       return { ...(data as unknown as HostErrorMessage), requestId };
+    case "workspace.ready":
+      if (!isRecord(data.workspace) || !isString(data.workspace.id) || !isString(data.workspace.name) || !isString(data.workspace.displayPath) || typeof data.workspace.generation !== "number") return null;
+      return { ...(data as unknown as WorkspaceReadyMessage), requestId };
+    case "workspace.error":
+      if (!isString(data.code) || !isString(data.message) || typeof data.generation !== "number") return null;
+      return { ...(data as unknown as WorkspaceErrorMessage), requestId };
     case "workspace.readDir.result":
       if (!isString(data.requestId) || !isString(data.path) || !Array.isArray(data.entries)) return null;
       return { ...(data as Record<string, unknown>), requestId } as never;
@@ -649,6 +706,9 @@ export function parseHostMessage(raw: unknown): (HostMessage & WithRequestId) | 
     case "workspace.fileChanged":
       if (!isString(data.path) || !isString(data.changeType)) return null;
       return { ...(data as Record<string, unknown>), requestId } as never;
+    case "workspace.watch.result":
+      if (typeof data.enabled !== "boolean" || typeof data.generation !== "number") return null;
+      return { ...(data as Record<string, unknown>), requestId } as never;
     case "integrations.snapshot":
       if (!isRecord(data.snapshot)) return null;
       return { ...(data as unknown as IntegrationsSnapshotMessage), requestId };
@@ -660,6 +720,20 @@ export function parseHostMessage(raw: unknown): (HostMessage & WithRequestId) | 
     case "schedule.create.result":
       if (!isString(data.requestId)) return null;
       return { ...(data as Record<string, unknown>), requestId } as never;
+    case "workspace.readFile.result":
+      if (!isString(data.requestId) || !isString(data.path) || !isString(data.content) || !isString(data.language) || typeof data.size !== "number") return null;
+      return { ...(data as Record<string, unknown>), requestId } as never;
+    case "workspace.writeFile.result":
+      if (!isString(data.requestId) || !isString(data.path) || typeof data.success !== "boolean") return null;
+      return { ...(data as Record<string, unknown>), requestId } as never;
+    case "workspace.stat.result":
+      if (!isString(data.requestId) || !isString(data.path) || !isRecord(data.stat)) return null;
+      return { ...(data as Record<string, unknown>), requestId } as never;
+    case "command.result":
+      if (!isString(data.command) || typeof data.success !== "boolean") return null;
+      if (data.output !== undefined && !isString(data.output)) return null;
+      if (data.error !== undefined && !isString(data.error)) return null;
+      return { ...(data as unknown as CommandResultFrame), requestId };
     case "subagent.event":
       if (!isRecord(data.event)) return null;
       return { ...(data as unknown as SubagentEventMessage), requestId };
@@ -752,6 +826,7 @@ export type HostEventHandler = (msg: HostMessage) => void;
 interface PendingRequest {
   resolve: (value?: any) => void;
   reject: (err: Error) => void;
+  timeout: ReturnType<typeof setTimeout>;
 }
 
 export class HostClient {
@@ -763,12 +838,14 @@ export class HostClient {
   private readonly subscribers = new Set<HostEventHandler>();
   private openPromise: { resolve: () => void; reject: (e: Error) => void } | null = null;
   private closed = false;
+  private readonly requestTimeoutMs: number;
 
   constructor(opts: HostClientOptions) {
     this.url = `ws://127.0.0.1:${opts.port}/agent?token=${encodeURIComponent(opts.token)}`;
     this.makeSocket =
       opts.WebSocketImpl ??
       ((url: string) => new WebSocket(url) as unknown as WebSocketLike);
+    this.requestTimeoutMs = opts.requestTimeoutMs ?? 15_000;
   }
 
   /** Open the socket. Resolves on `open`; rejects HostAuthError on a 4401 close. */
@@ -821,11 +898,33 @@ export class HostClient {
   }
 
   readDir(path = ""): Promise<DirEntry[]> { return this.requestResult({ type: "workspace.readDir", path }).then((m) => (m as { entries: DirEntry[] }).entries); }
+  readFile(path: string): Promise<{ path: string; content: string; language: string; size: number }> {
+    return this.requestResult({ type: "workspace.readFile", path }).then((m) => m as { path: string; content: string; language: string; size: number });
+  }
+  stat(path: string): Promise<FileStat> {
+    return this.requestResult({ type: "workspace.stat", path }).then((m) => (m as { stat: FileStat }).stat);
+  }
   search(query: string, options?: { caseSensitive?: boolean; includes?: string[]; maxResults?: number }): Promise<SearchMatch[]> {
     return this.requestResult({ type: "workspace.search", query, options }).then((m) => (m as { matches: SearchMatch[] }).matches);
   }
   gitStatus(): Promise<GitFileStatus[]> { return this.requestResult({ type: "workspace.gitStatus" }).then((m) => (m as { files: GitFileStatus[] }).files); }
-  writeFile(path: string, content: string): Promise<void> { return this.request({ type: "workspace.writeFile", path, content } as never); }
+  writeFile(path: string, content: string, options?: { expectedSha256?: string; expectedModified?: string }): Promise<WorkspaceWriteResult> {
+    return this.requestResult({ type: "workspace.writeFile", path, content, ...options }).then((m) => {
+      if (!(m as { success?: boolean }).success) throw new HostConnectionError(`host rejected write for ${path}`);
+      return m as WorkspaceWriteResult;
+    });
+  }
+  watch(): Promise<void> { return this.sendOneWay({ type: "workspace.watch", enabled: true }); }
+  unwatch(): Promise<void> { return this.sendOneWay({ type: "workspace.watch", enabled: false }); }
+  /** Open a path supplied by an explicit local-user action. The host validates it. */
+  openWorkspace(path: string, generation = 1): Promise<HostWorkspaceDescriptor> {
+    return this.requestResult({ type: "workspace.open", path, generation }).then((m) => (m as WorkspaceReadyMessage).workspace);
+  }
+
+  /** Backwards-compatible alias for the earlier picker seam. */
+  selectWorkspace(path: string): Promise<HostWorkspaceDescriptor> {
+    return this.openWorkspace(path);
+  }
   toggleIntegration(kind: "rules" | "skill" | "mcp", id: string, enabled: boolean): Promise<void> {
     return this.request({ type: "integration.toggle", kind, id, enabled });
   }
@@ -859,6 +958,23 @@ export class HostClient {
       type: "subagent.define",
       params,
     }).then((m) => (m as { result?: DefineSubagentResult }).result ?? (m as unknown as DefineSubagentResult));
+  }
+
+  /** Execute a typed slash-command frame through the authenticated host. */
+  executeCommand(input: ExecuteCommandInput): Promise<CommandResultFrame> {
+    const args = input.args ?? [];
+    return this.requestResult({
+      type: "command.execute",
+      command: input.command,
+      args,
+      rawText: input.rawText ?? [input.command, ...args].join(" "),
+      ...(input.parsed ? { parsed: input.parsed } : {}),
+    }).then((message) => message as CommandResultFrame);
+  }
+
+  /** Alias retained for command-dispatch callers. */
+  dispatchCommand(input: ExecuteCommandInput): Promise<CommandResultFrame> {
+    return this.executeCommand(input);
   }
 
   manageTask(params: ManageTaskParams): Promise<ManageTaskResult> {
@@ -949,7 +1065,7 @@ export class HostClient {
     const requestId = `req-${++this.seq}`;
     const frame: HostClientRequest = { ...msg, requestId };
     return new Promise<void>((resolve, reject) => {
-      this.pending.set(requestId, { resolve, reject });
+      this.pending.set(requestId, this.pendingRequest(requestId, resolve, reject));
       this.ws!.send(JSON.stringify(frame));
     });
   }
@@ -958,9 +1074,22 @@ export class HostClient {
     if (!this.ws || this.ws.readyState !== WS_OPEN) return Promise.reject(new HostConnectionError("not connected to agent host"));
     const requestId = `req-${++this.seq}`;
     return new Promise((resolve, reject) => {
-      this.pending.set(requestId, { resolve, reject });
+      this.pending.set(requestId, this.pendingRequest(requestId, resolve, reject));
       this.ws!.send(JSON.stringify({ ...msg, requestId }));
     });
+  }
+
+  private sendOneWay(msg: Record<string, unknown>): Promise<void> {
+    if (!this.ws || this.ws.readyState !== WS_OPEN) return Promise.reject(new HostConnectionError("not connected to agent host"));
+    this.ws.send(JSON.stringify(msg));
+    return Promise.resolve();
+  }
+
+  private pendingRequest(requestId: string, resolve: (value?: any) => void, reject: (error: Error) => void): PendingRequest {
+    const timeout = setTimeout(() => {
+      if (this.pending.delete(requestId)) reject(new HostConnectionError(`agent host request timed out (${requestId})`));
+    }, this.requestTimeoutMs);
+    return { resolve, reject, timeout };
   }
 
   private handleFrame(raw: unknown): void {
@@ -972,7 +1101,8 @@ export class HostClient {
       const p = this.pending.get(msg.requestId);
       if (p) {
         this.pending.delete(msg.requestId);
-        if (msg.type === "error") {
+        clearTimeout(p.timeout);
+        if (msg.type === "error" || msg.type === "workspace.error") {
           p.reject(new HostConnectionError(`${msg.code}: ${msg.message}`));
         } else {
           p.resolve(msg);
@@ -1004,7 +1134,10 @@ export class HostClient {
   }
 
   private failPending(err: Error): void {
-    for (const p of this.pending.values()) p.reject(err);
+    for (const p of this.pending.values()) {
+      clearTimeout(p.timeout);
+      p.reject(err);
+    }
     this.pending.clear();
   }
 }

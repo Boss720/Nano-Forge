@@ -7,8 +7,14 @@
  * opts in to a reviewed write flow.
  */
 import path from "node:path";
+import type { WorkspaceDescriptor, WorkspaceErrorCode } from "@protocol/workspace";
 import type { ExecutionPlan } from "@protocol/plan";
 import type { ModelProfile } from "@protocol/routing";
+import {
+  commandExecuteFrameSchema,
+  type CommandExecuteFrame,
+  type CommandResultFrame,
+} from "@protocol/commands";
 import {
   safeParseTerminalClientMessage,
   type TerminalServerMessage,
@@ -36,13 +42,15 @@ import {
   handleWriteFile,
 } from "./workspace/filesystem";
 import { createWorkspaceWatcher } from "./workspace/watcher.js";
+import { assertWorkspaceGeneration, validateWorkspaceRoot, WorkspaceRootError } from "./workspace/runtime.js";
+import { WorkspaceFileError } from "./workspace/filesystem.js";
 import { SubagentSupervisor } from "./agents/supervisor.js";
 import { DaemonManager } from "./daemons/manager.js";
 import { SharedMemoryEngine } from "./agents/memory.js";
-import { VoiceSessionManager } from "./voice/voiceManager.js";
 
 export interface AgentSessionOptions {
   workspaceRoot?: string;
+  workspaceDescriptor?: WorkspaceDescriptor;
   /**
    * Disabled by default. Direct browser-originated writes need a separate
    * diff/approval workflow; enabling this is only for trusted embeddings.
@@ -63,11 +71,9 @@ export interface AgentSessionOptions {
   daemonManager?: DaemonManager;
   /** Shared memory engine instance. */
   memoryEngine?: SharedMemoryEngine;
-  /** Voice session manager instance. */
-  voiceManager?: VoiceSessionManager;
 }
 
-type Send = (message: HostMessage | TerminalServerMessage) => void;
+type Send = (message: HostMessage | TerminalServerMessage | CommandResultFrame) => void;
 
 class SocketApprovalGate implements ApprovalGate {
   private readonly pending = new Map<string, (outcome: ApprovalOutcome) => void>();
@@ -127,6 +133,183 @@ const stateForEvent = (event: RunEvent): "done" | "error" | "cancelled" | undefi
   }
 };
 
+type CommandSupervisor = Pick<SubagentSupervisor, "spawnSubagent" | "manageSubagents" | "sendMessage">;
+
+const commandResult = (
+  frame: CommandExecuteFrame,
+  result: Omit<CommandResultFrame, "type" | "command" | "requestId">,
+): CommandResultFrame => ({
+  type: "command.result",
+  command: frame.command,
+  requestId: frame.requestId,
+  ...result,
+});
+
+const flagString = (flags: Record<string, string | number | boolean>, ...names: string[]): string | undefined => {
+  for (const name of names) {
+    const value = flags[name];
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return undefined;
+};
+
+/**
+ * Dispatches the swarm slash-command subset through the supervisor API. This
+ * function is exported and dependency-injected so transport tests can verify
+ * command semantics without opening a socket or constructing a supervisor.
+ */
+export async function dispatchCommand(
+  frame: CommandExecuteFrame,
+  supervisor: CommandSupervisor,
+): Promise<CommandResultFrame> {
+  const rawCommand = frame.command.trim().toLowerCase();
+  const flags = frame.parsed?.flags ?? {};
+  const positional = [...(frame.parsed?.positional ?? frame.args ?? [])];
+  const aliasActions: Record<string, string> = {
+    "/agent-list": "list",
+    "/agent-tree": "tree",
+    "/agent-inspect": "inspect",
+    "/agent-message": "message",
+    "/agent-pause": "pause",
+    "/agent-resume": "resume",
+    "/agent-stop": "stop",
+    "/agent-focus": "focus",
+  };
+  const command = rawCommand === "/sw" || rawCommand === "/agents" || rawCommand === "/agent" || rawCommand === "/a" || aliasActions[rawCommand]
+    ? "/swarm"
+    : rawCommand;
+  if (aliasActions[rawCommand]) positional.unshift(aliasActions[rawCommand]);
+  else if (rawCommand === "/agents" && positional.length === 0) positional.unshift("list");
+  const embeddedAction = command.startsWith("/swarm.") ? command.slice("/swarm.".length) : undefined;
+  const action = (embeddedAction ?? positional[0] ?? "").toLowerCase();
+
+  if (command !== "/swarm" && !embeddedAction) {
+    return commandResult(frame, {
+      success: false,
+      error: `Unsupported command: ${frame.command}`,
+      data: { code: "unsupported_command" },
+    });
+  }
+
+  try {
+    switch (action) {
+      case "run": {
+        const archetype = flagString(flags, "archetype", "type") ?? "custom";
+        const prompt = flagString(flags, "prompt") ?? positional.slice(1).join(" ");
+        if (!prompt) {
+          return commandResult(frame, {
+            success: false,
+            error: "swarm run requires a prompt",
+            data: { code: "invalid_command" },
+          });
+        }
+        const roles = flagString(flags, "roles")?.split(",").map((role) => role.trim()).filter(Boolean);
+        const timeoutValue = flags.timeoutSeconds ?? flags.timeout;
+        const budgetValue = flags.budgetTokens ?? flags.budget;
+        const result = await supervisor.spawnSubagent(
+          {
+            archetype,
+            prompt,
+            ...(flagString(flags, "name") ? { name: flagString(flags, "name") } : {}),
+            ...(roles?.length ? { roles } : {}),
+            ...(flagString(flags, "workspaceIsolation", "isolation")
+              ? { workspaceIsolation: flagString(flags, "workspaceIsolation", "isolation") }
+              : {}),
+            ...(typeof timeoutValue === "number" ? { timeoutSeconds: timeoutValue } : {}),
+            ...(typeof budgetValue === "number" ? { budgetTokens: budgetValue } : {}),
+          } as Parameters<SubagentSupervisor["spawnSubagent"]>[0],
+          flagString(flags, "parentId", "parent"),
+        );
+        return commandResult(frame, {
+          success: true,
+          output: `Started subagent ${result.name} (${result.subagentId})`,
+          data: result as unknown as CommandResultFrame["data"],
+        });
+      }
+      case "list":
+      case "tree": {
+        const result = await supervisor.manageSubagents({ action: "list" }, flagString(flags, "callerId", "caller"));
+        return commandResult(frame, {
+          success: result.success,
+          ...(result.message ? { output: result.message } : {}),
+          ...(result.message && !result.success ? { error: result.message } : {}),
+          data: result as unknown as CommandResultFrame["data"],
+        });
+      }
+      case "inspect": {
+        const subagentId = flagString(flags, "subagentId", "agent", "id") ?? positional[1];
+        if (!subagentId) {
+          return commandResult(frame, { success: false, error: "swarm inspect requires a subagent id", data: { code: "invalid_command" } });
+        }
+        const result = await supervisor.manageSubagents({
+          action: "inspect",
+          subagentId,
+          ...(flagString(flags, "file") ? { inspectFile: flagString(flags, "file") } : {}),
+        } as Parameters<SubagentSupervisor["manageSubagents"]>[0]);
+        return commandResult(frame, {
+          success: result.success,
+          ...(result.inspectedContent ? { output: result.inspectedContent } : {}),
+          ...(result.message ? { error: result.message } : {}),
+          data: result as unknown as CommandResultFrame["data"],
+        });
+      }
+      case "message": {
+        if (!supervisor.sendMessage) {
+          return commandResult(frame, { success: false, error: "Host does not support swarm messages", data: { code: "unsupported_capability" } });
+        }
+        const recipientId = flagString(flags, "recipientId", "recipient", "agent") ?? positional[1];
+        const body = flagString(flags, "body") ?? positional.slice(2).join(" ");
+        if (!recipientId || !body) {
+          return commandResult(frame, { success: false, error: "swarm message requires a recipient and body", data: { code: "invalid_command" } });
+        }
+        const result = await supervisor.sendMessage({
+          recipientId,
+          subject: flagString(flags, "subject") ?? "Direct Message",
+          body,
+          priority: flagString(flags, "priority") ?? "normal",
+          referencedArtifacts: [],
+        } as Parameters<SubagentSupervisor["sendMessage"]>[0], flagString(flags, "senderId", "sender") ?? "root");
+        return commandResult(frame, { success: true, output: `Message ${result.messageId} delivered`, data: result as unknown as CommandResultFrame["data"] });
+      }
+      case "pause":
+      case "resume":
+      case "stop": {
+        const subagentId = flagString(flags, "subagentId", "agent", "id") ?? positional[1];
+        if (!subagentId) {
+          return commandResult(frame, { success: false, error: `swarm ${action} requires a subagent id`, data: { code: "invalid_command" } });
+        }
+        const result = await supervisor.manageSubagents({
+          action: action === "stop" ? "kill" : action,
+          subagentId,
+          ...(action === "stop" ? { recursive: flags.recursive !== false } : {}),
+        });
+        return commandResult(frame, {
+          success: result.success,
+          ...(result.success ? { output: result.message } : { error: result.message ?? `swarm ${action} failed` }),
+          data: result as unknown as CommandResultFrame["data"],
+        });
+      }
+      default:
+        return commandResult(frame, { success: false, error: `Unsupported swarm action: ${action || "(missing)"}`, data: { code: "unsupported_action" } });
+    }
+  } catch (error) {
+    return commandResult(frame, {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+      data: { code: "command_dispatch_error" },
+    });
+  }
+}
+
+const parseCommandFrame = (raw: unknown): CommandExecuteFrame | null => {
+  let parsed: unknown = raw;
+  if (typeof raw === "string" || raw instanceof Buffer || Array.isArray(raw)) {
+    try { parsed = JSON.parse(String(raw)); } catch { return null; }
+  }
+  const result = commandExecuteFrameSchema.safeParse(parsed);
+  return result.success ? result.data : null;
+};
+
 /** Attach a fully composed coordinator + workspace RPC session to one socket. */
 export function attachAgentSession(
   socket: WebSocket,
@@ -134,6 +317,11 @@ export function attachAgentSession(
   options: AgentSessionOptions = {},
 ): void {
   const workspaceRoot = path.resolve(options.workspaceRoot ?? process.cwd());
+  const workspace = options.workspaceDescriptor;
+  if (!workspace) {
+    throw new Error("Agent session requires a validated workspace descriptor");
+  }
+  const generation = workspace.generation;
   const now = () => new Date().toISOString();
   const send: Send = (message) => {
     const payload = JSON.stringify(message);
@@ -182,15 +370,9 @@ export function attachAgentSession(
       scheduler: daemonManager.scheduler,
     });
   const memoryEngine = options.memoryEngine ?? subagentSupervisor.memory;
-  const voiceManager =
-    options.voiceManager ??
-    new VoiceSessionManager({
-      workspaceRoot,
-      coordinator,
-      providerRegistry: registry,
-      profiles,
-      send: (msg) => send(msg),
-    });
+
+  const onTerminalMessage = (message: TerminalServerMessage) => send(message);
+  ptyManager.on("message", onTerminalMessage);
 
   subagentSupervisor.subscribe((event) => {
     send({ type: "subagent.event", event, at: now() });
@@ -216,59 +398,114 @@ export function attachAgentSession(
       if (state) {
         send({ type: "run.state", runId: event.runId, state, at: event.at });
       }
-      send({ type: "run.event", runId: event.runId, event: event.type, data: event, at: event.at });
+      send({ type: "run.event", runId: event.runId, event: event.type, data: event as any, at: event.at });
     });
   });
-  send({ type: "host.ready", version: "0.1.0", hostId: context.hostId, at: now() });
+  send({ type: "host.ready", version: "0.1.0", hostId: context.hostId, workspace, at: now() });
 
-  const workspaceError = (error: unknown): void => {
+  const workspaceError = (
+    error: unknown,
+    requestId?: string,
+    requestedWorkspace?: WorkspaceDescriptor,
+  ): void => {
+    const nodeCode = (error as NodeJS.ErrnoException | undefined)?.code;
+    let code: WorkspaceErrorCode = "io_error";
+    if (error instanceof WorkspaceRootError || error instanceof WorkspaceFileError) code = error.code;
+    else if (nodeCode === "ENOENT") code = "not_found";
+    else if (nodeCode === "EACCES" || nodeCode === "EPERM") code = "permission_denied";
     send({
-      type: "error",
-      code: "workspace_error",
+      type: "workspace.error",
+      requestId,
+      code,
       message: error instanceof Error ? error.message : String(error),
+      generation,
+      recoverable: code !== "permission_denied" && code !== "root_too_broad",
+      requestedWorkspace,
       at: now(),
     });
   };
   const dispatchWorkspace = async (message: ClientMessage): Promise<void> => {
     try {
+      if (message.type === "workspace.describe") {
+        send({ type: "workspace.ready", requestId: message.requestId, workspace, at: now() });
+        return;
+      }
+      if (message.type === "workspace.open") {
+        assertWorkspaceGeneration(message.generation, generation);
+        const requested = await validateWorkspaceRoot(message.path, generation + 1);
+        const sameRoot = path.resolve(requested.canonicalRoot).toLowerCase() === path.resolve(workspaceRoot).toLowerCase();
+        if (sameRoot) {
+          send({ type: "workspace.ready", requestId: message.requestId, workspace, at: now() });
+          return;
+        }
+        if (Array.from(runs.values()).some((run) => run.status() === "running" || run.status() === "paused")) {
+          throw new WorkspaceRootError("active_work", "Cannot switch workspaces while a run is active");
+        }
+        workspaceError(
+          new WorkspaceRootError("reconnect_required", "Validated workspace requires a host reconnect so every privileged subsystem changes root atomically"),
+          message.requestId,
+          requested.descriptor,
+        );
+        return;
+      }
+      if ("generation" in message) assertWorkspaceGeneration(message.generation, generation);
       switch (message.type) {
         case "workspace.readDir":
-          send({ type: "workspace.readDir.result", requestId: message.requestId, path: message.path, entries: await handleReadDir(workspaceRoot, message.path) });
+          send({ type: "workspace.readDir.result", requestId: message.requestId, path: message.path, entries: await handleReadDir(workspaceRoot, message.path), generation });
           return;
         case "workspace.readFile": {
           const result = await handleReadFile(workspaceRoot, message.path);
-          send({ type: "workspace.readFile.result", requestId: message.requestId, path: message.path, ...result });
+          send({ type: "workspace.readFile.result", requestId: message.requestId, path: message.path, ...result, generation });
           return;
         }
         case "workspace.stat":
-          send({ type: "workspace.stat.result", requestId: message.requestId, path: message.path, stat: await handleStat(workspaceRoot, message.path) });
+          send({ type: "workspace.stat.result", requestId: message.requestId, path: message.path, stat: await handleStat(workspaceRoot, message.path), generation });
           return;
         case "workspace.search":
-          send({ type: "workspace.search.result", requestId: message.requestId, matches: await handleSearch(workspaceRoot, message.query, message.options) });
+          send({ type: "workspace.search.result", requestId: message.requestId, matches: await handleSearch(workspaceRoot, message.query, message.options), generation });
           return;
         case "workspace.gitStatus":
-          send({ type: "workspace.gitStatus.result", requestId: message.requestId, files: await handleGitStatus(workspaceRoot) });
+          send({ type: "workspace.gitStatus.result", requestId: message.requestId, files: await handleGitStatus(workspaceRoot), generation });
           return;
         case "workspace.writeFile":
-          if (!options.allowWorkspaceWrites) throw new Error("workspace writes require an approved write workflow");
-          await handleWriteFile(workspaceRoot, message.path, message.content);
-          send({ type: "workspace.writeFile.result", requestId: message.requestId, path: message.path, success: true });
+          if (!options.allowWorkspaceWrites) throw new WorkspaceRootError("write_not_approved", "workspace writes require an approved write workflow");
+          {
+            const result = await handleWriteFile(workspaceRoot, message.path, message.content, {
+              expectedSha256: message.expectedSha256,
+              expectedModified: message.expectedModified,
+            });
+            send({ type: "workspace.writeFile.result", requestId: message.requestId, path: message.path, generation, ...result });
+          }
           return;
         case "workspace.watch":
           if (message.enabled && !watcher) {
-            watcher = createWorkspaceWatcher({ workspaceRoot }, (event) => send({ type: "workspace.fileChanged", ...event }));
+            watcher = createWorkspaceWatcher({ workspaceRoot }, (event) => send({ type: "workspace.fileChanged", ...event, generation }));
           } else if (!message.enabled && watcher) {
             await watcher.close();
             watcher = undefined;
           }
+          send({ type: "workspace.watch.result", requestId: message.requestId, enabled: Boolean(message.enabled && watcher), generation });
+          return;
+        case "workspace.unwatch":
+          if (watcher) {
+            await watcher.close();
+            watcher = undefined;
+          }
+          send({ type: "workspace.watch.result", requestId: message.requestId, enabled: false, generation });
           return;
       }
     } catch (error) {
-      workspaceError(error);
+      workspaceError(error, "requestId" in message ? message.requestId : undefined);
     }
   };
 
   socket.on("message", async (data: unknown) => {
+    const commandMessage = parseCommandFrame(data);
+    if (commandMessage) {
+      const result = await dispatchCommand(commandMessage, subagentSupervisor);
+      send(result);
+      return;
+    }
     const decoded = decodeClientMessage(data);
     if (!decoded.ok) {
       if (typeof data === "string" || data instanceof Buffer || Array.isArray(data)) {
@@ -318,10 +555,6 @@ export function attachAgentSession(
     const message = decoded.message;
     if (message.type.startsWith("workspace.")) {
       void dispatchWorkspace(message);
-      return;
-    }
-    if (message.type.startsWith("voice.")) {
-      void voiceManager.handleClientMessage(message);
       return;
     }
     switch (message.type) {
@@ -457,9 +690,9 @@ export function attachAgentSession(
     approvalGate.close();
     void watcher?.close();
     auditStore.close();
+    ptyManager.off("message", onTerminalMessage);
     ptyManager.dispose();
     void daemonManager.dispose();
-    voiceManager.dispose();
   });
 }
 

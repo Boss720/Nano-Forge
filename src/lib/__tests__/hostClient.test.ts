@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   HostAuthError,
   HostClient,
+  HostConnectionError,
   parseHostMessage,
   type HostMessage,
   type WebSocketLike,
@@ -103,6 +104,86 @@ describe("HostClient connection", () => {
 });
 
 describe("HostClient requests", () => {
+  it("correlates workspace read results and host errors by request id", async () => {
+    const { client } = makeClient();
+    const ws = await connect(client);
+    const read = client.readFile("src/main.ts");
+    const frame = ws.sentFrames()[0];
+    ws.receive({ type: "workspace.readFile.result", requestId: frame.requestId, path: "src/main.ts", content: "export {}", language: "typescript", size: 9 });
+    await expect(read).resolves.toMatchObject({ path: "src/main.ts", language: "typescript" });
+
+    const stat = client.stat("missing.ts");
+    const statFrame = ws.sentFrames()[1];
+    ws.receive({ type: "error", requestId: statFrame.requestId, code: "not_found", message: "missing.ts" });
+    await expect(stat).rejects.toThrow(/not_found: missing.ts/);
+  });
+
+  it("rejects an unanswered workspace request at the configured timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const { client } = makeClient();
+      const ws = await connect(client);
+      const pending = client.readDir();
+      vi.advanceTimersByTime(15_000);
+      await expect(pending).rejects.toThrow(/timed out/);
+      expect(ws.sentFrames()[0]).toMatchObject({ type: "workspace.readDir" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("correlates command results deterministically and preserves structured failures", async () => {
+    const { client } = makeClient();
+    const ws = await connect(client);
+    const first = client.executeCommand({
+      command: "/swarm",
+      args: ["list"],
+      rawText: "/swarm list",
+    });
+    const second = client.dispatchCommand({
+      command: "/swarm",
+      args: ["unknown"],
+      rawText: "/swarm unknown",
+    });
+    const frames = ws.sentFrames();
+    expect(frames).toHaveLength(2);
+    expect(frames[0]).toMatchObject({ type: "command.execute", command: "/swarm" });
+    expect(frames[0].requestId).not.toBe(frames[1].requestId);
+
+    ws.receive({
+      type: "command.result",
+      requestId: frames[1].requestId,
+      command: "/swarm",
+      success: false,
+      error: "unsupported swarm action",
+      data: { code: "unsupported_action" },
+    });
+    ws.receive({
+      type: "command.result",
+      requestId: frames[0].requestId,
+      command: "/swarm",
+      success: true,
+      output: "0 subagents",
+      data: { action: "list", subagents: [] },
+    });
+
+    await expect(first).resolves.toMatchObject({ success: true, output: "0 subagents" });
+    await expect(second).resolves.toMatchObject({
+      success: false,
+      error: "unsupported swarm action",
+      data: { code: "unsupported_action" },
+    });
+  });
+
+  it("rejects a pending command when the host disconnects", async () => {
+    const { client } = makeClient();
+    const ws = await connect(client);
+    const pending = client.executeCommand({ command: "/swarm", args: ["list"], rawText: "/swarm list" });
+    ws.close(1006, "host crashed");
+    await expect(pending).rejects.toBeInstanceOf(HostConnectionError);
+    await expect(pending).rejects.toThrow(/host crashed/);
+  });
+
   it("plan.submit sends the full plan and resolves on the ack", async () => {
     const { client } = makeClient();
     const ws = await connect(client);
@@ -260,6 +341,17 @@ describe("parseHostMessage", () => {
     expect(parseHostMessage(JSON.stringify({ type: "tool.output", runId: "r", toolId: "t", chunk: "x" }))).toMatchObject({ type: "tool.output" });
     expect(parseHostMessage(JSON.stringify({ type: "run.event", runId: "r", event: "done" }))).toMatchObject({ type: "run.event" });
     expect(parseHostMessage(JSON.stringify({ type: "error", code: "boom", message: "m" }))).toMatchObject({ type: "error" });
+    expect(
+      parseHostMessage(
+        JSON.stringify({
+          type: "command.result",
+          requestId: "req-1",
+          command: "/swarm",
+          success: true,
+          data: { action: "list", subagents: [] },
+        }),
+      ),
+    ).toMatchObject({ type: "command.result", requestId: "req-1" });
   });
 
   it("rejects non-JSON, arrays, unknown types, and bad field types", () => {

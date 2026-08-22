@@ -32,6 +32,12 @@ export const subagentStateSchema = z.enum([
   "waiting_for_message",
   "canceling",
   "errored",
+  "spawning",
+  "executing",
+  "blocked",
+  "completed",
+  "failed",
+  "terminated",
 ]);
 export type SubagentState = z.infer<typeof subagentStateSchema>;
 
@@ -198,7 +204,7 @@ export const subagentLifecycleEventSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("subagent.state_changed"),
-    subagentId: z.string().uuid(),
+    subagentId: z.string().min(1).max(128),
     previousState: subagentStateSchema,
     newState: subagentStateSchema,
     reason: z.string().optional(),
@@ -211,14 +217,14 @@ export const subagentLifecycleEventSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("subagent.heartbeat"),
-    subagentId: z.string().uuid(),
+    subagentId: z.string().min(1).max(128),
     lastVisited: z.string().datetime(),
     progressSummary: z.string().optional(),
     at: z.string().datetime(),
   }),
   z.object({
     type: z.literal("subagent.completed"),
-    subagentId: z.string().uuid(),
+    subagentId: z.string().min(1).max(128),
     tokensUsed: z.number().int().nonnegative(),
     turnCount: z.number().int().nonnegative(),
     handoffArtifact: z.string().optional(),
@@ -226,21 +232,21 @@ export const subagentLifecycleEventSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("subagent.errored"),
-    subagentId: z.string().uuid(),
+    subagentId: z.string().min(1).max(128),
     error: z.string(),
     code: z.string().optional(),
     at: z.string().datetime(),
   }),
   z.object({
     type: z.literal("subagent.tree_updated"),
-    rootId: z.string().uuid(),
+    rootId: z.string().min(1).max(128),
     activeCount: z.number().int().nonnegative(),
     tree: z.array(subagentInfoSchema),
     at: z.string().datetime(),
   }),
   z.object({
     type: z.literal("subagent.telemetry_updated"),
-    subagentId: z.string().uuid(),
+    subagentId: z.string().min(1).max(128),
     telemetry: subagentTelemetrySchema,
     at: z.string().datetime(),
   }),
@@ -380,6 +386,11 @@ const VALID_STATE_TRANSITIONS: Readonly<Record<SubagentState, ReadonlySet<Subage
     "waiting_for_message",
     "canceling",
     "errored",
+    "executing",
+    "blocked",
+    "completed",
+    "failed",
+    "terminated",
   ]),
   idle: new Set([
     "running",
@@ -388,12 +399,23 @@ const VALID_STATE_TRANSITIONS: Readonly<Record<SubagentState, ReadonlySet<Subage
     "waiting_for_message",
     "canceling",
     "errored",
+    "executing",
+    "blocked",
+    "completed",
+    "failed",
+    "terminated",
   ]),
-  waiting_for_input: new Set(["running", "idle", "canceling", "errored"]),
-  waiting_for_dependents: new Set(["running", "idle", "canceling", "errored"]),
-  waiting_for_message: new Set(["running", "idle", "canceling", "errored"]),
-  canceling: new Set(["errored", "idle"]),
+  waiting_for_input: new Set(["running", "idle", "canceling", "errored", "executing", "blocked", "completed", "failed", "terminated"]),
+  waiting_for_dependents: new Set(["running", "idle", "canceling", "errored", "executing", "blocked", "completed", "failed", "terminated"]),
+  waiting_for_message: new Set(["running", "idle", "canceling", "errored", "executing", "blocked", "completed", "failed", "terminated"]),
+  canceling: new Set(["errored", "idle", "failed", "terminated"]),
   errored: new Set([]), // terminal state
+  spawning: new Set(["running", "idle", "executing", "canceling", "errored", "failed", "terminated"]),
+  executing: new Set(["running", "idle", "waiting_for_input", "waiting_for_dependents", "waiting_for_message", "blocked", "completed", "failed", "canceling", "errored", "terminated"]),
+  blocked: new Set(["running", "idle", "executing", "canceling", "errored", "failed", "terminated"]),
+  completed: new Set(["idle", "running"]),
+  failed: new Set([]), // terminal state
+  terminated: new Set([]), // terminal state
 };
 
 /**

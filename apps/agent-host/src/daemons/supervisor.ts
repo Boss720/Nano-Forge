@@ -8,9 +8,10 @@
  * - Lifecycle event dispatching (spawned, output, completed, killed)
  */
 import { EventEmitter } from "node:events";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
+import { resolveWithinWorkspace } from "../policy/policy.js";
 import {
   RING_BUFFER_DEFAULT_MAX_BYTES,
   TASK_ERROR_CODES,
@@ -26,6 +27,30 @@ import type {
   SupervisedTaskRecord,
   TaskEventListener,
 } from "./types.js";
+
+export const MAX_CONCURRENT_DAEMONS = 16;
+
+const activeDaemonPids = new Set<number>();
+
+if (typeof process !== "undefined" && typeof process.on === "function") {
+  process.on("exit", () => {
+    for (const pid of activeDaemonPids) {
+      try {
+        if (process.platform === "win32") {
+          execSync(`taskkill /pid ${pid} /T /F`, { stdio: "ignore" });
+        } else {
+          try {
+            process.kill(-pid, "SIGKILL");
+          } catch {
+            process.kill(pid, "SIGKILL");
+          }
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+  });
+}
 
 /**
  * 2MB Circular Ring Buffer for streaming process outputs without unbounded memory growth.
@@ -98,20 +123,32 @@ export class CircularRingBuffer implements CircularRingBufferInterface {
  * Supervised process runner for daemon processes.
  */
 export class DaemonSupervisor extends EventEmitter {
+  readonly workspaceRoot?: string;
   private readonly tasks = new Map<TaskId, SupervisedTaskRecord>();
 
-  constructor() {
+  constructor(workspaceRoot?: string) {
     super();
+    this.workspaceRoot = workspaceRoot ? path.resolve(workspaceRoot) : undefined;
   }
 
   /**
    * Spawns a new background process or daemon.
    */
   async spawnTask(options: SpawnTaskOptions): Promise<TaskSummary> {
+    const runningCount = Array.from(this.tasks.values()).filter((t) => t.status === "running").length;
+    if (runningCount >= MAX_CONCURRENT_DAEMONS) {
+      throw new Error(`${TASK_ERROR_CODES.ERR_TASK_MAX_LIMIT_EXCEEDED}: Maximum concurrent task limit of ${MAX_CONCURRENT_DAEMONS} reached`);
+    }
+
     const taskId = options.taskId ?? randomUUID();
     const isDaemon = options.isDaemon ?? false;
     const args = options.args ?? [];
-    const cwd = path.resolve(options.cwd);
+    const cwd = this.workspaceRoot
+      ? resolveWithinWorkspace(this.workspaceRoot, options.cwd)
+      : path.resolve(options.cwd);
+    if (!cwd) {
+      throw new Error(`${TASK_ERROR_CODES.ERR_TASK_SPAWN_FAILED}: cwd escapes the workspace root`);
+    }
     const ringBuffer = new CircularRingBuffer(options.maxBufferBytes ?? RING_BUFFER_DEFAULT_MAX_BYTES);
     const startedAt = new Date().toISOString();
     const startTimeMs = Date.now();
@@ -152,6 +189,11 @@ export class DaemonSupervisor extends EventEmitter {
         return reject(new Error(`${TASK_ERROR_CODES.ERR_TASK_SPAWN_FAILED}: Process spawned without a valid PID`));
       }
 
+      activeDaemonPids.add(pid);
+
+      // Prevent EPIPE unhandled error events on child stdin
+      child.stdin?.on("error", () => {});
+
       const record: SupervisedTaskRecord = {
         taskId,
         pid,
@@ -165,6 +207,28 @@ export class DaemonSupervisor extends EventEmitter {
         childProcess: child,
         ringBuffer,
       };
+
+      if (options.timeoutMs && options.timeoutMs > 0) {
+        const timeoutTimer = setTimeout(async () => {
+          if (record.status === "running") {
+            ringBuffer.append(`\n[Execution Timeout: exceeded ${options.timeoutMs}ms limit. Terminating task.]\n`);
+            record.status = "failed";
+            record.completedAt = new Date().toISOString();
+            record.durationMs = Date.now() - startTimeMs;
+            record.exitCode = 124;
+            this.emitLifecycleEvent({
+              type: "task.completed",
+              taskId,
+              exitCode: 124,
+              durationMs: record.durationMs,
+              at: record.completedAt,
+            });
+            await this.killTask(taskId, "SIGTERM");
+          }
+        }, options.timeoutMs);
+        timeoutTimer.unref();
+        record.timeoutTimer = timeoutTimer;
+      }
 
       this.tasks.set(taskId, record);
 
@@ -196,6 +260,12 @@ export class DaemonSupervisor extends EventEmitter {
 
       // Handle ERROR
       child.on("error", (err) => {
+        if (record.timeoutTimer) {
+          clearTimeout(record.timeoutTimer);
+          record.timeoutTimer = undefined;
+        }
+        activeDaemonPids.delete(pid);
+
         if (record.status === "running") {
           record.status = "failed";
           record.completedAt = new Date().toISOString();
@@ -213,6 +283,12 @@ export class DaemonSupervisor extends EventEmitter {
 
       // Handle EXIT
       child.on("close", (code, signal) => {
+        if (record.timeoutTimer) {
+          clearTimeout(record.timeoutTimer);
+          record.timeoutTimer = undefined;
+        }
+        activeDaemonPids.delete(pid);
+
         if (record.status === "running") {
           const durationMs = Date.now() - startTimeMs;
           record.completedAt = new Date().toISOString();
@@ -251,7 +327,13 @@ export class DaemonSupervisor extends EventEmitter {
       return { success: false, message: `Task not found: ${taskId}` };
     }
 
-    if (record.status !== "running" || !record.childProcess || !record.childProcess.stdin) {
+    if (
+      record.status !== "running" ||
+      !record.childProcess ||
+      !record.childProcess.stdin ||
+      record.childProcess.stdin.destroyed ||
+      record.childProcess.stdin.writableEnded
+    ) {
       return {
         success: false,
         message: "Process has already exited or stdin is closed",
@@ -279,6 +361,11 @@ export class DaemonSupervisor extends EventEmitter {
       return { success: false, message: `Task not found: ${taskId}` };
     }
 
+    if (record.timeoutTimer) {
+      clearTimeout(record.timeoutTimer);
+      record.timeoutTimer = undefined;
+    }
+
     if (record.status !== "running" || !record.childProcess) {
       return { success: true, message: `Task ${taskId} is already in state ${record.status}` };
     }
@@ -287,6 +374,7 @@ export class DaemonSupervisor extends EventEmitter {
     record.completedAt = new Date().toISOString();
 
     const pid = record.pid;
+    activeDaemonPids.delete(pid);
 
     try {
       if (process.platform === "win32") {

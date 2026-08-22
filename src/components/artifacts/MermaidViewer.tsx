@@ -1,6 +1,58 @@
 import { useState, useEffect, useRef } from "react";
 import { ZoomIn, ZoomOut, RotateCcw, Download, Copy, Check, Code } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import DOMPurify from "dompurify";
+
+export function getPurifier() {
+  try {
+    if (typeof (DOMPurify as any)?.sanitize === "function") {
+      return DOMPurify;
+    }
+    if (typeof (DOMPurify as any)?.default?.sanitize === "function") {
+      return (DOMPurify as any).default;
+    }
+    if (typeof (DOMPurify as any)?.default === "function" && typeof window !== "undefined") {
+      return (DOMPurify as any).default(window);
+    }
+    if (typeof DOMPurify === "function" && typeof window !== "undefined") {
+      return (DOMPurify as any)(window);
+    }
+  } catch {
+    /* ignore */
+  }
+  return undefined;
+}
+
+export function sanitizeMermaidSvg(rawSvg: string): string {
+  const purify = getPurifier();
+
+  if (purify && typeof purify.sanitize === "function") {
+    return purify.sanitize(rawSvg, {
+      USE_PROFILES: { svg: true, svgFilters: true },
+      FORBID_TAGS: ["script", "iframe", "object", "embed", "foreignObject"],
+      FORBID_ATTR: [
+        "onload",
+        "onerror",
+        "onclick",
+        "onmouseover",
+        "onfocus",
+        "onblur",
+        "onmouseenter",
+      ],
+    });
+  }
+
+  // Robust fallback for non-DOM environments
+  return rawSvg
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<foreignObject[\s\S]*?<\/foreignObject>/gi, "")
+    .replace(/<iframe[\s\S]*?<\/iframe>/gi, "")
+    .replace(/<object[\s\S]*?<\/object>/gi, "")
+    .replace(/<embed\b[^>]*\/?>/gi, "")
+    .replace(/<\/?(script|foreignObject|iframe|object|embed)\b[^>]*>/gi, "")
+    .replace(/\son[a-z]+\s*=\s*(['"]).*?\1/gi, "")
+    .replace(/\son[a-z]+\s*=\s*[^\s>]+/gi, "");
+}
 
 interface MermaidViewerProps {
   chart: string;
@@ -44,12 +96,13 @@ export function MermaidViewer({ chart, title = "Architecture Diagram", className
           globalMermaid.initialize({
             startOnLoad: false,
             theme: "dark",
-            securityLevel: "loose",
+            securityLevel: "strict",
           });
-          const id = `mermaid-${Math.random().toString(36).substring(2, 9)}`;
+          const id = `mermaid-${crypto.randomUUID()}`;
           const { svg } = await globalMermaid.render(id, chart);
+          const sanitized = sanitizeMermaidSvg(svg);
           if (isMounted) {
-            setSvgContent(svg);
+            setSvgContent(sanitized);
             setError(null);
           }
         } else {

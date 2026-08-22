@@ -2,10 +2,11 @@
  * Slash command wire protocol, definitions, and tokenizer — Module 1, Task 1.
  *
  * Provides isomorphic Zod schemas, types, parser/formatter utilities, and
- * the 8 built-in slash command definitions for NanoForge chat interaction.
+ * the built-in slash command definitions for NanoForge chat interaction.
  */
 
 import { z } from "zod";
+import { jsonValueSchema } from "./json";
 
 /* ------------------------------------------------------------------ */
 /* 1. Slash Command Categories & Mentions                             */
@@ -20,6 +21,20 @@ export const slashCommandCategorySchema = z.enum([
   "custom",
 ]);
 export type SlashCommandCategory = z.infer<typeof slashCommandCategorySchema>;
+
+/** Supported operations exposed by the swarm slash-command family. */
+export const swarmCommandActionSchema = z.enum([
+  "run",
+  "list",
+  "tree",
+  "inspect",
+  "message",
+  "pause",
+  "resume",
+  "stop",
+  "focus",
+]);
+export type SwarmCommandAction = z.infer<typeof swarmCommandActionSchema>;
 
 /** Context mentions extracted from command input: @file, @rule, #symbol, @agent. */
 export const commandMentionsSchema = z.object({
@@ -73,10 +88,20 @@ export const commandResultFrameSchema = z.object({
   success: z.boolean(),
   output: z.string().optional(),
   error: z.string().optional(),
-  data: z.unknown().optional(),
+  data: jsonValueSchema.optional(),
   requestId: z.string().optional(),
 });
 export type CommandResultFrame = z.infer<typeof commandResultFrameSchema>;
+
+/** Small typed payload for hosts returning a swarm command outcome. */
+export const swarmCommandResultSchema = z.object({
+  action: swarmCommandActionSchema,
+  success: z.boolean(),
+  agentId: z.string().min(1).optional(),
+  message: z.string().optional(),
+  data: jsonValueSchema.optional(),
+});
+export type SwarmCommandResult = z.infer<typeof swarmCommandResultSchema>;
 
 /* ------------------------------------------------------------------ */
 /* 4. Slash Command Definition Contracts                              */
@@ -103,7 +128,7 @@ export interface SlashCommandDefinition {
 }
 
 /* ------------------------------------------------------------------ */
-/* 5. Built-in Command Definitions (8 Commands)                       */
+/* 5. Built-in Command Definitions                                      */
 /* ------------------------------------------------------------------ */
 
 export const BUILTIN_SLASH_COMMANDS: readonly SlashCommandDefinition[] = [
@@ -219,6 +244,112 @@ export const BUILTIN_SLASH_COMMANDS: readonly SlashCommandDefinition[] = [
     usage: "/clear",
     category: "system",
     clientOnly: true,
+  },
+  {
+    name: "/swarm",
+    aliases: ["/sw"],
+    description: "Run or manage a coordinated group of supervised agents",
+    usage: "/swarm <run|list|tree|inspect|message|pause|resume|stop|focus> [arguments]",
+    category: "execution",
+    params: [
+      {
+        name: "action",
+        description: "Swarm operation to perform",
+        required: true,
+        type: "enum",
+        enumValues: [
+          "run",
+          "list",
+          "tree",
+          "inspect",
+          "message",
+          "pause",
+          "resume",
+          "stop",
+          "focus",
+        ],
+      },
+      {
+        name: "goal",
+        description: "Quoted goal used by the run operation",
+        required: false,
+        type: "string",
+      },
+      {
+        name: "agentId",
+        description: "Target agent identifier; @agent mentions are also extracted by the parser",
+        required: false,
+        type: "string",
+      },
+    ],
+    requiresHost: true,
+  },
+  {
+    name: "/agents",
+    aliases: ["/agent-list", "/agent-tree", "/agent-inspect"],
+    description: "List agents, show their supervision tree, or inspect an agent",
+    usage: "/agents <list|tree|inspect> [agentId] [--recursive]",
+    category: "execution",
+    params: [
+      {
+        name: "action",
+        description: "Read-only agent operation (defaults to list when omitted)",
+        required: false,
+        type: "enum",
+        enumValues: ["list", "tree", "inspect"],
+        defaultValue: "list",
+      },
+      {
+        name: "agentId",
+        description: "Agent identifier to inspect",
+        required: false,
+        type: "string",
+      },
+      {
+        name: "recursive",
+        description: "Include descendants when listing or displaying the tree",
+        required: false,
+        type: "boolean",
+        defaultValue: false,
+      },
+    ],
+    requiresHost: true,
+  },
+  {
+    name: "/agent",
+    aliases: [
+      "/a",
+      "/agent-message",
+      "/agent-pause",
+      "/agent-resume",
+      "/agent-stop",
+      "/agent-focus",
+    ],
+    description: "Inspect or control one supervised agent",
+    usage: "/agent <inspect|message|pause|resume|stop|focus> <agentId> [message]",
+    category: "execution",
+    params: [
+      {
+        name: "action",
+        description: "Operation to perform on the target agent",
+        required: true,
+        type: "enum",
+        enumValues: ["inspect", "message", "pause", "resume", "stop", "focus"],
+      },
+      {
+        name: "agentId",
+        description: "Target agent identifier; @agent mentions are also extracted by the parser",
+        required: true,
+        type: "string",
+      },
+      {
+        name: "message",
+        description: "Message body for the message operation",
+        required: false,
+        type: "string",
+      },
+    ],
+    requiresHost: true,
   },
 ] as const;
 

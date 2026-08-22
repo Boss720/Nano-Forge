@@ -10,6 +10,7 @@
  */
 
 import { EventEmitter } from "node:events";
+import path from "node:path";
 import type { z } from "zod";
 import {
   DEFAULT_MEMORY_NAMESPACE,
@@ -42,11 +43,13 @@ export interface SharedMemoryEngineOptions {
 }
 
 export class SharedMemoryEngine extends EventEmitter {
+  readonly workspaceRoot: string;
   private readonly entries = new Map<string, MemoryEntry>();
   private sweeperTimer: NodeJS.Timeout | null = null;
 
   constructor(options: SharedMemoryEngineOptions = {}) {
     super();
+    this.workspaceRoot = path.resolve(options.workspaceRoot ?? process.cwd());
     if (options.autoSweepIntervalMs && options.autoSweepIntervalMs > 0) {
       this.startSweeper(options.autoSweepIntervalMs);
     }

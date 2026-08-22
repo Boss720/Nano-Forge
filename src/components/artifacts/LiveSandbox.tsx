@@ -184,7 +184,7 @@ export function LiveSandbox({ html, title = "Live Sandbox Preview", className = 
             srcDoc={srcDoc}
             title={title}
             className="h-full w-full border-0 bg-white"
-            sandbox="allow-scripts allow-forms allow-same-origin"
+            sandbox="allow-scripts allow-forms"
           />
         </div>
       </div>

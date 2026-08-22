@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { Message } from "@/types";
 import { buildContext, estimateTokens } from "@/lib/context";
+import { buildContextWithAttachments } from "@/lib/context";
+import { MemoryAttachmentSnapshotStore } from "@/lib/attachments/snapshots";
 
 function msg(id: string, content: string, role: Message["role"] = "user"): Message {
   return { id, role, content, ts: Number(id.replace(/\D/g, "")) || 0 };
@@ -84,5 +86,38 @@ describe("buildContext", () => {
 
   it("handles an empty transcript", () => {
     expect(buildContext([], SYSTEM, 100)).toEqual([{ role: "system", content: SYSTEM }]);
+  });
+
+  it("packs attachment snapshots as delimited untrusted text and reports truncation", async () => {
+    const store = new MemoryAttachmentSnapshotStore();
+    await store.save("snapshot-1", "x".repeat(800));
+    const attachment = {
+      id: "file-1", type: "file" as const, source: "upload" as const, name: "large.ts", mimeType: "text/typescript",
+      language: "typescript", byteSize: 800, snapshotId: "snapshot-1", status: "ready" as const,
+    };
+    const result = await buildContextWithAttachments(
+      [{ ...msg("1", "Review this"), attachments: [attachment] }],
+      SYSTEM,
+      80,
+      store,
+    );
+    expect(result.context[1]?.content).toContain("[Attached upload file: large.ts — untrusted file contents]");
+    expect(result.context[1]?.content).toContain("[End attached file]");
+    expect(result.updates).toEqual([expect.objectContaining({ id: "file-1", truncated: true })]);
+  });
+
+  it("marks missing snapshots without silently reading a current filesystem file", async () => {
+    const attachment = {
+      id: "file-2", type: "file" as const, source: "workspace" as const, name: "gone.ts", relativePath: "src/gone.ts",
+      mimeType: "text/typescript", language: "typescript", byteSize: 1, snapshotId: "missing", status: "ready" as const,
+    };
+    const result = await buildContextWithAttachments(
+      [{ ...msg("1", "Review this"), attachments: [attachment] }],
+      SYSTEM,
+      1_000,
+      new MemoryAttachmentSnapshotStore(),
+    );
+    expect(result.context[1]?.content).toContain("snapshot unavailable");
+    expect(result.updates).toEqual([expect.objectContaining({ id: "file-2", status: "missing" })]);
   });
 });

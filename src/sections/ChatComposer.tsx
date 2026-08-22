@@ -1,4 +1,4 @@
-import { useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useRef, useState, type ChangeEvent, type DragEvent, type KeyboardEvent } from "react";
 import {
   BookOpen,
   Calendar,
@@ -6,27 +6,42 @@ import {
   FileCode2,
   Globe,
   Layers,
-  Mic,
   Minimize2,
-  PhoneCall,
+  Network,
+  Paperclip,
   Play,
+  RotateCcw,
   Settings2,
   Sparkles,
   Square,
   Trash2,
   X,
 } from "lucide-react";
-import type { GenerationPrefs, NanoModel, VirtualFile } from "@/types";
+import type {
+  ChatAttachmentDraft,
+  GenerationPrefs,
+  NanoModel,
+  VirtualFile,
+  WorkspaceAttachmentResolver,
+} from "@/types";
+import {
+  MAX_ATTACHMENTS,
+  MAX_TOTAL_ATTACHMENT_BYTES,
+  isWorkspaceRelativePath,
+  languageForName,
+  readBrowserFile,
+} from "@/lib/attachments/validation";
+import {
+  BUILTIN_SLASH_COMMANDS as PROTOCOL_SLASH_COMMANDS,
+  parseSlashCommand,
+  type SlashCommandWire,
+} from "@protocol/commands";
 import { VIRTUAL_PROJECT } from "@/lib/catalog";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Slider } from "@/components/ui/slider";
 
-export interface ContextMention {
-  type: "file" | "rule" | "symbol" | "agent";
-  id: string;
-  display?: string;
-  metadata?: Record<string, unknown>;
-}
+/** Backwards-compatible name for the existing @file send contract. */
+export type ContextMention = ChatAttachmentDraft;
 
 export interface SlashCommandItem {
   name: string;
@@ -36,69 +51,32 @@ export interface SlashCommandItem {
   category: "planning" | "execution" | "context" | "system" | "workspace" | "custom";
 }
 
-export const BUILTIN_SLASH_COMMANDS: readonly SlashCommandItem[] = [
-  {
-    name: "/plan",
-    aliases: ["/p"],
-    description: "Switch to Planning Mode, open visual DAG composer, and initialize plan",
-    usage: "/plan [goal description] [@file:<path>]",
-    category: "planning",
-  },
-  {
-    name: "/goal",
-    aliases: ["/g"],
-    description: "Set or update the active workspace objective banner",
-    usage: "/goal <objective description>",
-    category: "planning",
-  },
-  {
-    name: "/schedule",
-    aliases: ["/cron"],
-    description: "Schedule a one-shot timer or recurring background cron daemon",
-    usage: "/schedule <interval|cron> <prompt>",
-    category: "system",
-  },
-  {
-    name: "/browse",
-    aliases: ["/b"],
-    description: "Launch managed Playwright browser session for visual inspection",
-    usage: "/browse <url> [--action=screenshot|dom|crawl]",
-    category: "execution",
-  },
-  {
-    name: "/call",
-    aliases: ["/voice"],
-    description: "Start interactive voice call session with live speech transcription & TTS",
-    usage: "/call [start]",
-    category: "execution",
-  },
-  {
-    name: "/learn",
-    description: "Extract repository conventions and distill into reusable skill definition",
-    usage: "/learn [topic or directory path]",
-    category: "context",
-  },
-  {
-    name: "/cost",
-    aliases: ["/usage"],
-    description: "Open Token and Provider Cost Analytics modal dashboard",
-    usage: "/cost [--by-model] [--by-day]",
-    category: "system",
-  },
-  {
-    name: "/compact",
-    description: "Compress conversation context memory window preserving critical state",
-    usage: "/compact [--keep=N] [--summary]",
-    category: "context",
-  },
-  {
-    name: "/clear",
-    aliases: ["/reset"],
-    description: "Clear active chat transcript and reset scratch state",
-    usage: "/clear",
-    category: "system",
-  },
-];
+/** UI projection of the protocol registry; keeps the palette and host parser in sync. */
+export const BUILTIN_SLASH_COMMANDS: readonly SlashCommandItem[] = PROTOCOL_SLASH_COMMANDS.map(
+  ({ name, aliases, description, usage, category }) => ({
+    name,
+    ...(aliases ? { aliases } : {}),
+    description,
+    usage,
+    category,
+  }),
+);
+
+const SWARM_COMMAND_NAMES = new Set([
+  "/swarm",
+  "/sw",
+  "/agents",
+  "/agent-list",
+  "/agent-tree",
+  "/agent-inspect",
+  "/agent",
+  "/a",
+  "/agent-message",
+  "/agent-pause",
+  "/agent-resume",
+  "/agent-stop",
+  "/agent-focus",
+]);
 
 const CATEGORY_COLORS: Record<SlashCommandItem["category"], string> = {
   planning: "border-primary/40 bg-primary/10 text-primary",
@@ -110,8 +88,6 @@ const CATEGORY_COLORS: Record<SlashCommandItem["category"], string> = {
 };
 
 const COMMAND_ICONS: Record<string, typeof Sparkles> = {
-  "/call": PhoneCall,
-  "/voice": Mic,
   "/plan": Layers,
   "/goal": Sparkles,
   "/schedule": Calendar,
@@ -120,18 +96,23 @@ const COMMAND_ICONS: Record<string, typeof Sparkles> = {
   "/cost": CircleDollarSign,
   "/compact": Minimize2,
   "/clear": Trash2,
+  "/swarm": Network,
+  "/agents": Network,
+  "/agent": Network,
 };
 
 export interface ChatComposerProps {
   onSendMessage: (text: string, mentions?: ContextMention[]) => void;
   onTriggerPlan?: (goal: string) => void;
-  /** Milestone 3: voice call trigger & active state */
-  onTriggerVoiceCall?: () => void;
-  isVoiceCallActive?: boolean;
+  onExecuteCommand?: (wire: SlashCommandWire) => void | Promise<void>;
   disabled?: boolean;
   running?: boolean;
   onStop?: () => void;
   workspaceFiles?: VirtualFile[];
+  /** Optional host-backed seam. It only accepts workspace-relative paths. */
+  resolveWorkspaceAttachment?: WorkspaceAttachmentResolver;
+  workspaceAttachmentRequest?: string | null;
+  onWorkspaceAttachmentConsumed?: () => void;
   placeholder?: string;
   model?: NanoModel;
   connected?: boolean;
@@ -147,15 +128,37 @@ function fmtK(n: number): string {
   return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
 }
 
+function formatBytes(bytes: number): string {
+  return bytes >= 1024 ? `${(bytes / 1024).toFixed(1)} KiB` : `${bytes} B`;
+}
+
+function workspaceFailure(file: VirtualFile, error: string): ContextMention {
+  return {
+    id: file.path,
+    type: "file",
+    source: "workspace",
+    name: file.path.split(/[\\/]/).pop() ?? file.path,
+    relativePath: file.path,
+    mimeType: "text/plain",
+    language: file.language || languageForName(file.path),
+    byteSize: 0,
+    snapshotId: crypto.randomUUID(),
+    status: "error",
+    error,
+  };
+}
+
 export function ChatComposer({
   onSendMessage,
   onTriggerPlan,
-  onTriggerVoiceCall,
-  isVoiceCallActive = false,
+  onExecuteCommand,
   disabled = false,
   running = false,
   onStop,
   workspaceFiles,
+  resolveWorkspaceAttachment,
+  workspaceAttachmentRequest,
+  onWorkspaceAttachmentConsumed,
   placeholder,
   model,
   connected = false,
@@ -168,6 +171,57 @@ export function ChatComposer({
 }: ChatComposerProps) {
   const [draft, setDraft] = useState("");
   const [mentions, setMentions] = useState<ContextMention[]>([]);
+  const [isDraggingFile, setIsDraggingFile] = useState(false);
+  const [attachmentNotice, setAttachmentNotice] = useState<string | null>(null);
+
+  useEffect(() => {
+    const relativePath = workspaceAttachmentRequest;
+    if (!relativePath) return;
+    if (!resolveWorkspaceAttachment) {
+      setAttachmentNotice("Connect a local workspace before attaching its files.");
+      onWorkspaceAttachmentConsumed?.();
+      return;
+    }
+    const id = `workspace:${relativePath}`;
+    if (mentions.some((attachment) => attachment.id === id)) {
+      onWorkspaceAttachmentConsumed?.();
+      return;
+    }
+    if (mentions.filter((attachment) => attachment.status !== "error").length >= MAX_ATTACHMENTS) {
+      setAttachmentNotice(`A message can include at most ${MAX_ATTACHMENTS} attachments.`);
+      onWorkspaceAttachmentConsumed?.();
+      return;
+    }
+    const draft: ContextMention = {
+      id,
+      type: "file",
+      source: "workspace",
+      name: relativePath.split(/[\\/]/).pop() ?? relativePath,
+      relativePath,
+      mimeType: "text/plain",
+      language: languageForName(relativePath),
+      byteSize: 0,
+      snapshotId: crypto.randomUUID(),
+      status: "loading",
+    };
+    setMentions((previous) => [...previous, draft]);
+    onWorkspaceAttachmentConsumed?.();
+    void resolveWorkspaceAttachment(relativePath)
+      .then((resolved) => setMentions((previous) => previous.map((attachment) => attachment.id === id ? {
+        ...attachment,
+        content: resolved.content,
+        mimeType: resolved.mimeType ?? attachment.mimeType,
+        language: resolved.language ?? attachment.language,
+        byteSize: resolved.byteSize ?? new TextEncoder().encode(resolved.content).byteLength,
+        status: "ready",
+        error: undefined,
+      } : attachment)))
+      .catch((error) => setMentions((previous) => previous.map((attachment) => attachment.id === id ? {
+        ...attachment,
+        status: "error",
+        error: error instanceof Error ? error.message : "Could not read workspace file.",
+      } : attachment)));
+  }, [mentions, onWorkspaceAttachmentConsumed, resolveWorkspaceAttachment, workspaceAttachmentRequest]);
 
   // Popover state
   const [slashQuery, setSlashQuery] = useState<string | null>(null);
@@ -177,6 +231,7 @@ export function ChatComposer({
   const [activeMentionIndex, setActiveMentionIndex] = useState(0);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
 
   const availableFiles = workspaceFiles && workspaceFiles.length > 0 ? workspaceFiles : VIRTUAL_PROJECT;
@@ -249,10 +304,59 @@ export function ChatComposer({
   const selectMentionFile = (file: VirtualFile) => {
     // Add to mentions array if not already present
     if (!mentions.some((m) => m.id === file.path)) {
-      setMentions((prev) => [
-        ...prev,
-        { type: "file", id: file.path, display: file.path, metadata: { language: file.language } },
-      ]);
+      if (!isWorkspaceRelativePath(file.path)) {
+        addAttachments([workspaceFailure(file, "Workspace attachments must use a relative path.")]);
+      } else if (resolveWorkspaceAttachment) {
+        addAttachments([
+          {
+            id: file.path,
+            type: "file",
+            source: "workspace",
+            name: file.path.split(/[\\/]/).pop() ?? file.path,
+            relativePath: file.path,
+            mimeType: "text/plain",
+            language: file.language,
+            byteSize: 0,
+            snapshotId: crypto.randomUUID(),
+            status: "loading",
+          },
+        ]);
+        void resolveWorkspaceAttachment(file.path)
+          .then((resolved) => {
+            setMentions((prev) =>
+              prev.map((attachment) =>
+                attachment.id !== file.path
+                  ? attachment
+                  : {
+                      ...attachment,
+                      mimeType: resolved.mimeType ?? attachment.mimeType,
+                      language: resolved.language ?? attachment.language,
+                      byteSize: resolved.byteSize ?? new TextEncoder().encode(resolved.content).byteLength,
+                      content: resolved.content,
+                      status: "ready",
+                      error: undefined,
+                    },
+              ),
+            );
+          })
+          .catch((error) => updateAttachmentFailure(file.path, error));
+      } else {
+        addAttachments([
+          {
+            id: file.path,
+            type: "file",
+            source: "workspace",
+            name: file.path.split(/[\\/]/).pop() ?? file.path,
+            relativePath: file.path,
+            mimeType: "text/plain",
+            language: file.language,
+            byteSize: new TextEncoder().encode(file.content).byteLength,
+            snapshotId: crypto.randomUUID(),
+            status: "ready",
+            content: file.content,
+          },
+        ]);
+      }
     }
 
     // Replace the `@...` token in the draft
@@ -278,20 +382,90 @@ export function ChatComposer({
     setMentions((prev) => prev.filter((m) => m.id !== id));
   };
 
+  const addAttachments = (incoming: ContextMention[]) => {
+    setMentions((previous) => {
+      const next = [...previous];
+      for (const attachment of incoming) {
+        if (next.some((item) => item.id === attachment.id)) continue;
+        if (next.length >= MAX_ATTACHMENTS) {
+          setAttachmentNotice(`A message can include at most ${MAX_ATTACHMENTS} attachments.`);
+          continue;
+        }
+        const total = next.filter((item) => item.status !== "error").reduce((sum, item) => sum + item.byteSize, 0);
+        if (attachment.status !== "error" && total + attachment.byteSize > MAX_TOTAL_ATTACHMENT_BYTES) {
+          setAttachmentNotice("Attachments must total 1 MiB or less.");
+          continue;
+        }
+        next.push(attachment);
+      }
+      return next;
+    });
+  };
+
+  const updateAttachmentFailure = (id: string, error: unknown) => {
+    setMentions((previous) =>
+      previous.map((attachment) =>
+        attachment.id === id
+          ? { ...attachment, status: "error", error: error instanceof Error ? error.message : "Could not read attachment." }
+          : attachment,
+      ),
+    );
+  };
+
+  const addBrowserFiles = async (files: File[]) => {
+    const read = await Promise.all(files.map((file) => readBrowserFile(file)));
+    addAttachments(read);
+  };
+
+  const retryAttachment = async (attachment: ContextMention) => {
+    if (attachment.source === "upload" && attachment.file) {
+      const retried = await readBrowserFile(attachment.file);
+      setMentions((previous) => previous.map((item) => (item.id === attachment.id ? { ...retried, id: attachment.id, snapshotId: attachment.snapshotId } : item)));
+      return;
+    }
+    if (attachment.source === "workspace" && attachment.relativePath && resolveWorkspaceAttachment) {
+      setMentions((previous) => previous.map((item) => (item.id === attachment.id ? { ...item, status: "loading", error: undefined } : item)));
+      try {
+        const resolved = await resolveWorkspaceAttachment(attachment.relativePath);
+        setMentions((previous) => previous.map((item) => item.id === attachment.id ? {
+          ...item,
+          content: resolved.content,
+          mimeType: resolved.mimeType ?? item.mimeType,
+          language: resolved.language ?? item.language,
+          byteSize: resolved.byteSize ?? new TextEncoder().encode(resolved.content).byteLength,
+          status: "ready",
+        } : item));
+      } catch (error) {
+        updateAttachmentFailure(attachment.id, error);
+      }
+    }
+  };
+
+  const handlePickerChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files ?? []);
+    if (files.length > 0) void addBrowserFiles(files);
+    event.target.value = "";
+  };
+
+  const handleDrop = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    setIsDraggingFile(false);
+    const files = Array.from(event.dataTransfer.files ?? []);
+    if (files.length > 0) void addBrowserFiles(files);
+  };
+
   const submit = () => {
     const text = draft.trim();
-    if ((!text && mentions.length === 0) || running || disabled) return;
+    if ((!text && mentions.length === 0) || running || disabled || mentions.some((attachment) => attachment.status === "loading")) return;
 
-    // Check if input is /call or /voice command
-    if (text === "/call" || text.startsWith("/call ") || text === "/voice" || text.startsWith("/voice ")) {
-      if (onTriggerVoiceCall) {
-        onTriggerVoiceCall();
-        setDraft("");
-        setMentions([]);
-        setSlashQuery(null);
-        setMentionQuery(null);
-        return;
-      }
+    const command = parseSlashCommand(text);
+    if (command && SWARM_COMMAND_NAMES.has(command.command) && onExecuteCommand) {
+      void onExecuteCommand(command);
+      setDraft("");
+      setMentions([]);
+      setSlashQuery(null);
+      setMentionQuery(null);
+      return;
     }
 
     // Check if input is /plan command
@@ -495,11 +669,17 @@ export function ChatComposer({
       )}
 
       {/* Input container */}
-      <div className="rounded-lg border border-input bg-secondary/40 transition-colors focus-within:border-primary/60">
+      <div
+        className={`rounded-lg border border-input bg-secondary/40 transition-colors focus-within:border-primary/60 ${isDraggingFile ? "border-primary bg-primary/5" : ""}`}
+        onDragOver={(event) => { event.preventDefault(); setIsDraggingFile(true); }}
+        onDragLeave={() => setIsDraggingFile(false)}
+        onDrop={handleDrop}
+        data-testid="attachment-drop-zone"
+      >
         {/* Context mention chips */}
         {mentions.length > 0 && (
           <div className="flex flex-wrap items-center gap-1.5 border-b border-border/40 px-3 py-1.5">
-            <span className="micro-label normal-case tracking-normal text-muted-foreground">context:</span>
+            <span className="micro-label normal-case tracking-normal text-muted-foreground">attachments:</span>
             {mentions.map((m) => (
               <span
                 key={m.id}
@@ -507,7 +687,14 @@ export function ChatComposer({
                 className="inline-flex items-center gap-1 rounded-md border border-primary/30 bg-primary/10 px-2 py-0.5 font-mono text-[11px] text-primary"
               >
                 <FileCode2 className="h-3 w-3" />
-                {m.display ?? m.id}
+                <span>{m.relativePath ?? m.name}</span>
+                <span className="text-[9px] text-primary/70">{m.source} · {formatBytes(m.byteSize)} · {m.status}{m.truncated ? " · truncated" : ""}</span>
+                {m.status === "error" && <span className="max-w-40 truncate text-[9px] text-red-300">{m.error}</span>}
+                {(m.status === "error" || m.status === "stale" || m.status === "missing") && (m.file || (m.source === "workspace" && resolveWorkspaceAttachment)) && (
+                  <button type="button" aria-label={`Retry attachment ${m.name}`} onClick={() => void retryAttachment(m)} className="rounded p-0.5 hover:bg-primary/20">
+                    <RotateCcw className="h-2.5 w-2.5" />
+                  </button>
+                )}
                 <button
                   type="button"
                   aria-label={`Remove mention ${m.id}`}
@@ -520,7 +707,13 @@ export function ChatComposer({
             ))}
           </div>
         )}
+        {attachmentNotice && (
+          <div className="border-b border-red-500/20 px-3 py-1.5 font-mono text-[10px] text-red-300" role="status">
+            {attachmentNotice}
+          </div>
+        )}
 
+        <input ref={fileInputRef} type="file" multiple className="sr-only" data-testid="attachment-file-input" onChange={handlePickerChange} />
         <textarea
           ref={textareaRef}
           data-testid="chat-textarea"
@@ -563,26 +756,19 @@ export function ChatComposer({
 
           <div className="flex-1" />
 
+          <button
+            type="button"
+            aria-label="Attach files from device"
+            title="Attach text or code files from this device"
+            disabled={disabled || running || mentions.length >= MAX_ATTACHMENTS}
+            onClick={() => fileInputRef.current?.click()}
+            className="rounded p-1 text-muted-foreground transition-colors hover:text-foreground disabled:opacity-40"
+          >
+            <Paperclip className="h-3.5 w-3.5" />
+          </button>
+
           {genPrefs && onGenPrefsChange && (
             <GenSettings genPrefs={genPrefs} onChange={onGenPrefsChange} />
-          )}
-
-          {/* Milestone 3: Voice Call Mic Trigger Button */}
-          {onTriggerVoiceCall && (
-            <button
-              type="button"
-              data-testid="composer-mic-button"
-              onClick={onTriggerVoiceCall}
-              title={isVoiceCallActive ? "Voice Call Active — Click to open call drawer" : "Start Voice Call (/call)"}
-              className={`rounded-md p-1.5 transition-all ${
-                isVoiceCallActive
-                  ? "border border-emerald-500/50 bg-emerald-500/20 text-emerald-400 animate-pulse"
-                  : "text-muted-foreground hover:bg-secondary/60 hover:text-foreground"
-              }`}
-              aria-label="Start Voice Call"
-            >
-              <Mic className="h-4 w-4" />
-            </button>
           )}
 
           <span className="micro-label hidden sm:block">/ commands · @ files · ⏎ send</span>
@@ -599,7 +785,7 @@ export function ChatComposer({
             <button
               onClick={submit}
               data-testid="run-agent-button"
-              disabled={!draft.trim() && mentions.length === 0}
+              disabled={(!draft.trim() && mentions.length === 0) || mentions.some((attachment) => attachment.status === "loading")}
               className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 font-mono text-[11.5px] font-semibold text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-30 active:scale-[0.98]"
             >
               <Play className="h-3 w-3" /> run agent

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ChatComposer } from "@/sections/ChatComposer";
 import type { VirtualFile } from "@/types";
@@ -224,5 +224,47 @@ describe("ChatComposer @file Context Mention Autocomplete", () => {
     await user.click(removeBtn);
 
     expect(screen.queryByTestId("mention-chip-src/server.ts")).toBeNull();
+  });
+
+  it("accepts a browser-selected text file and sends it as a first-class attachment", async () => {
+    const user = userEvent.setup();
+    const cb = renderComposer();
+    const file = new File(["export const attached = true;"], "attached.ts", { type: "text/typescript" });
+    const input = screen.getByTestId("attachment-file-input");
+
+    await user.upload(input, file);
+    expect(await screen.findByText(/attached\.ts/i)).toBeTruthy();
+    await user.type(screen.getByTestId("chat-textarea"), "Review it{Enter}");
+
+    expect(cb.onSendMessage).toHaveBeenCalledWith(
+      "Review it",
+      expect.arrayContaining([expect.objectContaining({ source: "upload", name: "attached.ts", status: "ready" })]),
+    );
+  });
+
+  it("rejects blocked device files while retaining an actionable failed chip", async () => {
+    const user = userEvent.setup();
+    renderComposer();
+    const input = screen.getByTestId("attachment-file-input");
+    await user.upload(input, new File(["TOKEN=value"], ".env", { type: "text/plain" }));
+    expect(await screen.findByText(/cannot be attached/i)).toBeTruthy();
+    expect(screen.getByText(/\.env/)).toBeTruthy();
+  });
+
+  it("accepts text files dropped onto the composer", async () => {
+    renderComposer();
+    const dropped = new File(["# dropped"], "dropped.md", { type: "text/markdown" });
+    fireEvent.drop(screen.getByTestId("attachment-drop-zone"), { dataTransfer: { files: [dropped] } });
+    expect(await screen.findByText(/dropped\.md/i)).toBeTruthy();
+  });
+
+  it("enforces the five-file attachment limit with visible feedback", async () => {
+    const user = userEvent.setup();
+    renderComposer();
+    const files = Array.from({ length: 6 }, (_, index) => new File([`export const n = ${index};`], `file-${index}.ts`, { type: "text/typescript" }));
+    await user.upload(screen.getByTestId("attachment-file-input"), files);
+    await screen.findByText(/file-0\.ts/i);
+    expect(screen.getAllByTestId(/^mention-chip-upload:/)).toHaveLength(5);
+    expect(screen.getByText(/at most 5 attachments/i)).toBeTruthy();
   });
 });

@@ -17,10 +17,12 @@ import { TaskScheduler } from "./scheduler.js";
 export class DaemonManager {
   readonly supervisor: DaemonSupervisor;
   readonly scheduler: TaskScheduler;
+  readonly workspaceRoot?: string;
 
-  constructor(supervisor?: DaemonSupervisor, scheduler?: TaskScheduler) {
-    this.supervisor = supervisor ?? new DaemonSupervisor();
+  constructor(supervisor?: DaemonSupervisor, scheduler?: TaskScheduler, workspaceRoot?: string) {
+    this.supervisor = supervisor ?? new DaemonSupervisor(workspaceRoot);
     this.scheduler = scheduler ?? new TaskScheduler();
+    this.workspaceRoot = this.supervisor.workspaceRoot;
   }
 
   /**

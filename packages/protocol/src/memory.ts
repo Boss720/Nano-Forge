@@ -9,6 +9,7 @@
  */
 
 import { z } from "zod";
+import { jsonValueSchema } from "./json";
 
 /* ------------------------------------------------------------------ */
 /* 1. Protocol Constants & Error Codes                                */
@@ -41,7 +42,7 @@ export const DEFAULT_MEMORY_QUERY_LIMIT = 50;
  */
 export const memoryEntrySchema = z.object({
   key: z.string().min(1).max(MAX_MEMORY_KEY_LENGTH),
-  value: z.unknown(),
+  value: jsonValueSchema,
   namespace: z.string().min(1).max(MAX_MEMORY_NAMESPACE_LENGTH).default(DEFAULT_MEMORY_NAMESPACE),
   authorId: z.string().uuid().optional(),
   authorName: z.string().max(128).optional(),
@@ -63,7 +64,7 @@ export type MemoryEntry = z.infer<typeof memoryEntrySchema>;
  */
 export const memorySetParamsSchema = z.object({
   key: z.string().min(1).max(MAX_MEMORY_KEY_LENGTH),
-  value: z.unknown(),
+  value: jsonValueSchema,
   namespace: z.string().min(1).max(MAX_MEMORY_NAMESPACE_LENGTH).default(DEFAULT_MEMORY_NAMESPACE),
   tags: z.array(z.string().min(1).max(MAX_MEMORY_TAG_LENGTH)).default([]),
   ttlSeconds: z.number().int().positive().optional(),

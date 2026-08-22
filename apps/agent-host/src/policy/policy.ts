@@ -13,7 +13,7 @@
  * - writes, network access, installs, termination, redirection (`>`/`<`),
  *   and anything unknown are **ask** (interactive approval).
  */
-import { readFileSync } from "node:fs";
+import fs, { readFileSync } from "node:fs";
 import path from "node:path";
 
 /* ------------------------------------------------------------------------ */
@@ -87,19 +87,104 @@ export function executableBasename(executable: string): string {
 const normalizeForCompare = (p: string): string =>
   process.platform === "win32" ? p.toLowerCase() : p;
 
+export class SecurityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SecurityError";
+  }
+}
+
+export function sanitizePathString(input: string): string {
+  if (typeof input !== "string") return "";
+  let decoded = input;
+  // Multi-pass URL decode to defeat double/triple URL encoding
+  for (let i = 0; i < 3; i++) {
+    try {
+      const next = decodeURIComponent(decoded);
+      if (next === decoded) break;
+      decoded = next;
+    } catch {
+      break;
+    }
+  }
+  // Reject null bytes
+  if (decoded.includes("\0")) {
+    throw new Error("Path contains illegal null bytes");
+  }
+  return decoded;
+}
+
+function stripExtendedPrefix(p: string): string {
+  if (process.platform === "win32") {
+    if (p.startsWith("\\\\?\\")) {
+      return p.slice(4);
+    }
+    if (p.startsWith("\\\\.\\")) {
+      return p.slice(4);
+    }
+  }
+  return p;
+}
+
+function getCanonicalPath(targetPath: string): string {
+  try {
+    if (fs.existsSync(targetPath)) {
+      const real = fs.realpathSync.native ? fs.realpathSync.native(targetPath) : fs.realpathSync(targetPath);
+      return stripExtendedPrefix(real);
+    }
+  } catch {
+    // If realpath fails, fallback to lexical
+  }
+  // For non-existent files (e.g. pending write), find nearest existing ancestor
+  try {
+    let ancestor = path.dirname(targetPath);
+    const childParts: string[] = [path.basename(targetPath)];
+    while (!fs.existsSync(ancestor) && ancestor !== path.dirname(ancestor)) {
+      childParts.unshift(path.basename(ancestor));
+      ancestor = path.dirname(ancestor);
+    }
+    if (fs.existsSync(ancestor)) {
+      const realAncestor = fs.realpathSync.native ? fs.realpathSync.native(ancestor) : fs.realpathSync(ancestor);
+      const canonicalAncestor = stripExtendedPrefix(realAncestor);
+      return path.join(canonicalAncestor, ...childParts);
+    }
+  } catch {
+    // Fallback to lexical
+  }
+  return targetPath;
+}
+
 /**
  * True when `candidate` resolves to `workspaceRoot` itself or a path inside
  * it. Both absolute and root-relative candidates are supported; `..` escapes
  * and absolute paths outside the root return false.
  */
 export function isWithinWorkspace(candidate: string, workspaceRoot: string): boolean {
-  const root = path.resolve(workspaceRoot);
-  const resolved = path.resolve(root, candidate);
-  const rel = path.relative(
-    normalizeForCompare(root),
-    normalizeForCompare(resolved),
-  );
-  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+  try {
+    const sanitizedCandidate = sanitizePathString(candidate);
+    const sanitizedRoot = sanitizePathString(workspaceRoot);
+    const root = path.resolve(sanitizedRoot);
+    const resolved = path.resolve(root, sanitizedCandidate);
+
+    const normRoot = normalizeForCompare(root);
+    const normResolved = normalizeForCompare(resolved);
+    const rel = path.relative(normRoot, normResolved);
+    if (rel.startsWith("..") || path.isAbsolute(rel)) {
+      return false;
+    }
+
+    // Canonical / Symlink check
+    const canonicalRoot = normalizeForCompare(getCanonicalPath(root));
+    const canonicalTarget = normalizeForCompare(getCanonicalPath(resolved));
+    const relCanonical = path.relative(canonicalRoot, canonicalTarget);
+    if (relCanonical.startsWith("..") || path.isAbsolute(relCanonical)) {
+      return false;
+    }
+
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -110,9 +195,45 @@ export function resolveWithinWorkspace(
   workspaceRoot: string,
   cwd?: string,
 ): string | null {
-  const root = path.resolve(workspaceRoot);
-  const resolved = path.resolve(root, cwd && cwd.trim() ? cwd : ".");
-  return isWithinWorkspace(resolved, root) ? resolved : null;
+  try {
+    const raw = cwd && cwd.trim() ? cwd.trim() : ".";
+    const sanitized = sanitizePathString(raw);
+    const sanitizedRoot = sanitizePathString(workspaceRoot);
+    const root = path.resolve(sanitizedRoot);
+    const resolved = path.resolve(root, sanitized);
+
+    if (!isWithinWorkspace(resolved, root)) {
+      return null;
+    }
+    return resolved;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolves a target path within workspace root, throwing SecurityError if it escapes or violates security rules.
+ */
+export function resolveWorkspacePath(workspaceRoot: string, targetPath?: string): string {
+  if (!workspaceRoot) {
+    throw new SecurityError("Workspace root is required");
+  }
+  const rawTarget = targetPath && targetPath.trim() ? targetPath.trim() : ".";
+  if (rawTarget.includes("\0")) {
+    throw new SecurityError("Null bytes not allowed in path");
+  }
+  const decoded = sanitizePathString(rawTarget);
+  if (decoded.includes("\0")) {
+    throw new SecurityError("Null bytes not allowed in path");
+  }
+
+  const root = path.resolve(sanitizePathString(workspaceRoot));
+  const resolvedCandidate = path.resolve(root, decoded);
+
+  if (!isWithinWorkspace(resolvedCandidate, root)) {
+    throw new SecurityError("Path traversal detected: target resolves outside workspace");
+  }
+  return resolvedCandidate;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -227,10 +348,14 @@ export interface SubagentAccessDecision {
  */
 export function canonicalizeSubagentPath(rawPath: string): string {
   let decoded = rawPath;
-  try {
-    decoded = decodeURIComponent(rawPath);
-  } catch {
-    // Keep original if decoding fails
+  for (let i = 0; i < 3; i++) {
+    try {
+      const next = decodeURIComponent(decoded);
+      if (next === decoded) break;
+      decoded = next;
+    } catch {
+      break;
+    }
   }
   return path.normalize(decoded);
 }
@@ -323,6 +448,27 @@ export function authorizeSubagentPathAccess(
 
   // 3. For operations outside `.agents/` metadata (i.e. source tree, worktree, or scratch):
   if (request.operation === "write" || request.operation === "delete") {
+    // Check isolation mode write permissions first
+    if (options.isolationMode === "share") {
+      // In share mode, source root is read-only. Writes only allowed in scratchDir
+      if (!insideScratch) {
+        return {
+          allowed: false,
+          decision: "deny",
+          reason: `Share isolation mode: writes to repository source tree are denied. Use scratch directory.`,
+        };
+      }
+    } else if (options.isolationMode === "branch") {
+      // In branch mode, writes must be confined to worktreePath
+      if (!insideWorktree) {
+        return {
+          allowed: false,
+          decision: "deny",
+          reason: `Branch isolation mode: writes outside worktree "${options.worktreePath}" are denied.`,
+        };
+      }
+    }
+
     // Check archetype read-only restriction
     const isReadOnlyArchetype =
       options.archetype === "explorer" ||
@@ -342,27 +488,6 @@ export function authorizeSubagentPathAccess(
         decision: "deny",
         reason: `Archetype "${options.archetype || 'read-only'}" (read-only archetype) is not permitted to mutate source tree files.`,
       };
-    }
-
-    // Check isolation mode write permissions
-    if (options.isolationMode === "share") {
-      // In share mode, source root is read-only. Writes only allowed in scratchDir
-      if (!insideScratch) {
-        return {
-          allowed: false,
-          decision: "deny",
-          reason: `Share isolation mode: writes to repository source tree are denied. Use scratch directory.`,
-        };
-      }
-    } else if (options.isolationMode === "branch") {
-      // In branch mode, writes must be confined to worktreePath
-      if (!insideWorktree) {
-        return {
-          allowed: false,
-          decision: "deny",
-          reason: `Branch isolation mode: writes outside worktree "${options.worktreePath}" are denied.`,
-        };
-      }
     }
   }
 

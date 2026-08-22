@@ -5,6 +5,9 @@
  * suite has no client-side dependency quirks under the test runner.
  */
 import { afterEach, describe, expect, it } from "vitest";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import {
   CLOSE_INVALID_MESSAGE,
   CLOSE_UNAUTHORIZED,
@@ -46,11 +49,21 @@ const NativeWebSocket = globalThis.WebSocket as unknown as new (
 ) => WsLike;
 
 let host: HostHandle | undefined;
+const tempRoots: string[] = [];
 
 afterEach(async () => {
   await host?.close();
   host = undefined;
+  for (const root of tempRoots.splice(0)) {
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });
+
+async function tempWorkspace(label: string): Promise<string> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), `nanoforge-${label}-`));
+  tempRoots.push(root);
+  return root;
+}
 
 const agentUrl = (h: HostHandle, token?: string): string =>
   `ws://127.0.0.1:${h.port}/agent${token === undefined ? "" : `?token=${token}`}`;
@@ -106,6 +119,68 @@ describe("token store", () => {
 });
 
 describe("authenticated local host", () => {
+  it("pins PTY, daemon, subagent, memory, and session roots to one canonical workspace", async () => {
+    const root = await tempWorkspace("consistent-root");
+    host = await createHost({ session: { workspaceRoot: root } });
+    const canonical = await fs.realpath(root);
+    expect(host.workspace.displayPath).toBe(canonical);
+    expect(host.ptyManager.workspaceRoot).toBe(canonical);
+    expect(host.daemonManager.workspaceRoot).toBe(canonical);
+    expect(host.subagentSupervisor.workspaceRoot).toBe(canonical);
+    expect(host.subagentSupervisor.memory.workspaceRoot).toBe(canonical);
+  });
+
+  it("correlates stale generations and validates switches as reconnect-required", async () => {
+    const root = await tempWorkspace("current-root");
+    const nextRoot = await tempWorkspace("next-root");
+    host = await createHost({ session: { workspaceRoot: root } });
+    const ws = new NativeWebSocket(agentUrl(host, host.token));
+    await waitForOpen(ws);
+    const ready = await nextMessage(ws);
+    expect((ready.workspace as any).generation).toBe(1);
+
+    let reply = nextMessage(ws);
+    ws.send(JSON.stringify({ type: "workspace.readDir", requestId: "stale-1", path: "", generation: 99 }));
+    expect(await reply).toMatchObject({ type: "workspace.error", requestId: "stale-1", code: "stale_generation", generation: 1 });
+
+    reply = nextMessage(ws);
+    ws.send(JSON.stringify({ type: "workspace.open", requestId: "open-1", path: nextRoot, generation: 1 }));
+    const reconnect = await reply;
+    expect(reconnect).toMatchObject({ type: "workspace.error", requestId: "open-1", code: "reconnect_required" });
+    expect((reconnect.requestedWorkspace as any).displayPath).toBe(await fs.realpath(nextRoot));
+    ws.close();
+  });
+
+  it("returns correlated watch results and reviewed-write conflicts", async () => {
+    const root = await tempWorkspace("reviewed-write");
+    await fs.writeFile(path.join(root, "note.txt"), "original", "utf8");
+    host = await createHost({ session: { workspaceRoot: root, allowWorkspaceWrites: true } });
+    const ws = new NativeWebSocket(agentUrl(host, host.token));
+    await waitForOpen(ws);
+    await nextMessage(ws);
+
+    let reply = nextMessage(ws);
+    ws.send(JSON.stringify({ type: "workspace.watch", requestId: "watch-1", enabled: true, generation: 1 }));
+    expect(await reply).toMatchObject({ type: "workspace.watch.result", requestId: "watch-1", enabled: true, generation: 1 });
+
+    reply = nextMessage(ws);
+    ws.send(JSON.stringify({
+      type: "workspace.writeFile",
+      requestId: "write-1",
+      path: "note.txt",
+      content: "replacement",
+      generation: 1,
+      expectedSha256: "0".repeat(64),
+    }));
+    expect(await reply).toMatchObject({ type: "workspace.error", requestId: "write-1", code: "write_conflict" });
+    expect(await fs.readFile(path.join(root, "note.txt"), "utf8")).toBe("original");
+
+    reply = nextMessage(ws);
+    ws.send(JSON.stringify({ type: "workspace.unwatch", requestId: "watch-2", generation: 1 }));
+    expect(await reply).toMatchObject({ type: "workspace.watch.result", requestId: "watch-2", enabled: false, generation: 1 });
+    ws.close();
+  });
+
   it("binds loopback only and answers /health", async () => {
     host = await createHost();
     expect(host.port).toBeGreaterThan(0);
@@ -114,8 +189,13 @@ describe("authenticated local host", () => {
 
     const res = await fetch(`http://127.0.0.1:${host.port}/health`);
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { ok: boolean; version: string };
-    expect(body).toEqual({ ok: true, version: HOST_VERSION });
+    const body = (await res.json()) as any;
+    expect(body.ok).toBe(true);
+    expect(body.version).toBe(HOST_VERSION);
+    expect(body.memory).toBeDefined();
+    expect(body.subagents).toBeDefined();
+    expect(body.daemons).toBeDefined();
+    expect(body.connections).toBeDefined();
   });
 
   it("closes an unauthenticated socket (missing token) with 4401", async () => {

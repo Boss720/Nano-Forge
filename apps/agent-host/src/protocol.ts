@@ -10,7 +10,24 @@
  * error | cancelled`.
  */
 import { z } from "zod";
-import type { ExecutionPlan } from "@protocol/plan";
+import { executionPlanSchema, type ExecutionPlan } from "@protocol/plan";
+import { jsonValueSchema } from "@protocol/json";
+import {
+  workspaceDescribeRequestSchema,
+  workspaceErrorSchema,
+  workspaceGitStatusRequestSchema,
+  workspaceOpenRequestSchema,
+  workspaceReadDirRequestSchema,
+  workspaceReadFileRequestSchema,
+  workspaceReadySchema,
+  workspaceSearchRequestSchema,
+  workspaceStatRequestSchema,
+  workspaceUnwatchRequestSchema,
+  workspaceWatchRequestSchema,
+  workspaceWatchResultSchema,
+  workspaceWriteRequestSchema,
+  workspaceWriteResultSchema,
+} from "@protocol/workspace";
 
 /** Canonical run lifecycle states shared with the UI tool cards. */
 export const RUN_STATES = [
@@ -228,22 +245,16 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
     reason: z.string().max(4096).optional(),
   }),
   // Workspace RPCs
-  z.object({ type: z.literal("workspace.readDir"), requestId: idSchema, path: z.string() }),
-  z.object({ type: z.literal("workspace.readFile"), requestId: idSchema, path: z.string() }),
-  z.object({ type: z.literal("workspace.writeFile"), requestId: idSchema, path: z.string(), content: z.string() }),
-  z.object({ type: z.literal("workspace.stat"), requestId: idSchema, path: z.string() }),
-  z.object({
-    type: z.literal("workspace.search"),
-    requestId: idSchema,
-    query: z.string(),
-    options: z.object({
-      caseSensitive: z.boolean().optional(),
-      includes: z.array(z.string()).optional(),
-      maxResults: z.number().optional(),
-    }).optional(),
-  }),
-  z.object({ type: z.literal("workspace.gitStatus"), requestId: idSchema }),
-  z.object({ type: z.literal("workspace.watch"), enabled: z.boolean() }),
+  workspaceDescribeRequestSchema,
+  workspaceOpenRequestSchema,
+  workspaceReadDirRequestSchema,
+  workspaceReadFileRequestSchema,
+  workspaceWriteRequestSchema,
+  workspaceStatRequestSchema,
+  workspaceSearchRequestSchema,
+  workspaceGitStatusRequestSchema,
+  workspaceWatchRequestSchema,
+  workspaceUnwatchRequestSchema,
   z.object({
     type: z.literal("integration.toggle"),
     requestId: idSchema,
@@ -391,6 +402,7 @@ export const hostMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("host.ready"),
     version: z.string(),
     hostId: idSchema,
+    workspace: workspaceReadySchema.shape.workspace.optional(),
     at: atSchema,
   }),
   z.object({ type: z.literal("pong"), at: atSchema }),
@@ -426,7 +438,7 @@ export const hostMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("run.event"),
     runId: idSchema,
     event: z.string().min(1).max(128),
-    data: z.unknown().optional(),
+    data: jsonValueSchema.optional(),
     at: atSchema,
   }),
   z.object({
@@ -437,13 +449,16 @@ export const hostMessageSchema = z.discriminatedUnion("type", [
     at: atSchema.optional(),
   }),
   // Workspace RPC Results
-  z.object({ type: z.literal("workspace.readDir.result"), requestId: idSchema, path: z.string(), entries: z.array(dirEntrySchema) }),
-  z.object({ type: z.literal("workspace.readFile.result"), requestId: idSchema, path: z.string(), content: z.string(), language: z.string(), size: z.number() }),
-  z.object({ type: z.literal("workspace.writeFile.result"), requestId: idSchema, path: z.string(), success: z.boolean() }),
-  z.object({ type: z.literal("workspace.stat.result"), requestId: idSchema, path: z.string(), stat: fileStatSchema }),
-  z.object({ type: z.literal("workspace.search.result"), requestId: idSchema, matches: z.array(searchMatchSchema) }),
-  z.object({ type: z.literal("workspace.gitStatus.result"), requestId: idSchema, files: z.array(gitFileStatusSchema) }),
-  z.object({ type: z.literal("workspace.fileChanged"), path: z.string(), changeType: z.enum(["created", "modified", "deleted"]) }),
+  workspaceReadySchema,
+  workspaceErrorSchema,
+  z.object({ type: z.literal("workspace.readDir.result"), requestId: idSchema, path: z.string(), entries: z.array(dirEntrySchema), generation: z.number().int().positive() }),
+  z.object({ type: z.literal("workspace.readFile.result"), requestId: idSchema, path: z.string(), content: z.string(), language: z.string(), size: z.number(), modified: z.string().datetime(), sha256: z.string().regex(/^[a-f0-9]{64}$/i), generation: z.number().int().positive() }),
+  workspaceWriteResultSchema,
+  z.object({ type: z.literal("workspace.stat.result"), requestId: idSchema, path: z.string(), stat: fileStatSchema, generation: z.number().int().positive() }),
+  z.object({ type: z.literal("workspace.search.result"), requestId: idSchema, matches: z.array(searchMatchSchema), generation: z.number().int().positive() }),
+  z.object({ type: z.literal("workspace.gitStatus.result"), requestId: idSchema, files: z.array(gitFileStatusSchema), generation: z.number().int().positive() }),
+  workspaceWatchResultSchema,
+  z.object({ type: z.literal("workspace.fileChanged"), path: z.string(), changeType: z.enum(["created", "modified", "deleted"]), generation: z.number().int().positive() }),
   z.object({
     type: z.literal("integrations.snapshot"),
     requestId: idSchema.optional(),

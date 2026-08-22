@@ -35,7 +35,9 @@ export interface WorkspaceExplorerProps {
   onRefresh: () => void;
   onSearch: (query: string) => void;
   onLoadDirectory?: (path: string) => Promise<void> | void;
+  onAttachToChat?: (path: string) => void;
   searchResults?: SearchMatch[];
+  error?: string | null;
   isConnected: boolean;
   className?: string;
 }
@@ -82,7 +84,8 @@ const TreeNode: React.FC<{
   activeFile?: string;
   onSelect: (path: string) => void;
   onLoadDirectory?: (path: string) => Promise<void> | void;
-}> = ({ node, depth, activeFile, onSelect, onLoadDirectory }) => {
+  onAttachToChat?: (path: string) => void;
+}> = ({ node, depth, activeFile, onSelect, onLoadDirectory, onAttachToChat }) => {
   const [isExpanded, setIsExpanded] = useState(node.expanded ?? false);
   const [isLoading, setIsLoading] = useState(false);
 
@@ -174,6 +177,9 @@ const TreeNode: React.FC<{
           <ContextMenuItem onClick={() => node.isDir ? null : onSelect(node.path)}>
             Open
           </ContextMenuItem>
+          {!node.isDir && onAttachToChat && <ContextMenuItem onClick={() => onAttachToChat(node.path)}>
+            Attach to chat
+          </ContextMenuItem>}
           <ContextMenuItem onClick={() => navigator.clipboard.writeText(node.path)}>
             Copy Relative Path
           </ContextMenuItem>
@@ -201,6 +207,7 @@ const TreeNode: React.FC<{
               activeFile={activeFile} 
               onSelect={onSelect}
               onLoadDirectory={onLoadDirectory}
+              onAttachToChat={onAttachToChat}
             />
           ))}
         </div>
@@ -216,7 +223,9 @@ export function WorkspaceExplorer({
   onRefresh,
   onSearch,
   onLoadDirectory,
+  onAttachToChat,
   searchResults,
+  error,
   isConnected,
   className
 }: WorkspaceExplorerProps) {
@@ -271,6 +280,7 @@ export function WorkspaceExplorer({
 
       <ScrollArea className="flex-1">
         <div className="py-2">
+          {error && <p role="alert" className="mx-2 mb-2 rounded border border-destructive/30 bg-destructive/10 px-2 py-1.5 font-mono text-[10px] text-destructive">{error}</p>}
           {isSearching ? (
             <div className="px-2">
               <div className="text-[10px] text-muted-foreground mb-2 px-1 font-mono uppercase tracking-wider">
@@ -308,6 +318,7 @@ export function WorkspaceExplorer({
                   activeFile={activeFile} 
                   onSelect={onFileSelect}
                   onLoadDirectory={onLoadDirectory}
+                  onAttachToChat={onAttachToChat}
                 />
               ))}
             </div>

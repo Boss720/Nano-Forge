@@ -4,8 +4,9 @@ import {
   createDebouncedSaver,
   loadState,
   saveState,
+  STATE_VERSION,
   STORAGE_KEY,
-  type PersistedState,
+  type LegacyPersistedState,
   type StorageLike,
 } from "@/lib/persist";
 
@@ -31,7 +32,7 @@ function makeStorage(initial: Record<string, string> = {}): StorageLike & {
   return store;
 }
 
-function makeState(): Omit<PersistedState, "version"> {
+function makeState(): Omit<LegacyPersistedState, "version"> {
   const sessions: Session[] = [
     {
       id: "s1",
@@ -47,7 +48,7 @@ function makeState(): Omit<PersistedState, "version"> {
 }
 
 describe("saveState / loadState round-trip", () => {
-  it("round-trips sessions, usage and files under nanoforge.v1 with version 1", () => {
+  it("normalizes legacy session input under nanoforge.v1 with the current version", () => {
     const storage = makeStorage();
     const state = makeState();
 
@@ -55,10 +56,17 @@ describe("saveState / loadState round-trip", () => {
 
     const raw = storage.data[STORAGE_KEY];
     expect(raw).toBeDefined();
-    expect(JSON.parse(raw).version).toBe(1);
+    expect(JSON.parse(raw).version).toBe(STATE_VERSION);
 
     const loaded = loadState(storage);
-    expect(loaded).toEqual({ version: 1, ...state });
+    expect(loaded).toMatchObject({
+      version: STATE_VERSION,
+      workspaces: [{ id: "workspace-default", chats: state.sessions }],
+      activeWorkspaceId: "workspace-default",
+      activeChatId: "s1",
+      usage: state.usage,
+      files: state.files,
+    });
   });
 
   it("returns null when the key is missing", () => {
@@ -108,7 +116,11 @@ describe("persisted runs (cost dashboard, additive v1 field)", () => {
     const state = { ...makeState(), runs };
     expect(saveState(state, storage)).toBe(true);
     const loaded = loadState(storage);
-    expect(loaded).toEqual({ version: 1, ...state });
+    expect(loaded).toMatchObject({
+      version: STATE_VERSION,
+      workspaces: [{ id: "workspace-default", chats: state.sessions }],
+      runs,
+    });
     expect(loaded?.runs).toEqual(runs);
   });
 
@@ -163,7 +175,10 @@ describe("createDebouncedSaver", () => {
 
     vi.advanceTimersByTime(1);
     expect(storage.setItemCalls).toBe(1);
-    expect(loadState(storage)).toEqual({ version: 1, ...makeState() });
+    expect(loadState(storage)).toMatchObject({
+      version: STATE_VERSION,
+      workspaces: [{ id: "workspace-default", chats: makeState().sessions }],
+    });
   });
 
   it("uses a 500ms delay by default", () => {
@@ -194,5 +209,63 @@ describe("createDebouncedSaver", () => {
     saver.cancel();
     vi.advanceTimersByTime(10_000);
     expect(storage.setItemCalls).toBe(0);
+  });
+});
+
+describe("workspace migration", () => {
+  it("migrates the legacy flat sessions payload into a default workspace", () => {
+    const storage = makeStorage({
+      [STORAGE_KEY]: JSON.stringify({ version: 1, ...makeState() }),
+    });
+
+    const loaded = loadState(storage);
+
+    expect(loaded?.version).toBe(STATE_VERSION);
+    expect(loaded?.workspaces).toHaveLength(1);
+    expect(loaded?.workspaces[0]).toMatchObject({
+      id: "workspace-default",
+      name: "Default workspace",
+      chats: makeState().sessions,
+    });
+    expect(loaded?.activeWorkspaceId).toBe("workspace-default");
+    expect(loaded?.activeChatId).toBe("s1");
+  });
+
+  it("validates a new workspace payload without throwing", () => {
+    const storage = makeStorage();
+    const state = {
+      workspaces: [
+        {
+          id: "w1",
+          name: "Work",
+          createdAt: 1720000000000,
+          chats: makeState().sessions,
+        },
+      ],
+      activeWorkspaceId: "w1",
+      activeChatId: "s1",
+      usage: makeState().usage,
+      files: makeState().files,
+    };
+
+    expect(saveState(state, storage)).toBe(true);
+    expect(loadState(storage)).toMatchObject({ version: STATE_VERSION, ...state });
+  });
+
+  it("migrates version-2 workspace metadata without granting a filesystem root", () => {
+    const storage = makeStorage({
+      [STORAGE_KEY]: JSON.stringify({
+        version: 2,
+        workspaces: [{ id: "w1", name: "Work", createdAt: 1, chats: [], location: { kind: "local", hostWorkspaceId: "host-1", displayPath: "…/Work", lastOpenedAt: 1, rootPath: "C:\\private" } }],
+        activeWorkspaceId: "w1",
+        activeChatId: "",
+        usage: { input: 0, output: 0, costUsd: 0, requests: 0 },
+        files: [],
+      }),
+    });
+
+    const loaded = loadState(storage);
+    expect(loaded).toMatchObject({ version: STATE_VERSION, workspaces: [{ location: { hostWorkspaceId: "host-1", displayPath: "…/Work" } }] });
+    expect(loaded?.workspaces[0].location).not.toHaveProperty("rootPath");
   });
 });

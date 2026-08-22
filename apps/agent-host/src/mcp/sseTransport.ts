@@ -1,9 +1,12 @@
-import { EventSource } from "eventsource";
-// For Node environment without native EventSource, we might need a fetch-based approach or eventsource package.
-// Actually, vitest provides modern globals usually, or we can use standard fetch. Wait, the MCP SDK might have an SSE transport.
-// Let's implement an SSE transport adapter compatible with MCP.
 import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
+
+export interface EventSourceLike {
+  onopen?: () => void;
+  onerror?: () => void;
+  addEventListener(event: string, cb: (event: { data: string }) => void): void;
+  close(): void;
+}
 
 export interface SseMcpClientOptions {
   url: string;
@@ -17,7 +20,7 @@ export function createSseMcpTransport(options: SseMcpClientOptions): Transport {
 
 class SseTransport implements Transport {
   private _options: SseMcpClientOptions;
-  private _eventSource: EventSource | undefined;
+  private _eventSource: EventSourceLike | undefined;
   private _endpoint?: string;
   
   onclose?: () => void;
@@ -34,11 +37,11 @@ class SseTransport implements Transport {
     }
 
     return new Promise((resolve, reject) => {
-      // Use dynamic import or global EventSource if available. 
-      // Node 22 doesn't have native EventSource yet. The standard MCP TS SDK provides an SSEClientTransport.
-      // But we are asked to write an SSE/HTTP transport adapter for MCP client.
-      type EventSourceCtor = new (url: string, init?: { headers?: Record<string, string> }) => EventSource;
-      const ES = ((globalThis as typeof globalThis & { EventSource?: EventSourceCtor }).EventSource ?? EventSource) as EventSourceCtor;
+      type EventSourceCtor = new (url: string, init?: { headers?: Record<string, string> }) => EventSourceLike;
+      const ES = (globalThis as unknown as { EventSource?: EventSourceCtor }).EventSource;
+      if (!ES) {
+        throw new Error("EventSource is not defined in global environment.");
+      }
 
       const es = new ES(this._options.url, {
         headers: this._options.headers,

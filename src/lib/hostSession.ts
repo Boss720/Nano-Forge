@@ -53,6 +53,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ExecutionPlan, PlanStep, PlanStepStatus, ToolRun } from "@/types";
 import { HostClient, type HostMessage } from "@/lib/hostClient";
+import type { CommandResultFrame } from "@protocol/commands";
+import type { ExecuteCommandInput, HostWorkspaceDescriptor } from "@/lib/hostClient";
+import type { WorkspaceWriteResult } from "@protocol/workspace";
+import type { DirEntry, FileStat, SearchMatch, GitFileStatus } from "@/types/workspace";
 import {
   useBrowserPermissions,
   type BrowserPermissionDecision,
@@ -94,10 +98,16 @@ export function loadHostSettings(storage: Storage | undefined = defaultStorage()
     const raw = storage?.getItem(HOST_SETTINGS_KEY);
     if (!raw) return DEFAULT_HOST_SETTINGS;
     const parsed = JSON.parse(raw) as Partial<HostSettings>;
+    // Scrub legacy tokens if stored in localStorage
+    if (parsed.token) {
+      const { token: _, ...safe } = parsed;
+      try {
+        storage?.setItem(HOST_SETTINGS_KEY, JSON.stringify(safe));
+      } catch {}
+    }
     return {
       enabled: parsed.enabled === true,
       ...(typeof parsed.port === "number" ? { port: parsed.port } : {}),
-      ...(typeof parsed.token === "string" ? { token: parsed.token } : {}),
     };
   } catch {
     return DEFAULT_HOST_SETTINGS;
@@ -183,6 +193,16 @@ export interface HostClientLike {
   denyApproval(runId: string, stepId: string): Promise<void>;
   pauseRun(runId: string): Promise<void>;
   cancelRun(runId: string): Promise<void>;
+  readDir?(path?: string): Promise<DirEntry[]>;
+  readFile?(path: string): Promise<{ path: string; content: string; language: string; size: number }>;
+  writeFile?(path: string, content: string, options?: { expectedSha256?: string; expectedModified?: string }): Promise<WorkspaceWriteResult>;
+  stat?(path: string): Promise<FileStat>;
+  search?(query: string, options?: { caseSensitive?: boolean; includes?: string[]; maxResults?: number }): Promise<SearchMatch[]>;
+  gitStatus?(): Promise<GitFileStatus[]>;
+  watch?(): Promise<void>;
+  unwatch?(): Promise<void>;
+  selectWorkspace?(selectionToken: string): Promise<HostWorkspaceDescriptor>;
+  openWorkspace?(path: string): Promise<HostWorkspaceDescriptor>;
   toggleIntegration?(kind: "rules" | "skill" | "mcp", id: string, enabled: boolean): Promise<void>;
   invokeSubagent?(params: InvokeSubagentParams, parentId?: string): Promise<InvokeSubagentResult>;
   manageSubagents?(params: ManageSubagentsParams, callerId?: string): Promise<ManageSubagentsResult>;
@@ -197,6 +217,8 @@ export interface HostClientLike {
   dispatchPlaygroundTurn?(subagentId: string, prompt: string): Promise<any>;
   simulateAgentTurn?(subagentId: string, scenario: string): Promise<any>;
   injectAgentFailure?(subagentId: string, failureType: string, strategy?: string): Promise<any>;
+  executeCommand?(input: ExecuteCommandInput): Promise<CommandResultFrame>;
+  dispatchCommand?(input: ExecuteCommandInput): Promise<CommandResultFrame>;
 }
 
 export interface HostIntegrationsState {
@@ -269,6 +291,18 @@ export interface HostSession {
   ) => Promise<SendMessageResult | null>;
   manageSubagentsAction: (params: ManageSubagentsParams) => Promise<ManageSubagentsResult | null>;
   defineSubagent: (params: DefineSubagentParams) => Promise<DefineSubagentResult | null>;
+  executeCommand: (input: ExecuteCommandInput) => Promise<CommandResultFrame>;
+  dispatchCommand: (input: ExecuteCommandInput) => Promise<CommandResultFrame>;
+  readWorkspaceDirectory: (path?: string) => Promise<DirEntry[] | null>;
+  readWorkspaceFile: (path: string) => Promise<{ path: string; content: string; language: string; size: number } | null>;
+  writeWorkspaceFile: (path: string, content: string, options?: { expectedSha256?: string; expectedModified?: string }) => Promise<WorkspaceWriteResult | null>;
+  statWorkspaceFile: (path: string) => Promise<FileStat | null>;
+  searchWorkspace: (query: string, options?: { maxResults?: number }) => Promise<SearchMatch[] | null>;
+  workspaceGitStatus: () => Promise<GitFileStatus[] | null>;
+  watchWorkspace: () => Promise<boolean>;
+  unwatchWorkspace: () => Promise<boolean>;
+  selectWorkspace: (selectionToken: string) => Promise<HostWorkspaceDescriptor | null>;
+  openWorkspace: (path: string) => Promise<HostWorkspaceDescriptor | null>;
   manageTask: (params: ManageTaskParams) => Promise<ManageTaskResult | null>;
   createSchedule: (params: ScheduleParams) => Promise<ScheduleResult | null>;
   cancelSchedule: (scheduleId: string) => Promise<ManageTaskResult | null>;
@@ -1156,6 +1190,77 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
     [],
   );
 
+  const executeCommand = useCallback(
+    async (input: ExecuteCommandInput): Promise<CommandResultFrame> => {
+      const client = clientRef.current;
+      const execute = client?.executeCommand ?? client?.dispatchCommand;
+      if (!execute) {
+        return {
+          type: "command.result",
+          command: input.command,
+          success: false,
+          error: "Host does not support command execution",
+          data: { code: "unsupported_capability" },
+        };
+      }
+      try {
+        return await execute.call(client, input);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setLastError(message);
+        throw err;
+      }
+    },
+    [],
+  );
+
+  const dispatchCommand = useCallback(
+    (input: ExecuteCommandInput): Promise<CommandResultFrame> => executeCommand(input),
+    [executeCommand],
+  );
+
+  const withWorkspaceClient = useCallback(async <T,>(operation: (client: HostClientLike) => Promise<T>): Promise<T | null> => {
+    const client = clientRef.current;
+    if (!client) return null;
+    try {
+      return await operation(client);
+    } catch (err) {
+      setLastError(err instanceof Error ? err.message : String(err));
+      return null;
+    }
+  }, []);
+
+  const readWorkspaceDirectory = useCallback((path = "") => withWorkspaceClient((client) =>
+    client.readDir ? client.readDir(path) : Promise.reject(new Error("Host does not support workspace directory reads")),
+  ), [withWorkspaceClient]);
+  const readWorkspaceFile = useCallback((path: string) => withWorkspaceClient((client) =>
+    client.readFile ? client.readFile(path) : Promise.reject(new Error("Host does not support workspace file reads")),
+  ), [withWorkspaceClient]);
+  const writeWorkspaceFile = useCallback((path: string, content: string, options?: { expectedSha256?: string; expectedModified?: string }) => withWorkspaceClient((client) =>
+    client.writeFile ? client.writeFile(path, content, options) : Promise.reject(new Error("Host does not support reviewed workspace writes")),
+  ), [withWorkspaceClient]);
+  const statWorkspaceFile = useCallback((path: string) => withWorkspaceClient((client) =>
+    client.stat ? client.stat(path) : Promise.reject(new Error("Host does not support workspace file stats")),
+  ), [withWorkspaceClient]);
+  const searchWorkspace = useCallback((query: string, options?: { maxResults?: number }) => withWorkspaceClient((client) =>
+    client.search ? client.search(query, options) : Promise.reject(new Error("Host does not support workspace search")),
+  ), [withWorkspaceClient]);
+  const workspaceGitStatus = useCallback(() => withWorkspaceClient((client) =>
+    client.gitStatus ? client.gitStatus() : Promise.reject(new Error("Host does not support Git status")),
+  ), [withWorkspaceClient]);
+  const watchWorkspace = useCallback(async () => (await withWorkspaceClient((client) =>
+    client.watch ? client.watch() : Promise.reject(new Error("Host does not support workspace watching")),
+  )) !== null, [withWorkspaceClient]);
+  const unwatchWorkspace = useCallback(async () => (await withWorkspaceClient((client) =>
+    client.unwatch ? client.unwatch() : Promise.reject(new Error("Host does not support workspace watching")),
+  )) !== null, [withWorkspaceClient]);
+  const selectWorkspace = useCallback((selectionToken: string) => withWorkspaceClient((client) =>
+    client.selectWorkspace ? client.selectWorkspace(selectionToken) : Promise.reject(new Error("This local host cannot open folders yet")),
+  ), [withWorkspaceClient]);
+  const openWorkspace = useCallback((path: string) => withWorkspaceClient((client) =>
+    client.openWorkspace ? client.openWorkspace(path) : client.selectWorkspace ? client.selectWorkspace(path) : Promise.reject(new Error("This local host cannot open folders yet")),
+  ), [withWorkspaceClient]);
+
   const manageTask = useCallback(
     async (params: ManageTaskParams): Promise<ManageTaskResult | null> => {
       const client = clientRef.current;
@@ -1243,7 +1348,7 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
       try {
         const res = await client.setSharedMemory({
           key,
-          value,
+          value: value as any,
           namespace,
           ttlSeconds,
           tags,
@@ -1409,6 +1514,18 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
     sendAgentMessage,
     manageSubagentsAction,
     defineSubagent,
+    executeCommand,
+    dispatchCommand,
+    readWorkspaceDirectory,
+    readWorkspaceFile,
+    writeWorkspaceFile,
+    statWorkspaceFile,
+    searchWorkspace,
+    workspaceGitStatus,
+    watchWorkspace,
+    unwatchWorkspace,
+    selectWorkspace,
+    openWorkspace,
     manageTask,
     createSchedule,
     cancelSchedule,

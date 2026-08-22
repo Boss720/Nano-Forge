@@ -819,8 +819,7 @@ describe("RunCoordinator Adversarial & Stress Testing", () => {
       for (const ev of events) {
         expect(Object.isFrozen(ev)).toBe(true);
         expect(() => {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          (ev as any).mutated = true;
+          (ev as Record<string, unknown>).mutated = true;
         }).toThrow();
       }
     });

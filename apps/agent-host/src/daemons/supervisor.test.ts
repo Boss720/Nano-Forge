@@ -119,10 +119,16 @@ describe("DaemonSupervisor", () => {
       isDaemon: false,
     });
 
+    await new Promise((r) => setTimeout(r, 200));
+
     const sendRes = await supervisor.sendInput(task.taskId, "ping-input");
     expect(sendRes.success).toBe(true);
 
-    await new Promise((r) => setTimeout(r, 600));
+    for (let i = 0; i < 25; i++) {
+      const updated = supervisor.getTask(task.taskId);
+      if (updated?.recentLogs?.includes("ECHO:ping-input")) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
 
     const updated = supervisor.getTask(task.taskId);
     expect(updated?.recentLogs).toContain("ECHO:ping-input");
