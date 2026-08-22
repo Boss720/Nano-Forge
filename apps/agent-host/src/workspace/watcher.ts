@@ -1,5 +1,6 @@
 import chokidar from 'chokidar';
 import path from 'node:path';
+import { isSensitiveWorkspacePath, SENSITIVE_WORKSPACE_GLOB_PATTERNS } from './sensitivePath.js';
 
 export interface WatcherOptions {
   workspaceRoot: string;
@@ -15,7 +16,15 @@ export type FileChangeEvent = {
 export type WatcherCallback = (event: FileChangeEvent) => void;
 
 export function createWorkspaceWatcher(options: WatcherOptions, callback: WatcherCallback): { close: () => Promise<void> } {
-  const ignored = options.ignored ?? ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/.nanoforge/runs/**'];
+  const ignored = [
+    ...(options.ignored ?? [
+    '**/node_modules/**',
+    '**/.git/**',
+    '**/dist/**',
+    '**/.nanoforge/runs/**',
+    ]),
+    ...SENSITIVE_WORKSPACE_GLOB_PATTERNS,
+  ];
   const debounceMs = options.debounceMs ?? 300;
 
   const watcher = chokidar.watch(options.workspaceRoot, {
@@ -30,6 +39,7 @@ export function createWorkspaceWatcher(options: WatcherOptions, callback: Watche
     const relativePath = path.relative(options.workspaceRoot, absolutePath);
     // Use forward slashes for cross-platform consistency if needed, but relativePath usually uses path.sep
     const normalizedPath = relativePath.split(path.sep).join('/');
+    if (!normalizedPath || isSensitiveWorkspacePath(normalizedPath)) return;
 
     const eventKey = `${changeType}:${normalizedPath}`;
 

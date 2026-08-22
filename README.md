@@ -1,275 +1,128 @@
 # NanoForge
 
-> **High-Assurance Agentic Workspace & Autonomous Swarm Platform**
+NanoForge is an independently developed, local-first coding workbench candidate for NanoGPT users. It combines a React/Vite browser UI with an optional loopback agent host, shared TypeScript protocol/core packages, and a programmatic SDK.
 
-NanoForge is an enterprise-grade agentic workbench and multi-agent swarm orchestration platform engineered for high assurance, deterministic sandboxing, and seamless embedding into [`nano-gpt.com`](https://nano-gpt.com).
+## Current status
 
----
+This repository is a technical-evaluation candidate, not an official NanoGPT product or partnership. The verifiable integration in the UI is a browser-direct OpenAI-compatible API path:
 
-## 1. System Architecture
+- `GET https://nano-gpt.com/api/v1/models` for a live catalog when the user connects a key.
+- `POST https://nano-gpt.com/api/v1/chat/completions` with `stream: true` and OpenAI-style SSE frames.
+- `POST .../generate-image` exists in code, but its live response contract is not verified here.
 
-NanoForge is organized as an isomorphic TypeScript monorepo with clean separation between wire schemas, agent kernel execution, host orchestration daemons, visual workbench docks, and client SDKs.
+The following are not claims made by this repository: official affiliation or endorsement, seamless embedding into NanoGPT, hosted multi-tenant service, or a first-class host-routed NanoGPT provider. The optional local host and SDK are local control-plane surfaces; they do not automatically route the browser chat path through NanoGPT.
 
-```
-┌────────────────────────────────────────────────────────┐
-│              Frontend Workbench (src/)                 │
-│   (AppLayout, SessionManager, Connection, VoiceHUD)    │
-│   (Swarm Tree, Mailbox, Tool Inspector, Daemons)       │
-└──────────────────────────┬─────────────────────────────┘
-                           │ WebSocket / REST (ws://127.0.0.1:4040/ws)
-                           ▼
-┌────────────────────────────────────────────────────────┐
-│            Agent Host Daemon (apps/agent-host)         │
-│  Fastify WS ── Session ── Policy Engine ── PTY/Daemons │
-│     │               │                              │   │
-│     ▼               ▼                              ▼   ▼   │
-│ Audit Ledger    Supervisor                     Subagents│
-└──────────────────────────┬─────────────────────────────┘
-                           │
-                           ▼
-┌────────────────────────────────────────────────────────┐
-│               Shared Protocol & SDK                    │
-│   packages/protocol (Zod) ── packages/core (ReAct)     │
-│   packages/sdk (@nanoforge/sdk client)                 │
-└────────────────────────────────────────────────────────┘
+## What is here
+
+The browser workbench supports model selection, streaming chat, a demo mode, local transcript/workspace persistence, reviewable diff-style output, and optional host-backed workspace/agent surfaces. The host and SDK have typed WebSocket and provider-adapter code, with automated tests, but a live NanoGPT end-to-end run is still an integration item for a pilot.
+
+The source manifests currently use version `0.1.0`. Files under `release/` are not treated as a current release or compatibility proof; release provenance is documented in [known limitations](docs/known-limitations.md).
+
+## Architecture
+
+```text
+Browser React/Vite UI
+  ├─ direct HTTPS → NanoGPT OpenAI-compatible API
+  │                  /models, /chat/completions
+  └─ optional WebSocket → local Fastify agent host
+                          /agent?token=... (canonical)
+                              └─ protocol, workspace, tools, runs, providers
+
+Shared packages: protocol schemas · core provider/agent abstractions · SDK client
 ```
 
-### Workspace Packages
+Key areas:
 
-| Package | Path | Description |
-|---|---|---|
-| **`@nanoforge/protocol`** | `packages/protocol/` | Isomorphic TypeScript definitions, Zod wire schemas, 7-state subagent FSM, tool definitions, and 5-field cron parsing engine. Zero native Node dependencies. |
-| **`@nanoforge/core`** | `packages/core/` | Headless autonomous ReAct agent kernel, streaming LLM provider adapters, cancellation tree, and context compaction. |
-| **`@nanoforge/sdk`** | `packages/sdk/` | Programmatic isomorphic TypeScript client SDK for embedding NanoForge capabilities into external platforms and `nano-gpt.com`. |
-| **`@nanoforge/agent-host`** | `apps/agent-host/` | Fastify HTTP/WebSocket server running local agent orchestration, daemon task supervisor, PTY terminal multiplexer, policy approval engine, and append-only SQLite audit ledger. |
-| **Frontend UI** | `src/` | React 19 web/desktop workbench featuring modular docks (Chat, Monaco Diff Viewer, Terminal, Subagents Swarm Tree, Artifacts, Voice HUD). |
-| **Release & Tools** | `scripts/` | Standalone launcher (`nanoforge-launcher.cjs`), Windows Single Executable Application builder (`build-exe.js`), and automated release packager (`package-release.js`). |
+| Area | Location | Role |
+| --- | --- | --- |
+| Browser API client | `src/lib/nanogpt.ts` | Direct NanoGPT model, chat-stream, and image request code. |
+| Browser workbench | `src/`, `src/App.tsx` | React UI, demo/live orchestration, persistence, review surfaces. |
+| Local host | `apps/agent-host/` | Optional loopback Fastify/WebSocket control plane and workspace runtime. |
+| Shared contracts | `packages/protocol/` | Wire schemas and state contracts. |
+| Agent/provider core | `packages/core/` | Provider adapters and agent-loop building blocks. |
+| SDK | `packages/sdk/` | Typed client for the local host WebSocket protocol. |
 
----
+The host has a generic OpenAI-compatible adapter configured through host options/environment. Its default provider URL is intentionally inert until configured; the browser's NanoGPT key and URL are not forwarded into the host automatically. The core provider registry also has no `nanogpt` entry.
 
-## 2. Quickstart & Installation
+## Run locally
 
-### Prerequisites
-- **Node.js**: `>= 20.0.0` (LTS recommended)
-- **pnpm**: `>= 9.0.0` (`pnpm` is the exclusive package manager)
+Prerequisites:
 
-### Setup
-```bash
-# Clone the repository
-git clone https://github.com/bosscube1/nano-forge.git
-cd nano-forge
+- Node.js 20 or newer.
+- pnpm 9.15.4 (the repository declares pnpm 9.15.4 as its package manager).
+- A modern browser. A NanoGPT API key is needed only for a live provider check; demo mode does not need credentials.
 
-# Install monorepo dependencies
-pnpm install
+Install and start the browser workbench:
 
-# Run typechecks and build all packages
-pnpm build:all
-```
-
-### Development
-```bash
-# Start Vite frontend development server (http://localhost:5173)
+```powershell
+pnpm install --frozen-lockfile
 pnpm dev
+```
 
-# Start Fastify Agent Host daemon (http://127.0.0.1:4040)
+Open `http://localhost:3000`. For a live request, use the Connect UI, keep the default base URL `https://nano-gpt.com/api/v1`, enter a key, validate the connection, and select a returned model. The browser must be allowed to make the cross-origin request; a CORS failure is not evidence of provider incompatibility. For a credential-free walkthrough, use Demo mode and label the output as simulated.
+
+The optional local host can be started separately. It chooses an ephemeral port unless `PORT` is set and prints a single-use token on startup:
+
+```powershell
+$env:PORT = "4040"
 pnpm start:host
-
-# Run frontend and host simultaneously
-pnpm turbo:build
 ```
 
----
+The canonical host URL is `ws://127.0.0.1:4040/agent?token=<token>`; `/ws` is also registered for compatibility. Do not expose the host publicly. Workspace writes are disabled by default; only enable `NANOFORGE_ALLOW_WORKSPACE_WRITES=1` for a deliberately trusted local evaluation, with a disposable workspace.
 
-## 3. Standalone Launcher & CLI Usage
+## Security and write boundaries
 
-NanoForge includes a zero-dependency dual launcher (`scripts/nanoforge-launcher.cjs`) that hosts the frontend static UI and spawns the background Fastify agent host.
+- Browser API keys are held in the live application state for requests. The connection loader removes legacy `apiKey` values from `localStorage`; only non-secret connection settings such as the base URL may be retained. This is browser-memory handling, not a secure vault.
+- Chat/workspace state and usage data are persisted locally. Treat the browser profile and any connected page as sensitive while a key is active.
+- The host binds to loopback by default, authenticates WebSockets with registered single-use tokens, validates message schemas, and confines workspace operations to a validated root.
+- Host workspace writes fail closed unless explicitly enabled and are checked against an expected file version. Read/search/terminal/subagent behavior still needs evaluation against the intended threat model before distribution.
+- No hosted tenancy, remote isolation, account authorization flow, or production secret-management service is included in this repository.
 
-```bash
-# Start standalone launcher
-pnpm start:launcher
+## Verification
 
-# Custom ports and token configuration
-node scripts/nanoforge-launcher.cjs --port 5000 --host-port 5001 --token my-custom-token --no-open
-```
+These commands are the repository's available checks and do not require NanoGPT credentials:
 
-### Launcher CLI Options
-
-| Flag | Default | Description |
-|---|---|---|
-| `--port <number>`, `--port=<number>` | `4173` | UI HTTP server port |
-| `--host-port <number>`, `--host-port=<number>` | `4174` | Agent Host backend port |
-| `--token <string>`, `--token=<string>` | Auto-generated | 192-bit cryptographic authentication token |
-| `--no-open` | `false` | Prevent opening the browser automatically |
-| `--dry-run` | `false` | Validate configurations and exit without binding ports |
-| `--help`, `-h` | — | Display CLI usage reference |
-
-### Building Distribution Packages & Windows Executable
-
-```bash
-# Compile standalone Windows binary (NanoForge.exe via Node SEA)
-pnpm build:exe
-
-# Assemble complete release package zip (release/NanoForge-v*-windows-x64.zip)
-pnpm package
-```
-
----
-
-## 4. Agent Host Endpoints & WebSocket Protocol
-
-### HTTP Endpoints
-
-- **`GET /health`**
-  Returns operational status and subsystem metrics.
-  ```json
-  {
-    "status": "healthy",
-    "version": "0.1.0",
-    "uptime": 124.5,
-    "pid": 14200,
-    "subsystems": {
-      "subagents": { "active": 2, "maxConcurrency": 8 },
-      "daemons": { "active": 1 },
-      "memory": { "heapUsedMB": 42.1, "rssMB": 89.4 }
-    }
-  }
-  ```
-
-- **`POST /api/session`**
-  Initializes an agent execution session with security tokens.
-
-- **`GET /api/audit`**
-  Streams append-only SQLite audit ledger event logs for security auditing.
-
-### WebSocket Interface
-
-- **Endpoint**: `ws://127.0.0.1:4040/ws?token=<crypto_token>`
-- **Authentication**: Validated against active token in query string.
-- **Wire Framing**: JSON payloads strictly validated against `@nanoforge/protocol` Zod schemas (`clientMessageSchema`, `hostMessageSchema`).
-- **Close Codes**:
-  - `4401`: Unauthorized Origin or Invalid Token
-  - `4400`: Protocol Schema Violation
-  - `1000`: Graceful Termination / Normal Closure
-
----
-
-## 5. Environment Variables & Configuration
-
-| Variable | Default | Description |
-|---|---|---|
-| `HOST` / `BIND_ADDRESS` | `127.0.0.1` | Network interface to bind HTTP and WebSocket servers (set to `0.0.0.0` for containerized deployments). |
-| `PORT` | `4040` | Port for Fastify agent host server. |
-| `NANOFORGE_AUTH_TOKEN` | Generated | Pre-shared token override for headless automation. |
-| `NANOFORGE_WORKSPACE_ROOT` | Current working directory | Root directory where agent file operations are confined. |
-| `LOG_LEVEL` | `info` | Pino structured logger level (`debug`, `info`, `warn`, `error`, `silent`). |
-| `ALLOWED_ORIGINS` / `CORS_ORIGIN` | `http://127.0.0.1:*, http://localhost:*` | Comma-separated list of allowed origins for WebSocket and CORS headers. |
-| `MAX_SUBAGENT_DEPTH` | `3` | Maximum hierarchical supervision depth (`SEC-SUB-05`). |
-| `MAX_CONCURRENT_SUBAGENTS` | `8` | Maximum active concurrent subagents throttle. |
-
----
-
-## 6. Security Model & Invariants
-
-NanoForge implements defense-in-depth access controls across all execution layers:
-
-1. **Path Confinement & Anti-Traversal (`SEC-SUB-01`)**:
-   - Every file operation resolves canonical paths with `fs.realpathSync`.
-   - Prevents directory traversal (`..`, `%2e%2e`), symlink escapes, and Windows case-sensitivity path bypasses.
-   - Restricts subagent file modifications strictly to their allocated workspace bounds (`.agents/<id>/` in `inherit` mode, or dedicated Git worktrees in `branch` mode).
-
-2. **Mailbox Access Control (`SEC-SUB-03`)**:
-   - Subagents can only transmit mailbox messages to their direct parent, direct children, or sibling subagents under the same parent.
-   - Cross-tree message passing is rejected with `ERR_SUBAGENT_UNAUTHORIZED_RECIPIENT`.
-
-3. **Hierarchy Depth & Concurrency Bounds (`SEC-SUB-05`)**:
-   - Subagent supervision trees are capped at depth $\le 3$ to eliminate fork bombs.
-   - Active concurrent agent count is throttled to $\le 8$.
-
-4. **Token Budget Metering (`SEC-SUB-04`)**:
-   - Enforces per-agent token limits. Breaching quotas triggers the 5-rung failure escalation protocol (`Retry` $\to$ `Replace` $\to$ `Skip` $\to$ `Redistribute` $\to$ `Degrade`).
-
-5. **XSS & Content Security Isolation**:
-   - Mermaid diagrams render inside isolated sandboxes with strict DOMPurify sanitization.
-   - Content Security Policy (CSP) headers block untrusted script execution.
-
-6. **Credential Protection**:
-   - API keys and crypto tokens are stored in ephemeral memory and never written to plain-text browser `localStorage`.
-
----
-
-## 7. Programmatic SDK Integration (`@nanoforge/sdk`)
-
-The `@nanoforge/sdk` package provides a typed client library for integrating NanoForge into web applications and programmatic backend workflows.
-
-```typescript
-import { NanoForgeClient } from '@nanoforge/sdk';
-
-// 1. Initialize client connection
-const client = new NanoForgeClient({
-  hostUrl: 'ws://127.0.0.1:4040/ws',
-  token: process.env.NANOFORGE_AUTH_TOKEN,
-  autoReconnect: true,
-});
-
-await client.connect();
-
-// 2. Create and stream an agent session
-const session = await client.createSession({
-  workspaceRoot: '/path/to/project',
-});
-
-const plan = {
-  id: 'plan_1',
-  goal: 'Run test suite and optimize bundle',
-  tasks: [
-    { id: 'task_1', title: 'Run vitest', tool: 'run_command', args: { command: 'pnpm test' } },
-  ],
-};
-
-for await (const event of client.streamRun(plan)) {
-  console.log(`[Event ${event.type}]`, event.payload);
-}
-
-// 3. Graceful disconnection
-await client.disconnect();
-```
-
----
-
-## 8. Testing & Verification
-
-NanoForge includes extensive test coverage across unit, component, integration, and adversarial suites.
-
-```bash
-# Run pure protocol schema tests (packages/protocol)
-pnpm test:protocol
-
-# Run Fastify agent host, daemon, and policy tests (apps/agent-host)
-pnpm test:host
-
-# Run core ReAct agent kernel tests (packages/core)
-pnpm test:core
-
-# Run SDK client tests (packages/sdk)
-pnpm test:sdk
-
-# Run frontend React workbench tests (src/)
+```powershell
+pnpm lint
+pnpm typecheck
 pnpm test
-
-# Run end-to-end integration tests (tests/e2e/)
-pnpm test:e2e
-
-# Run all test suites across monorepo in parallel via Turbo
 pnpm test:all
-
-# Typecheck and build production bundle
-pnpm typecheck:all
+pnpm test:sdk
+pnpm test:host
 pnpm build
 ```
 
----
+Passing local tests prove repository behavior and mocked/provider-adapter contracts only. A live NanoGPT check must be opt-in, keep credentials outside source control, and record no secret values.
 
-## 9. License
+## Before presenting to NanoGPT
 
-Proprietary and Confidential. Copyright &copy; 2026 NanoForge / nano-gpt.com. All rights reserved.
+- [ ] Say “independent local-first companion candidate,” not official integration or partnership.
+- [ ] Use a disposable sample workspace and confirm Demo mode is clearly labelled if no live key is available.
+- [ ] Confirm the browser API base URL, selected model, catalog freshness, and CORS path.
+- [ ] Keep the API key out of source control, screenshots, URLs, logs, and recordings.
+- [ ] If showing the local host, show its loopback address and one-use token flow; do not expose it to the network.
+- [ ] Do not present host-routed NanoGPT execution, hosted tenancy, a release archive, or live compatibility as already proven.
+- [ ] Have the verification output and [known limitations](docs/known-limitations.md) available.
 
+## 3–5 minute demo outline
+
+1. **0:00–0:30 — Positioning:** independent local-first companion candidate; state the browser-direct integration boundary.
+2. **0:30–1:00 — Readiness:** show Demo mode or a live NanoGPT connection, selected model, and disposable workspace.
+3. **1:00–2:15 — Core loop:** provide a bounded coding request, show context, streamed response, plan/tool visibility, and the generated diff.
+4. **2:15–3:15 — Review:** inspect the change, show verification evidence, and apply only within the disposable workspace if the host write path is intentionally enabled.
+5. **3:15–4:00 — Boundaries:** show local persistence, optional loopback host/SDK, and the explicit limitations.
+6. **4:00–5:00 — Ask:** propose a technical pilot, adapter contract tests, or a companion-app integration discussion.
+
+## Collaboration request
+
+We would like NanoGPT’s guidance on a focused technical pilot: validate the `/models` and streaming chat contracts, capability/pricing/usage fields, authentication and CORS expectations, and error behavior. A useful first milestone could be one of:
+
+- a NanoGPT adapter contract-test suite that both sides can run without sharing credentials;
+- an agreed host/provider adapter contract for a first-class NanoGPT route; or
+- a local companion-app pilot with explicit branding, security, and support boundaries.
+
+See [technical overview](docs/technical-overview.md), [known limitations](docs/known-limitations.md), and the [local SDK guide](docs/sdk-integration.md).
+
+## License
+
+The repository does not make an approved NanoGPT licensing or ownership claim. Confirm the intended license and branding language before public distribution.

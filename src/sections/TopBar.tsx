@@ -1,5 +1,7 @@
-import { BarChart3, Download, Image, KeyRound, Layers, Network, Palette, PanelLeft, PanelRight, Settings, Zap } from "lucide-react";
+import { BarChart3, Download, HardDrive, Image, KeyRound, Layers, Network, Palette, PanelLeft, PanelRight, Settings, Zap } from "lucide-react";
 import type { ConnectionState, UsageTotals } from "@/types";
+
+export type RuntimeStatus = "ready" | "connecting" | "error" | "offline" | "unavailable" | "no-workspace";
 
 interface Props {
   connection: ConnectionState;
@@ -23,6 +25,8 @@ interface Props {
   subagentCount?: number;
   /** Milestone 4: open theme customizer dialog */
   onOpenTheme?: () => void;
+  /** Local host/workspace health, kept separate from the NanoGPT API state. */
+  runtimeStatus: RuntimeStatus;
 }
 
 export function TopBar({
@@ -40,8 +44,25 @@ export function TopBar({
   onOpenSubagents,
   subagentCount = 0,
   onOpenTheme,
+  runtimeStatus,
 }: Props) {
   const connected = connection.status === "connected";
+  const apiLabel = connection.status === "connected"
+    ? "API live"
+    : connection.status === "checking"
+      ? "API checking…"
+      : connection.status === "error"
+        ? "API error"
+        : "API demo";
+  const runtimeLabel = {
+    ready: "Runtime ready",
+    connecting: "Host connecting",
+    error: "Host error",
+    offline: "Host offline",
+    unavailable: "Workspace unavailable",
+    "no-workspace": "No workspace",
+  }[runtimeStatus];
+  const runtimeHealthy = runtimeStatus === "ready";
   return (
     <header className="flex h-12 shrink-0 items-center gap-4 border-b border-border bg-card px-4">
       {/* Task 3.2: sessions/workspace drawer trigger — below lg only */}
@@ -75,7 +96,7 @@ export function TopBar({
       >
         <Zap className="h-3.5 w-3.5 text-primary" />
         <span className="font-mono text-[11px] text-foreground/90">Nano-GPT Subscription</span>
-        <span className="micro-label normal-case tracking-normal group-hover:text-primary">1 key → 1,104 models</span>
+        <span className="micro-label normal-case tracking-normal group-hover:text-primary">1 key → live catalog</span>
       </a>
 
       <div className="flex-1" />
@@ -166,8 +187,18 @@ export function TopBar({
         />
         <KeyRound className="h-3.5 w-3.5 text-muted-foreground" />
         <span className="hidden font-mono text-[11px] text-foreground/80 sm:inline">
-          {connected ? "key active" : connection.status === "checking" ? "checking…" : "demo mode"}
+          {apiLabel}
         </span>
+      </div>
+
+      <div
+        className="flex items-center gap-2 rounded-md border border-border bg-secondary/60 px-2.5 py-1.5"
+        title="Local host and active workspace runtime status"
+        aria-label={`Local runtime: ${runtimeLabel}`}
+      >
+        <span className={`h-1.5 w-1.5 rounded-full ${runtimeHealthy ? "bg-emerald-400" : runtimeStatus === "connecting" ? "pulse-dot bg-primary" : "bg-muted-foreground/50"}`} />
+        <HardDrive className="h-3.5 w-3.5 text-muted-foreground" />
+        <span className="hidden font-mono text-[11px] text-foreground/80 sm:inline">{runtimeLabel}</span>
       </div>
 
       {/* Task 3.2: model-catalog drawer trigger — below lg only */}

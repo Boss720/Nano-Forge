@@ -45,6 +45,15 @@ describe('workspace filesystem', () => {
     it('blocks path traversal', async () => {
       await expect(handleReadDir(tmpDir, '../')).rejects.toThrow();
     });
+
+    it('does not list sensitive files while keeping ordinary source entries visible', async () => {
+      await fs.writeFile(path.join(tmpDir, '.env.local'), 'API_TOKEN=do-not-leak', 'utf8');
+      await fs.writeFile(path.join(tmpDir, 'credentials.json'), '{}', 'utf8');
+
+      const entries = await handleReadDir(tmpDir, '.');
+      expect(entries.map((entry) => entry.name)).not.toEqual(expect.arrayContaining(['.env.local', 'credentials.json']));
+      expect(entries.map((entry) => entry.name)).toContain('README.md');
+    });
   });
 
   describe('handleReadFile', () => {
@@ -82,6 +91,13 @@ describe('workspace filesystem', () => {
 
       await expect(handleReadFile(tmpDir, 'large.txt')).rejects.toThrow('File too large (exceeds 1MB limit)');
     });
+
+    it.each(['.env', '.env.production', '.ssh/id_ed25519', '.aws/credentials', 'service-account.json'])('denies sensitive read path %s', async (relativePath) => {
+        const target = path.join(tmpDir, ...relativePath.split('/'));
+        await fs.mkdir(path.dirname(target), { recursive: true });
+        await fs.writeFile(target, 'secret', 'utf8');
+        await expect(handleReadFile(tmpDir, relativePath)).rejects.toMatchObject({ code: 'path_outside_workspace' });
+      });
   });
 
   describe('handleWriteFile', () => {
@@ -122,6 +138,12 @@ describe('workspace filesystem', () => {
       await expect(handleWriteFile(tmpDir, 'large.txt', 'x'.repeat(1024 * 1024 + 1)))
         .rejects.toMatchObject({ code: 'file_too_large' });
     });
+
+    it('denies writes to sensitive paths, including files that do not exist yet', async () => {
+      await expect(handleWriteFile(tmpDir, '.env.local', 'TOKEN=secret'))
+        .rejects.toMatchObject({ code: 'path_outside_workspace' });
+      await expect(fs.access(path.join(tmpDir, '.env.local'))).rejects.toThrow();
+    });
   });
 
   describe('handleStat', () => {
@@ -131,6 +153,11 @@ describe('workspace filesystem', () => {
       expect(stat.isDir).toBe(false);
       expect(stat.size).toBeGreaterThan(0);
       expect(stat.modified).toBeDefined();
+    });
+
+    it('denies stat of sensitive paths without revealing whether they exist', async () => {
+      await fs.writeFile(path.join(tmpDir, '.npmrc'), '//registry.example/:_authToken=secret', 'utf8');
+      await expect(handleStat(tmpDir, '.npmrc')).rejects.toMatchObject({ code: 'path_outside_workspace' });
     });
   });
 
@@ -152,6 +179,21 @@ describe('workspace filesystem', () => {
         matchText: 'hello',
       });
     });
+
+    it('filters sensitive search results even when ripgrep returns them', async () => {
+      vi.mocked(execa).mockResolvedValue({
+        stdout: [
+          JSON.stringify({ type: 'match', data: { path: { text: '.env' }, line_number: 1, submatches: [{ match: { text: 'TOKEN' }, start: 0 }], lines: { text: 'TOKEN=secret\n' } } }),
+          JSON.stringify({ type: 'match', data: { path: { text: 'src/index.ts' }, line_number: 1, submatches: [{ match: { text: 'hello' }, start: 13 }], lines: { text: 'hello\n' } } }),
+        ].join('\n'),
+      } as never);
+
+      const matches = await handleSearch(tmpDir, 'hello');
+      expect(matches.map((match) => match.file)).toEqual(['src/index.ts']);
+      const args = vi.mocked(execa).mock.calls.at(-1)?.[1] as string[];
+      expect(args).toContain('--glob');
+      expect(args).toContain('!**/.env');
+    });
   });
 
   describe('handleGitStatus', () => {
@@ -165,6 +207,15 @@ describe('workspace filesystem', () => {
       expect(status[0]).toEqual({ path: 'src/index.ts', status: 'M' });
       expect(status[1]).toEqual({ path: 'new-file.txt', status: '?' });
       expect(status[2]).toEqual({ path: 'deleted.js', status: 'D' });
+    });
+
+    it('does not expose sensitive paths in Git status', async () => {
+      vi.mocked(execa).mockResolvedValue({
+        stdout: ` M .env\n M src/index.ts\n?? credentials.json`,
+      } as never);
+
+      const status = await handleGitStatus(tmpDir);
+      expect(status).toEqual([{ path: 'src/index.ts', status: 'M' }]);
     });
   });
 });

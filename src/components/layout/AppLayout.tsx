@@ -13,7 +13,7 @@ import type {
   WorkspaceLocation,
 } from "@/types";
 import type { FileTreeNode } from "@/types/workspace";
-import { TopBar } from "@/sections/TopBar";
+import { TopBar, type RuntimeStatus } from "@/sections/TopBar";
 import { Sidebar } from "@/sections/Sidebar";
 import { WorkspaceExplorer } from "@/sections/WorkspaceExplorer";
 import { useWorkspace } from "@/hooks/use-workspace";
@@ -262,6 +262,17 @@ export function AppLayout({
   const activeWorkspace = workspaces.find((workspace) => workspace.id === activeWorkspaceId);
   const persistedHostWorkspace = activeWorkspace?.location?.status === "ready";
   const hasHostWorkspace = host.status === "connected" && (persistedHostWorkspace || openedWorkspace !== null);
+  const runtimeStatus: RuntimeStatus = host.status === "off"
+    ? "offline"
+    : host.status === "connecting"
+      ? "connecting"
+      : host.status === "error"
+        ? "error"
+        : hasHostWorkspace
+          ? "ready"
+          : activeWorkspace?.location
+            ? "unavailable"
+            : "no-workspace";
   const workspaceClient = useMemo(() => hasHostWorkspace ? {
     readDir: async (path = "") => {
       const result = await host.readWorkspaceDirectory(path);
@@ -486,6 +497,7 @@ export function AppLayout({
             host.subagents.filter((a) => a.state === "running").length || host.subagents.length
           }
           onOpenTheme={() => setThemeOpen(true)}
+          runtimeStatus={runtimeStatus}
         />
       </ErrorBoundary>
 

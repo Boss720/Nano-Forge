@@ -129,9 +129,9 @@ export function ConnectDialog({
           <>
             <div className="space-y-4 px-4 py-4">
               <p className="text-[12.5px] leading-relaxed text-muted-foreground">
-                Your <span className="text-foreground">Nano-GPT subscription</span> key unlocks the full catalog —
-                656 text, 198 image, 143 video models — through one OpenAI-compatible endpoint. The key stays in this
-                browser's local storage; requests go straight from your machine to nano-gpt.com.
+                Connect a <span className="text-foreground">Nano-GPT API key</span> to use its OpenAI-compatible
+                endpoint. The key is held in memory for this browser session; requests go directly from your machine
+                to the configured base URL.
               </p>
 
               <div className="space-y-1.5">

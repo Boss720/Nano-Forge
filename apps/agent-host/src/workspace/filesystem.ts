@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { execa } from 'execa';
 import { resolveWithinWorkspace } from '../policy/policy.js';
 import type { DirEntry, FileStat, SearchMatch, GitFileStatus } from '../protocol.js';
+import { isSensitiveWorkspacePath, SENSITIVE_WORKSPACE_GLOB_PATTERNS } from './sensitivePath.js';
 
 const EXT_LANG_MAP: Record<string, string> = {
   '.ts': 'typescript', '.tsx': 'typescriptreact', '.js': 'javascript', '.jsx': 'javascriptreact',
@@ -41,6 +42,9 @@ const confinedPath = (workspaceRoot: string, relativePath: string): string => {
   if (!fullPath) {
     throw new WorkspaceFileError('path_outside_workspace', 'Path is outside workspace');
   }
+  if (isSensitiveWorkspacePath(path.relative(path.resolve(workspaceRoot), fullPath))) {
+    throw new WorkspaceFileError('path_outside_workspace', 'Path is not available');
+  }
   return fullPath;
 };
 
@@ -56,6 +60,15 @@ export async function handleReadDir(workspaceRoot: string, relativePath: string)
     }
 
     const entryPath = path.join(fullPath, entry.name);
+    let inspectedPath = entryPath;
+    try {
+      inspectedPath = await fs.realpath(entryPath);
+    } catch {
+      // A concurrently removed entry is still filtered by its lexical path.
+    }
+    if (isSensitiveWorkspacePath(path.relative(path.resolve(workspaceRoot), inspectedPath))) {
+      continue;
+    }
     let size: number | undefined;
     let modified: string | undefined;
 
@@ -202,11 +215,16 @@ export async function handleSearch(workspaceRoot: string, query: string, options
     } else {
       args.push('--ignore-case');
     }
+    args.push('--glob-case-insensitive');
     
     if (options?.includes && options.includes.length > 0) {
       for (const pattern of options.includes) {
         args.push('--glob', pattern);
       }
+    }
+
+    for (const pattern of SENSITIVE_WORKSPACE_GLOB_PATTERNS) {
+      args.push('--glob', `!${pattern}`);
     }
     
     args.push(query, workspaceRoot);
@@ -224,6 +242,7 @@ export async function handleSearch(workspaceRoot: string, query: string, options
         if (parsed.type === 'match') {
           const rawPath = parsed.data.path.text;
           const file = path.isAbsolute(rawPath) ? path.relative(workspaceRoot, rawPath) : rawPath;
+          if (isSensitiveWorkspacePath(file)) continue;
           const lineNum = parsed.data.line_number;
           // Note: submatches contains an array of matches on the same line
           const matchText = parsed.data.submatches[0]?.match?.text || query;
@@ -277,10 +296,7 @@ export async function handleGitStatus(workspaceRoot: string): Promise<GitFileSta
       else if (statusCode.includes('!')) status = '!';
       else if (statusCode.includes('?')) status = '?';
 
-      statuses.push({
-        path: filePath,
-        status,
-      });
+      if (!isSensitiveWorkspacePath(filePath)) statuses.push({ path: filePath, status });
     }
 
     return statuses;

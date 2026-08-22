@@ -169,8 +169,8 @@ function EmptyState({ onPick, connected }: { onPick: (t: string) => void; connec
       </svg>
       <h1 className="mt-4 font-mono text-[15px] font-bold tracking-[0.2em] text-foreground">FORGE A CHANGE</h1>
       <p className="mt-2 text-[13px] leading-relaxed text-muted-foreground">
-        An agent console wired to <span className="text-foreground">nano-gpt.com</span> — one subscription key,
-        1,104 models, OpenAI-compatible streaming. {connected ? "Your key is live." : "No key yet — the demo script runs the loop for free."}
+        An agent console that can connect to <span className="text-foreground">NanoGPT's OpenAI-compatible API</span>.
+        {connected ? " Your key is live." : " No key yet — the demo script runs the loop for free."}
       </p>
       <div className="mt-6 space-y-2 text-left">
         {starters.map((s) => (

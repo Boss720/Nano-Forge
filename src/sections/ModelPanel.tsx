@@ -48,7 +48,7 @@ export function ModelPanel({ models, selected, onSelect, live, routeDecision, cl
           <input
             value={q}
             onChange={(e) => setQ(e.target.value)}
-            placeholder="search 1,104 models…"
+            placeholder="search the model catalog…"
             className="w-full bg-transparent font-mono text-[11.5px] text-foreground outline-none placeholder:text-muted-foreground/60"
           />
         </div>

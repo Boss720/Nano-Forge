@@ -85,6 +85,33 @@ describe("DaemonSupervisor", () => {
     expect(events).toContain("task.completed");
   });
 
+  it("does not inherit arbitrary host secrets, while retaining explicit task variables", async () => {
+    const secretName = "NANOFORGE_TEST_HOST_SECRET";
+    const previousSecret = process.env[secretName];
+    process.env[secretName] = "must-not-reach-child";
+    try {
+      const task = await supervisor.spawnTask({
+        command: "node",
+        args: ["-e", "console.log(JSON.stringify({secret: process.env.NANOFORGE_TEST_HOST_SECRET ?? null, safe: process.env.NANOFORGE_EXPLICIT_SAFE}))"],
+        cwd: process.cwd(),
+        env: { NANOFORGE_EXPLICIT_SAFE: "approved" },
+      });
+
+      for (let i = 0; i < 30; i++) {
+        if (supervisor.getTask(task.taskId)?.recentLogs?.includes('"safe":"approved"')) break;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+
+      const logs = supervisor.getTask(task.taskId)?.recentLogs ?? "";
+      expect(logs).toContain('"safe":"approved"');
+      expect(logs).toContain('"secret":null');
+      expect(logs).not.toContain("must-not-reach-child");
+    } finally {
+      if (previousSecret === undefined) delete process.env[secretName];
+      else process.env[secretName] = previousSecret;
+    }
+  });
+
   it("terminates a running process via killTask", async () => {
     const isWindows = process.platform === "win32";
     const command = isWindows ? "cmd" : "node";

@@ -5,7 +5,7 @@ NanoForge is a high-assurance agentic workspace system comprising:
 - **`packages/protocol`**: Isomorphic TypeScript schema package (Zod) defining all wire events, agent planning, subagents, daemons, terminal RPC, voice calls, and tool interactions.
 - **`apps/agent-host`**: Fastify WebSocket/HTTP server running local agent orchestration, daemon task supervisor, PTY terminal multiplexer, policy approval engine, and append-only SQLite audit ledger.
 - **`src/`**: React 19 web/desktop frontend workbench featuring modular docks (Chat, Monaco Diff Viewer, Terminal, Subagents, Artifacts, Voice HUD).
-- **`packages/sdk` (`@nanoforge/sdk`)**: Isomorphic programmatic client SDK for embedding NanoForge capabilities into `nano-gpt.com` and third-party integrations.
+- **`packages/sdk` (`@nanoforge/sdk`)**: Isomorphic programmatic client SDK for integrating NanoForge capabilities into compatible companion apps and third-party tools, including a possible NanoGPT pilot.
 
 ```
 ┌────────────────────────────────────────────────────────┐
@@ -75,13 +75,13 @@ NanoForge is a high-assurance agentic workspace system comprising:
 
 ## Interface Contracts
 ### Client ↔ Agent Host (WebSocket)
-- **Endpoint**: `ws://127.0.0.1:4040/ws` (or env `PORT`/`HOST`)
+- **Endpoint**: `ws://127.0.0.1:<host-port>/agent?token=<token>` for the browser/launcher path (the port is configured by the launcher; embedded hosts may expose their configured route).
 - **Handshake**: Query param `?token=<token>` where token is a 192-bit base64url cryptotoken.
 - **Wire Framing**: JSON objects conforming to `clientMessageSchema` and `hostMessageSchema`.
 - **Close Codes**: `4401` Unauthorized, `4400` Protocol Violation, `1000` Normal Graceful Close, `1001` Going Away.
 
 ### Filesystem & Tool Isolation
-- **Path Resolution**: `resolveWorkspacePath(workspaceRoot, targetPath)` performs 3-pass URI decoding, resolves symlinks with `fs.realpathSync.native`, and verifies that `resolvedPath.startsWith(normalizedWorkspaceRoot)`. Throws `SecurityError` if breached.
+- **Path Resolution**: `resolveWorkspacePath(workspaceRoot, targetPath)` decodes and canonicalizes the candidate, resolves symlinks with `fs.realpathSync.native`, and verifies containment using a path-relative boundary check. Throws `SecurityError` if breached.
 
 ### Programmatic SDK (`@nanoforge/sdk`)
 ```typescript

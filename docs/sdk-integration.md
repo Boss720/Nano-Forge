@@ -1,167 +1,68 @@
-# NanoForge Programmatic SDK Integration Guide
+# Local SDK integration (experimental)
 
-> Authoritative guide for embedding `@nanoforge/sdk` into `nano-gpt.com` and distributed backend services.
+`@nanoforge/sdk` is a typed client for a NanoForge agent host running on the same machine or on a separately managed trusted network. It is not the browser-direct NanoGPT API client, and this guide does not claim that NanoForge is officially affiliated with NanoGPT.
 
----
+## What the SDK connects to
 
-## 1. Overview & Architecture
+The SDK speaks NanoForge’s WebSocket control protocol:
 
-NanoForge provides `@nanoforge/sdk` to allow programmatic control over local and remote NanoForge agent host daemons. The SDK enables `nano-gpt.com` web applications, background workers, and CI runners to:
+```text
+ws://127.0.0.1:<port>/agent?token=<single-use-token>
+```
 
-1. **Orchestrate Autonomous Agents**: Generate and submit DAG execution plans.
-2. **Stream Real-time Tool Outputs**: Consume incremental stdout/stderr streams and state transitions via standard TypeScript `AsyncIterable<RunEvent>`.
-3. **Enforce Interactive Policy Gates**: Intercept dangerous commands and prompt users for approvals or apply rule-based automated policies.
-4. **Manage Multi-Agent Swarms**: Spawn, monitor, and coordinate subagent trees (up to 3 levels of depth).
-5. **Supervise Long-Running Daemons & Timers**: Manage background tasks with execution timeouts and circular ring buffers.
+The host also registers `/ws`, but `/agent` is the documented path. The host accepts one registered token per connection. Because the token is consumed during authentication, do not enable SDK auto-reconnect unless the caller also provisions a fresh token for every reconnect.
 
----
+The SDK can submit typed plans, consume run events as an `AsyncIterable`, send approval decisions, query workspace metadata/files, and call the host’s subagent/task/memory RPC surfaces. It does not turn the NanoGPT browser connection into a host-routed provider.
 
-## 2. Server-Side Integration (`nano-gpt.com` Backend)
+## Minimal local-host example
 
-### 2.1 Establishing Daemon Connections
-
-```typescript
+```ts
 import { NanoForgeClient } from "@nanoforge/sdk";
 
-export class AgentHostManager {
-  private client: NanoForgeClient;
-
-  constructor(hostPort = 4040, token: string) {
-    this.client = new NanoForgeClient({
-      hostUrl: `ws://127.0.0.1:${hostPort}/agent`,
-      token,
-      autoReconnect: true,
-      maxReconnectAttempts: 10,
-      timeoutMs: 15000,
-    });
-  }
-
-  public async initialize(): Promise<void> {
-    await this.client.connect();
-    console.log("[nano-gpt] Successfully connected to NanoForge Agent Host daemon.");
-  }
-
-  public getClient(): NanoForgeClient {
-    return this.client;
-  }
-}
-```
-
-### 2.2 Streaming Agent Execution to HTTP/SSE Clients
-
-```typescript
-import { Request, Response } from "express";
-import { NanoForgeClient, SubmittedPlan } from "@nanoforge/sdk";
-
-export async function handleAgentRunStream(
-  client: NanoForgeClient,
-  plan: SubmittedPlan,
-  res: Response
-) {
-  // Set Server-Sent Events (SSE) headers
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive",
-  });
-
-  try {
-    for await (const event of client.streamRun(plan)) {
-      res.write(`data: ${JSON.stringify(event)}\n\n`);
-    }
-    res.write("data: [DONE]\n\n");
-  } catch (err: any) {
-    res.write(`data: ${JSON.stringify({ type: "error", error: err.message })}\n\n`);
-  } finally {
-    res.end();
-  }
-}
-```
-
----
-
-## 3. Client-Side Integration (Browser / Workbench)
-
-### 3.1 Direct WebSocket Control Plane
-
-```typescript
-import { NanoForgeClient } from "@nanoforge/sdk";
-
-export async function initializeWorkbenchSession() {
-  const client = new NanoForgeClient({
-    hostUrl: "ws://127.0.0.1:4040/agent",
-    token: sessionStorage.getItem("nanoforge_token") || undefined,
-  });
-
-  await client.connect();
-
-  // Listen for tool approval requests
-  client.on("approval_required", (req) => {
-    const userApproved = window.confirm(
-      `Agent requests execution of "${req.request.executable}". Reason: ${req.reason}. Allow?`
-    );
-    if (userApproved) {
-      void client.grantApproval(req.requestId);
-    } else {
-      void client.denyApproval(req.requestId, "User declined execution");
-    }
-  });
-
-  return client;
-}
-```
-
----
-
-## 4. Subagent Swarms & Multi-Agent Workflows
-
-### 4.1 Spawning Subagents Programmatically
-
-```typescript
-// Define and spawn a specialized specialist subagent
-const subagent = await client.invokeSubagent({
-  name: "security_auditor",
-  archetype: "specialist",
-  task: "Scan codebase for hardcoded API keys and credentials",
-  isolation: "inherit",
-  budgetTokens: 50000,
-  timeoutSeconds: 300,
+const client = new NanoForgeClient({
+  hostUrl: "ws://127.0.0.1:4040/agent",
+  token: process.env.NANOFORGE_HOST_TOKEN,
+  autoReconnect: false,
 });
 
-console.log(`Subagent spawned: ${subagent.id} (State: ${subagent.state})`);
+await client.connect();
+
+const session = await client.createSession({
+  title: "Disposable evaluation",
+  model: "provider-configured-model",
+});
+
+for await (const event of session.streamRun({
+  id: "evaluation-plan-1",
+  goal: "Inspect the sample workspace",
+  steps: [
+    { id: "inspect", title: "Inspect the sample workspace", action: "read-only inspection" },
+  ],
+})) {
+  console.log(event.type, event.state ?? event.detail ?? "");
+}
+
+await client.disconnect();
 ```
 
-### 4.2 Inter-Agent Message Routing
+Supply the token through process configuration or an equivalent trusted handoff. Do not put host tokens or provider keys in a browser URL, source file, screenshot, or persistent browser storage.
 
-```typescript
-// Send coordination message from supervisor to subagent
-await client.sendMessage(
-  {
-    recipientId: subagent.id,
-    content: "Please prioritize src/lib/nanogpt.ts in your scan.",
-  },
-  "supervisor-main"
-);
+## Provider relationship
+
+The host contains a generic OpenAI-compatible adapter that can be configured with a base URL and provider key in the host process. The current browser UI does not pass its NanoGPT key into that adapter, and the core provider registry does not register a `nanogpt` provider. A NanoGPT host integration therefore remains a pilot/adaptor task, not an SDK capability claim.
+
+## Workspace writes
+
+`writeFile` is exposed by the SDK, but the host rejects workspace writes unless `allowWorkspaceWrites` is explicitly enabled. A write also carries expected file-version data in the host protocol. Use a disposable workspace and a reviewed diff; the SDK method is not a blanket authorization mechanism.
+
+## Local verification
+
+From the repository root:
+
+```powershell
+pnpm test:sdk
+pnpm typecheck:sdk
+pnpm --filter @nanoforge/sdk lint
 ```
 
----
-
-## 5. Security & Isolation Invariants
-
-When integrating `@nanoforge/sdk`:
-
-1. **Origin Verification**: The Fastify Agent Host daemon enforces strict loopback origin validation. Third-party web origins are rejected with close code `4401`.
-2. **Token Rotation**: Pass single-use 192-bit base64url crypto tokens per session.
-3. **Workspace Confinement**: Operations outside the workspace root are blocked with `SecurityError`.
-4. **Subagent Depth Limits**: Subagent creation exceeding 3 tiers is blocked with `SEC-SUB-05`.
-5. **Approval Gates**: Mutating commands require explicit `client.grantApproval(requestId)`.
-
----
-
-## 6. Testing & CI Integration
-
-Run the SDK unit tests:
-
-```bash
-pnpm run test:sdk
-```
+These checks use test doubles for the WebSocket/provider boundary. They do not prove live NanoGPT compatibility, published package availability, hosted operation, or a stable external SDK contract.

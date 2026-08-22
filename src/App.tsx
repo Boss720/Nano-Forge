@@ -61,6 +61,11 @@ export default function App({ hostSession }: { hostSession?: UseHostSessionOptio
     pinChat,
   } = useSessionPersistence(selectedModel);
 
+  const activeWorkspace = workspaces.find((workspace) => workspace.id === activeWorkspaceId);
+  const workspaceWriteCapability = host.status === "connected" && activeWorkspace?.location?.status === "ready"
+    ? "live"
+    : "virtual";
+
   const reviewedWorkspaceWrite = useCallback(async (path: string, content: string) => {
     const stat = await host.statWorkspaceFile(path);
     const result = await host.writeWorkspaceFile(path, content, stat ? { expectedModified: stat.modified } : undefined);
@@ -89,6 +94,7 @@ export default function App({ hostSession }: { hostSession?: UseHostSessionOptio
     artifactsManager,
     readWorkspaceFile: host.readWorkspaceFile,
     writeWorkspaceFile: reviewedWorkspaceWrite,
+    workspaceWriteCapability,
   });
 
   return (

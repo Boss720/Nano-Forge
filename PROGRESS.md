@@ -148,3 +148,20 @@ Assess the current NanoForge workspace and produce a concrete, prioritized set o
 - Documentation lane: NanoGPT-facing README, technical overview, known limitations, and collaboration framing. Allowlist: `README.md`, `docs/technical-overview.md`, `docs/known-limitations.md`, and SDK-facing docs only.
 - Coordinator work: reconcile independent patches, update contradictory UI copy outside the delegated allowlists, run the required verification gates, and prepare the requested remote push.
 - Existing `.agents/**` and generated release artifacts remain outside the release commit unless explicitly needed by the project source.
+
+## NanoGPT Readiness Implementation Wave A2
+
+- Status: in progress after the local baseline was published to `origin/main` at commit `0c95978`.
+- Security lane owner: workspace policy, daemon environment, launcher boundary, and focused adversarial tests. No frontend or documentation overlap.
+- Demo lane owner: orchestration write capability gate, API/local runtime status, and focused UI tests. No host security or documentation overlap.
+- Documentation lane owner: NanoGPT-facing README, technical overview, known limitations, and collaboration framing. No product source overlap.
+- Acceptance gate: workers must provide raw focused verification; coordinator must inspect the complete combined diff and independently run app/package typechecks, full tests, lint, and build before accepting the wave.
+- Git boundary: generated `.agents/**` records are local swarm metadata and remain excluded from product commits; all product changes from this wave will be committed and pushed after verification.
+
+## NanoGPT Readiness Implementation Wave A2 Evidence
+
+- Completed three independent lanes and reconciled their patches: sensitive workspace policy and watcher/search filtering; minimal child environments and hardened launcher containment; virtual-by-default demo writes and separate API/runtime status; NanoGPT-facing README, technical overview, known limitations, SDK guidance, and presentation checklist.
+- Coordinator corrections: removed stale hard-coded catalog counts and local-storage key wording from UI copy, aligned ChatComposer tests with the truthful runtime label, and corrected strict typing/lint issues in the new focused tests.
+- Independent verification: app, protocol, host, core, and SDK typechecks passed; `pnpm lint` passed; full `pnpm test` passed with 60 files / 616 tests; `pnpm build` passed.
+- Build warnings retained: existing ThemeCustomizer static/dynamic import overlap and large bundle-size warning.
+- Remaining external gate: no live NanoGPT credentialed contract check, approved branding language, clean-machine release smoke test, checksum, or single-version distributable artifact was available locally; documentation now labels those claims as unverified.

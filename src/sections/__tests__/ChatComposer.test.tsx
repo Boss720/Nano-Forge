@@ -46,7 +46,7 @@ describe("ChatComposer rendering & basic interactions", () => {
     renderComposer();
     expect(screen.getByTestId("chat-textarea")).toBeTruthy();
     expect(screen.getByText("GPT-5.2")).toBeTruthy();
-    expect(screen.getByText(/live · nano-gpt\.com\/api\/v1/i)).toBeTruthy();
+    expect(screen.getByText(/live · API connected/i)).toBeTruthy();
     expect(screen.getByText(/12\.5k \/ 400\.0k/i)).toBeTruthy();
     expect(screen.getByTestId("run-agent-button")).toBeTruthy();
   });

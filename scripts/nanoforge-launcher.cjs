@@ -49,6 +49,26 @@ function generateToken() {
   return crypto.randomBytes(24).toString('base64url');
 }
 
+const MINIMAL_CHILD_ENVIRONMENT_KEYS = process.platform === 'win32'
+  ? ['PATH', 'PATHEXT', 'SystemRoot', 'WINDIR', 'ComSpec', 'TEMP', 'TMP']
+  : ['PATH', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL'];
+
+function buildChildEnvironment(overrides = {}) {
+  const environment = {};
+  const hostKeys = Object.keys(process.env);
+  for (const requestedKey of MINIMAL_CHILD_ENVIRONMENT_KEYS) {
+    const actualKey = process.platform === 'win32'
+      ? hostKeys.find((key) => key.toLowerCase() === requestedKey.toLowerCase())
+      : requestedKey;
+    const value = actualKey ? process.env[actualKey] : undefined;
+    if (value !== undefined) environment[actualKey || requestedKey] = value;
+  }
+  for (const [key, value] of Object.entries(overrides)) {
+    if (value !== undefined) environment[key] = String(value);
+  }
+  return environment;
+}
+
 function parseArgs(argv = process.argv.slice(2)) {
   const args = {
     uiPort: Number(process.env.NANOFORGE_PORT || process.env.NANOFORGE_UI_PORT || 4173),
@@ -183,6 +203,7 @@ function resolveNodeExecutable() {
 }
 
 function createStaticServer(distRoot, api = {}) {
+  const resolvedDistRoot = path.resolve(distRoot);
   return http.createServer((req, res) => {
     const requestPath = (req.url || '/').split('?')[0];
     if (req.method === 'POST' && requestPath === '/api/workspace' && typeof api.onWorkspaceOpen === 'function') {
@@ -212,15 +233,32 @@ function createStaticServer(distRoot, api = {}) {
       });
       return;
     }
-    // Normalization & sanitization
+    // Decode once, then reject malformed or NUL-containing request paths.
     const rawUrl = req.url || '/';
-    const cleanPath = decodeURIComponent(rawUrl.split('?')[0].split('#')[0]);
-    const normalized = path.normalize(cleanPath).replace(/^(\.\.[\/\\])+/, '');
-    const relativeTarget = normalized === '/' || normalized === '\\' ? 'index.html' : normalized.replace(/^[\/\\]+/, '');
-    const candidateFile = path.resolve(distRoot, relativeTarget);
+    const rawPath = rawUrl.split(/[?#]/)[0] || '/';
+    let cleanPath;
+    try {
+      cleanPath = decodeURIComponent(rawPath);
+    } catch {
+      res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('400 Bad Request');
+      return;
+    }
+    if (rawUrl.includes('\0') || cleanPath.includes('\0')) {
+      res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('400 Bad Request');
+      return;
+    }
 
-    // Path traversal check
-    if (!candidateFile.startsWith(distRoot)) {
+    // Treat both URL separators as path separators before resolving. This
+    // protects POSIX test/dev hosts from Windows-style traversal probes too.
+    const normalizedInput = cleanPath.replace(/[\\/]+/g, path.sep);
+    let relativeTarget = normalizedInput;
+    while (relativeTarget.startsWith(path.sep)) relativeTarget = relativeTarget.slice(path.sep.length);
+    if (!relativeTarget) relativeTarget = 'index.html';
+    const candidateFile = path.resolve(resolvedDistRoot, relativeTarget);
+
+    if (!isPathWithinRoot(candidateFile, resolvedDistRoot)) {
       res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
       res.end('403 Forbidden');
       return;
@@ -239,7 +277,7 @@ function createStaticServer(distRoot, api = {}) {
       }
 
       // SPA fallback to index.html for client-side routing
-      const indexFile = path.join(distRoot, 'index.html');
+      const indexFile = path.join(resolvedDistRoot, 'index.html');
       fs.stat(indexFile, (indexErr, indexStats) => {
         if (!indexErr && indexStats.isFile()) {
           const indexStream = fs.createReadStream(indexFile);
@@ -268,6 +306,11 @@ function createStaticServer(distRoot, api = {}) {
       });
     });
   });
+}
+
+function isPathWithinRoot(candidatePath, rootPath) {
+  const relative = path.relative(path.resolve(rootPath), path.resolve(candidatePath));
+  return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
 function openBrowser(url) {
@@ -344,7 +387,7 @@ Options:
     const isTypeScript = hostEntry.endsWith('.ts');
     const isWindows = process.platform === 'win32';
 
-    const env = Object.assign({}, process.env, {
+    const env = buildChildEnvironment({
       PORT: String(config.hostPort),
       TOKEN: config.token,
       HOST: '127.0.0.1',
@@ -419,7 +462,7 @@ Options:
 
   const spawnReplacementHost = (workspaceRoot) => {
     if (!hostEntry) throw new Error('Agent host entry is unavailable');
-    const env = Object.assign({}, process.env, {
+    const env = buildChildEnvironment({
       PORT: String(config.hostPort),
       TOKEN: config.token,
       HOST: '127.0.0.1',
@@ -570,5 +613,7 @@ module.exports = {
   generateToken,
   parseArgs,
   createStaticServer,
+  isPathWithinRoot,
+  buildChildEnvironment,
   MIME_TYPES,
 };

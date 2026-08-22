@@ -737,7 +737,7 @@ export function ChatComposer({
             {model?.name ?? "no model"}
           </span>
           <span className="micro-label normal-case tracking-normal">
-            {connected ? "live · nano-gpt.com/api/v1" : "demo script · no tokens burned"}
+            {connected ? "live · API connected" : "demo script · no tokens burned"}
           </span>
 
           {budgetTokens > 0 && (

@@ -48,6 +48,8 @@ export interface UseAgentOrchestrationProps {
   /** Host-backed file reads/writes used by the reviewed local-write path. */
   readWorkspaceFile?: (path: string) => Promise<{ path: string; content: string; language: string; size: number } | null>;
   writeWorkspaceFile?: (path: string, content: string, options?: { expectedSha256?: string; expectedModified?: string }) => Promise<unknown>;
+  /** Virtual patches are the safe default; App opts into disk writes explicitly. */
+  workspaceWriteCapability?: "virtual" | "live";
 }
 
 export function useAgentOrchestration({
@@ -66,6 +68,7 @@ export function useAgentOrchestration({
   attachmentSnapshots,
   readWorkspaceFile,
   writeWorkspaceFile,
+  workspaceWriteCapability = "virtual",
 }: UseAgentOrchestrationProps) {
   const [running, setRunning] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
@@ -279,7 +282,8 @@ export function useAgentOrchestration({
       if (!patch || patch.status === decision) return;
       void (async () => {
         let workingFiles = files;
-        if (writeWorkspaceFile && readWorkspaceFile) {
+        const liveWorkspaceWrite = workspaceWriteCapability === "live";
+        if (liveWorkspaceWrite && writeWorkspaceFile && readWorkspaceFile) {
           const current = await readWorkspaceFile(patch.file);
           if (current) {
             const existing = workingFiles.findIndex((file) => file.path === patch.file);
@@ -296,7 +300,7 @@ export function useAgentOrchestration({
           ? applyPatch(workingFiles, patch)
           : patch.status === "applied" ? revertPatch(workingFiles, patch) : workingFiles;
         const nextContent = nextFiles.find((file) => file.path === patch.file)?.content;
-        if (writeWorkspaceFile && nextContent !== undefined) {
+        if (liveWorkspaceWrite && writeWorkspaceFile && nextContent !== undefined) {
           await writeWorkspaceFile(patch.file, nextContent);
         }
 
@@ -320,7 +324,18 @@ export function useAgentOrchestration({
       });
 
     },
-    [session, files, connected, handleSend, setFiles, setSessions, patchMessage, readWorkspaceFile, writeWorkspaceFile],
+    [
+      session,
+      files,
+      connected,
+      handleSend,
+      setFiles,
+      setSessions,
+      patchMessage,
+      readWorkspaceFile,
+      writeWorkspaceFile,
+      workspaceWriteCapability,
+    ],
   );
 
   return {

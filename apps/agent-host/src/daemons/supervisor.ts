@@ -30,6 +30,27 @@ import type {
 
 export const MAX_CONCURRENT_DAEMONS = 16;
 
+const MINIMAL_CHILD_ENVIRONMENT_KEYS = process.platform === "win32"
+  ? ["PATH", "PATHEXT", "SystemRoot", "WINDIR", "ComSpec", "TEMP", "TMP"]
+  : ["PATH", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL"];
+
+/** Build a child environment without forwarding the host's ambient secrets. */
+export function buildDaemonEnvironment(overrides: Record<string, string> = {}): Record<string, string> {
+  const environment: Record<string, string> = {};
+  const hostKeys = Object.keys(process.env);
+  for (const requestedKey of MINIMAL_CHILD_ENVIRONMENT_KEYS) {
+    const actualKey = process.platform === "win32"
+      ? hostKeys.find((key) => key.toLowerCase() === requestedKey.toLowerCase())
+      : requestedKey;
+    const value = actualKey ? process.env[actualKey] : undefined;
+    if (value !== undefined) environment[actualKey ?? requestedKey] = value;
+  }
+  for (const [key, value] of Object.entries(overrides)) {
+    if (value !== undefined) environment[key] = String(value);
+  }
+  return environment;
+}
+
 const activeDaemonPids = new Set<number>();
 
 if (typeof process !== "undefined" && typeof process.on === "function") {
@@ -162,7 +183,7 @@ export class DaemonSupervisor extends EventEmitter {
 
         child = spawn(options.command, args, {
           cwd,
-          env: { ...process.env, ...options.env },
+          env: buildDaemonEnvironment(options.env),
           detached: isDaemon && !isWindows, // detached process group on POSIX
           stdio: ["pipe", "pipe", "pipe"],
           shell: needsShell,
