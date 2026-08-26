@@ -56,6 +56,9 @@ export const DEFAULT_ALLOWED_ORIGINS: readonly string[] = [
   "http://127.0.0.1:3000",
   "http://localhost:4173",
   "http://127.0.0.1:4173",
+  // The packaged launcher serves the UI on 4183 by default.
+  "http://localhost:4183",
+  "http://127.0.0.1:4183",
   "http://localhost:5173",
   "http://127.0.0.1:5173",
   "http://localhost:4040",
@@ -209,8 +212,13 @@ export interface HostHandle {
 }
 
 export async function createHost(options: HostOptions = {}): Promise<HostHandle> {
+  const configuredGeneration = Number(process.env.NANOFORGE_WORKSPACE_GENERATION ?? "1");
+  const workspaceGeneration = Number.isSafeInteger(configuredGeneration) && configuredGeneration > 0
+    ? configuredGeneration
+    : 1;
   const validatedWorkspace = await validateWorkspaceRoot(
     options.session?.workspaceRoot ?? process.env.NANOFORGE_WORKSPACE ?? process.cwd(),
+    workspaceGeneration,
   );
   const workspaceRoot = validatedWorkspace.canonicalRoot;
   const app = Fastify({ logger: options.logger ?? false });

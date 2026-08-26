@@ -91,6 +91,39 @@ describe("HostClient connection", () => {
     await expect(p).rejects.toThrow(/4401/);
   });
 
+  it("uses an ephemeral broker websocket URL and records the described workspace generation", async () => {
+    FakeWebSocket.instances = [];
+    const client = new HostClient({
+      websocketUrl: "ws://127.0.0.1:4821/agent?token=broker-token",
+      WebSocketImpl: (url) => new FakeWebSocket(url),
+    });
+    const ws = await connect(client);
+    expect(ws.url).toBe("ws://127.0.0.1:4821/agent?token=broker-token");
+
+    const described = client.describeWorkspace();
+    const frame = ws.sentFrames()[0];
+    expect(frame).toMatchObject({ type: "workspace.describe" });
+    ws.receive({
+      type: "workspace.ready",
+      requestId: frame.requestId,
+      workspace: {
+        id: "opaque-workspace-id",
+        name: "NanoForge",
+        displayPath: "NanoForge",
+        generation: 4,
+        capabilities: { read: true, stat: true, watch: true, search: true, git: true, terminal: true, subagents: true, memory: true, reviewedWrite: true },
+      },
+      at: "2026-08-26T00:00:00.000Z",
+    });
+    await expect(described).resolves.toMatchObject({ generation: 4 });
+
+    const directory = client.readDir();
+    const directoryFrame = ws.sentFrames()[1];
+    expect(directoryFrame).toMatchObject({ type: "workspace.readDir", generation: 4 });
+    ws.receive({ type: "workspace.readDir.result", requestId: directoryFrame.requestId, path: "", entries: [] });
+    await expect(directory).resolves.toEqual([]);
+  });
+
   it("surfaces 4401 closes to event subscribers as an unauthorized error", async () => {
     const { client } = makeClient();
     const events: HostMessage[] = [];

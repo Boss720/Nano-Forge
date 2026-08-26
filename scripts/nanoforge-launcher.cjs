@@ -14,6 +14,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawn, exec } = require('node:child_process');
+const { createWindowsFolderPicker } = require('./workspace-picker.cjs');
+const { createWorkspaceRegistry } = require('./workspace-registry.cjs');
 
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -205,15 +207,248 @@ function resolveNodeExecutable() {
   }
 }
 
+function defaultWorkspaceCapabilities(allowWorkspaceWrites) {
+  return {
+    read: true,
+    stat: true,
+    watch: true,
+    search: true,
+    git: true,
+    terminal: false,
+    subagents: true,
+    memory: true,
+    reviewedWrite: allowWorkspaceWrites === true || allowWorkspaceWrites === '1',
+  };
+}
+
+function workspaceLabel(entry) {
+  const label = path.basename(entry.path || '').trim();
+  return label || 'Workspace';
+}
+
+function brokerError(requestId, code, message, recoverable = true) {
+  return {
+    type: 'workspace.broker.error',
+    ...(requestId ? { requestId } : {}),
+    code,
+    message,
+    recoverable,
+  };
+}
+
+/**
+ * Owns the browser-safe workspace control-plane state. Registry entries retain
+ * canonical paths, while this broker deliberately returns opaque descriptors.
+ */
+function createWorkspaceBroker(options = {}) {
+  const registry = options.registry;
+  const picker = options.picker;
+  const capabilities = options.capabilities || defaultWorkspaceCapabilities(options.allowWorkspaceWrites);
+  const hostPort = Number(options.hostPort || 4174);
+  const token = options.token || '';
+  const activateWorkspace = options.activateWorkspace;
+  const revealWorkspace = options.revealWorkspace;
+  let generation = Number(options.generation || 1);
+  let activeEntry = options.activeEntry || null;
+  let switchState = activeEntry ? 'active' : 'idle';
+  let switchMessage;
+  const completed = new Map();
+
+  const descriptor = (entry, descriptorGeneration = generation) => ({
+    workspaceId: entry.id,
+    label: workspaceLabel(entry),
+    generation: Math.max(1, descriptorGeneration),
+    capabilities,
+  });
+  const connection = () => ({
+    websocketUrl: `ws://127.0.0.1:${hostPort}/agent?token=${encodeURIComponent(token)}`,
+    port: hostPort,
+    token,
+    generation,
+  });
+  const fail = (requestId, error, fallbackCode = 'invalid_request') => {
+    switchState = 'failed';
+    switchMessage = fallbackCode === 'host_start_failed' ? 'Unable to start the selected workspace.' : 'Workspace request could not be completed.';
+    const message = fallbackCode === 'host_start_failed' ? switchMessage : 'Workspace request could not be completed.';
+    return brokerError(requestId, fallbackCode, message, true);
+  };
+  const validateRequest = (request, expectedType, requestId) => {
+    if (!request || request.type !== expectedType || typeof request.requestId !== 'string' || request.requestId !== requestId || !requestId || requestId.length > 128) {
+      return brokerError(requestId, 'invalid_request', 'The workspace request is invalid.', true);
+    }
+    return null;
+  };
+  const complete = async (request, requestId) => {
+    const expectedByType = {
+      'workspace.choose': 'workspace.choose',
+      'workspace.activate': 'workspace.activate',
+      'workspace.recent.remove': 'workspace.recent.remove',
+      'workspace.recent.pin': 'workspace.recent.pin',
+      'workspace.reveal': 'workspace.reveal',
+    };
+    const invalid = validateRequest(request, expectedByType[request && request.type], requestId);
+    if (invalid) return { status: 400, payload: invalid };
+    const idempotencyKey = request.idempotencyKey;
+    if (idempotencyKey && completed.has(`${request.type}:${idempotencyKey}`)) return completed.get(`${request.type}:${idempotencyKey}`);
+    let payload;
+    try {
+      if (request.type === 'workspace.choose') {
+        switchState = 'choosing';
+        const selected = await picker.pick();
+        if (!selected || selected.status === 'cancelled') {
+          switchState = 'idle';
+          payload = brokerError(requestId, 'picker_cancelled', 'No workspace was selected.', true);
+          return { status: 409, payload };
+        }
+        if (selected.status !== 'selected' || typeof selected.path !== 'string') return { status: 503, payload: fail(requestId, null) };
+        switchState = 'validating';
+        const entry = registry.open(selected.path);
+        switchState = 'idle';
+        payload = { type: 'workspace.choose.result', requestId, workspace: descriptor(entry) };
+      } else if (request.type === 'workspace.activate') {
+        if (typeof request.workspaceId !== 'string' || !request.workspaceId || typeof idempotencyKey !== 'string' || !idempotencyKey) return { status: 400, payload: brokerError(requestId, 'invalid_request', 'The workspace request is invalid.', true) };
+        switchState = 'validating';
+        const entry = registry.resolve(request.workspaceId);
+        if (!entry) {
+          switchState = 'idle';
+          return { status: 404, payload: brokerError(requestId, 'unknown_workspace', 'The selected workspace is no longer available.', true) };
+        }
+        switchState = 'activating';
+        if (typeof activateWorkspace !== 'function') return { status: 503, payload: fail(requestId, null, 'host_start_failed') };
+        const nextGeneration = generation + 1;
+        await activateWorkspace(entry.path, nextGeneration);
+        generation = nextGeneration;
+        activeEntry = entry;
+        switchState = 'active';
+        switchMessage = undefined;
+        payload = { type: 'workspace.activate.result', requestId, workspace: descriptor(entry), connection: connection() };
+      } else if (request.type === 'workspace.recent.remove') {
+        if (typeof request.workspaceId !== 'string' || !request.workspaceId || typeof idempotencyKey !== 'string' || !idempotencyKey) return { status: 400, payload: brokerError(requestId, 'invalid_request', 'The workspace request is invalid.', true) };
+        if (!registry.remove(request.workspaceId)) return { status: 404, payload: brokerError(requestId, 'unknown_workspace', 'The selected workspace is no longer available.', true) };
+        if (activeEntry && activeEntry.id === request.workspaceId) activeEntry = null;
+        payload = { type: 'workspace.recent.remove.result', requestId, workspaceId: request.workspaceId, removed: true };
+      } else if (request.type === 'workspace.recent.pin') {
+        if (typeof request.workspaceId !== 'string' || typeof request.pinned !== 'boolean' || typeof idempotencyKey !== 'string' || !idempotencyKey) return { status: 400, payload: brokerError(requestId, 'invalid_request', 'The workspace request is invalid.', true) };
+        const entry = registry.pin(request.workspaceId, request.pinned);
+        if (!entry) return { status: 404, payload: brokerError(requestId, 'unknown_workspace', 'The selected workspace is no longer available.', true) };
+        payload = { type: 'workspace.recent.pin.result', requestId, workspace: descriptor(entry), pinned: entry.pinned === true };
+      } else if (request.type === 'workspace.reveal') {
+        if (typeof request.workspaceId !== 'string' || typeof request.relativePath !== 'string' || !request.relativePath) return { status: 400, payload: brokerError(requestId, 'invalid_request', 'The workspace request is invalid.', true) };
+        const entry = registry.resolve(request.workspaceId);
+        if (!entry) return { status: 404, payload: brokerError(requestId, 'unknown_workspace', 'The selected workspace is no longer available.', true) };
+        const target = path.resolve(entry.path, request.relativePath);
+        if (!isPathWithinRoot(target, entry.path)) return { status: 400, payload: brokerError(requestId, 'invalid_request', 'The requested item is outside the workspace.', true) };
+        if (typeof revealWorkspace !== 'function') return { status: 503, payload: brokerError(requestId, 'invalid_request', 'Workspace reveal is unavailable.', true) };
+        await revealWorkspace(target);
+        payload = { type: 'workspace.reveal.result', requestId, revealed: true };
+      }
+    } catch (error) {
+      return { status: 503, payload: fail(requestId, error, request.type === 'workspace.activate' ? 'host_start_failed' : 'workspace_missing') };
+    }
+    const result = { status: 200, payload };
+    if (idempotencyKey) completed.set(`${request.type}:${idempotencyKey}`, result);
+    return result;
+  };
+  const query = (type, requestId) => {
+    if (!requestId || requestId.length > 128) return { status: 400, payload: brokerError(requestId, 'invalid_request', 'The workspace request is invalid.', true) };
+    if (type === 'workspace.current') return { status: 200, payload: { type: 'workspace.current.result', requestId, ...(activeEntry ? { workspace: descriptor(activeEntry), connection: connection() } : {}) } };
+    if (type === 'workspace.recent.list') return { status: 200, payload: { type: 'workspace.recent.list.result', requestId, workspaces: registry.list().map((entry) => descriptor(entry)) } };
+    return { status: 200, payload: { type: 'workspace.switch.status.result', requestId, state: switchState, ...(activeEntry ? { workspace: descriptor(activeEntry) } : {}), ...(switchMessage ? { message: switchMessage } : {}) } };
+  };
+  return { complete, query, setActiveEntry: (entry) => { activeEntry = entry; switchState = entry ? 'active' : 'idle'; } };
+}
+
 function createStaticServer(distRoot, api = {}) {
   const resolvedDistRoot = path.resolve(distRoot);
+  const legacyRecentDescriptor = (entry) => ({
+    workspaceId: entry.id,
+    label: workspaceLabel(entry),
+    generation: 1,
+    capabilities: defaultWorkspaceCapabilities(false),
+  });
   return http.createServer((req, res) => {
     const requestPath = (req.url || '/').split('?')[0];
+    const authorization = req.headers.authorization || '';
+    const isAuthorized = () => !api.token || authorization === `Bearer ${api.token}`;
+    const rejectUnauthorized = () => {
+      res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify({ error: 'unauthorized' }));
+    };
+    const respondJson = (status, payload) => {
+      res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify(payload));
+    };
+    const readJsonBody = (callback) => {
+      let body = '';
+      req.setEncoding('utf8');
+      req.on('data', (chunk) => {
+        body += chunk;
+        if (body.length > 16 * 1024) req.destroy();
+      });
+      req.on('end', () => {
+        try { callback(JSON.parse(body || '{}')); } catch { respondJson(400, { error: 'invalid JSON body' }); }
+      });
+    };
+    const brokerPostPaths = {
+      '/workspace/choose': 'workspace.choose',
+      '/workspace/activate': 'workspace.activate',
+      '/workspace/recent/remove': 'workspace.recent.remove',
+      '/workspace/recent/pin': 'workspace.recent.pin',
+      '/workspace/reveal': 'workspace.reveal',
+    };
+    const brokerGetPaths = {
+      '/workspace/current': 'workspace.current',
+      '/workspace/recent': 'workspace.recent.list',
+      '/workspace/switch/status': 'workspace.switch.status',
+    };
+    if (api.workspaceBroker && brokerPostPaths[requestPath] && req.method === 'POST') {
+      if (!isAuthorized()) { rejectUnauthorized(); return; }
+      const requestId = typeof req.headers['x-request-id'] === 'string' ? req.headers['x-request-id'] : '';
+      readJsonBody(async (payload) => {
+        const result = await api.workspaceBroker.complete(payload, requestId);
+        respondJson(result.status, result.payload);
+      });
+      return;
+    }
+    if (api.workspaceBroker && brokerGetPaths[requestPath] && req.method === 'GET') {
+      if (!isAuthorized()) { rejectUnauthorized(); return; }
+      const requestId = typeof req.headers['x-request-id'] === 'string' ? req.headers['x-request-id'] : '';
+      const result = api.workspaceBroker.query(brokerGetPaths[requestPath], requestId);
+      respondJson(result.status, result.payload);
+      return;
+    }
+    const recentMatch = /^\/api\/workspace\/recent\/([^/]+)$/.exec(requestPath);
+    if (api.workspacePicker && requestPath === '/api/workspace/pick' && req.method === 'POST') {
+      if (!isAuthorized()) { rejectUnauthorized(); return; }
+      Promise.resolve(api.workspacePicker.pick()).then((result) => respondJson(200, result), () => respondJson(503, { error: 'workspace picker unavailable' }));
+      return;
+    }
+    if (api.workspaceRegistry && requestPath === '/api/workspace/recent' && req.method === 'GET') {
+      if (!isAuthorized()) { rejectUnauthorized(); return; }
+      // Keep the legacy route available while ensuring it cannot disclose the
+      // registry's private canonical paths.
+      respondJson(200, { workspaces: api.workspaceRegistry.list().map(legacyRecentDescriptor) });
+      return;
+    }
+    if (api.workspaceRegistry && recentMatch && req.method === 'PATCH') {
+      if (!isAuthorized()) { rejectUnauthorized(); return; }
+      readJsonBody((payload) => {
+        if (!payload || typeof payload.pinned !== 'boolean') { respondJson(400, { error: 'pinned must be boolean' }); return; }
+        const workspace = api.workspaceRegistry.pin(recentMatch[1], payload.pinned);
+        if (!workspace) { respondJson(404, { error: 'workspace not found' }); return; }
+        respondJson(200, workspace);
+      });
+      return;
+    }
+    if (api.workspaceRegistry && recentMatch && req.method === 'DELETE') {
+      if (!isAuthorized()) { rejectUnauthorized(); return; }
+      if (!api.workspaceRegistry.remove(recentMatch[1])) { respondJson(404, { error: 'workspace not found' }); return; }
+      respondJson(200, { removed: true });
+      return;
+    }
     if (req.method === 'POST' && requestPath === '/api/workspace' && typeof api.onWorkspaceOpen === 'function') {
-      const authorization = req.headers.authorization || '';
-      if (api.token && authorization !== `Bearer ${api.token}`) {
-        res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ error: 'unauthorized' }));
+      if (!isAuthorized()) {
+        rejectUnauthorized();
         return;
       }
       let body = '';
@@ -361,6 +596,11 @@ Options:
   const allowWorkspaceWrites = (Boolean(config.allowWorkspaceWrites) || process.env.NANOFORGE_ALLOW_WORKSPACE_WRITES === '1') ? '1' : '0';
   const distRoot = resolveDistRoot(config.distRoot);
   const hostEntry = resolveHostEntry();
+  // Normal launcher runs own real local services. Tests may still inject
+  // isolated implementations through the existing option hooks.
+  const workspacePicker = config.workspacePicker || createWindowsFolderPicker();
+  const workspaceRegistry = config.workspaceRegistry || createWorkspaceRegistry();
+  let initialWorkspaceEntry = null;
   if (config.workspaceRoot) {
     const workspaceRoot = path.resolve(config.workspaceRoot);
     let workspaceStat;
@@ -373,6 +613,7 @@ Options:
       throw new Error(`Workspace is not a directory: ${workspaceRoot}`);
     }
     config.workspaceRoot = workspaceRoot;
+    initialWorkspaceEntry = workspaceRegistry.open(workspaceRoot);
   }
 
   console.log('===================================================');
@@ -382,7 +623,7 @@ Options:
   console.log(`[launcher] Host Entry:  ${hostEntry || 'None found (will start UI only)'}`);
   console.log(`[launcher] Host Port:   ${config.hostPort}`);
   console.log(`[launcher] UI Port:     ${config.uiPort}`);
-  console.log(`[launcher] Workspace:   ${config.workspaceRoot || process.cwd()}`);
+  console.log(`[launcher] Workspace:   ${config.workspaceRoot ? 'configured (private)' : 'not configured'}`);
   console.log(`[launcher] Writes:      ${allowWorkspaceWrites === '1' ? 'ENABLED (opt-in)' : 'DISABLED (default)'}`);
   console.log(`[launcher] Auth Token:  ${config.token.slice(0, 8)}... (redacted)`);
 
@@ -399,6 +640,7 @@ Options:
       HOST: '127.0.0.1',
       NANOFORGE_WORKSPACE: config.workspaceRoot || process.cwd(),
       NANOFORGE_ALLOW_WORKSPACE_WRITES: allowWorkspaceWrites,
+      NANOFORGE_WORKSPACE_GENERATION: '1',
     });
 
     if (isTypeScript) {
@@ -466,7 +708,7 @@ Options:
     }
   }
 
-  const spawnReplacementHost = (workspaceRoot) => {
+  const spawnReplacementHost = (workspaceRoot, workspaceGeneration = 1) => {
     if (!hostEntry) throw new Error('Agent host entry is unavailable');
     const env = buildChildEnvironment({
       PORT: String(config.hostPort),
@@ -474,6 +716,7 @@ Options:
       HOST: '127.0.0.1',
       NANOFORGE_WORKSPACE: workspaceRoot,
       NANOFORGE_ALLOW_WORKSPACE_WRITES: allowWorkspaceWrites,
+      NANOFORGE_WORKSPACE_GENERATION: String(workspaceGeneration),
     });
     const isTypeScript = hostEntry.endsWith('.ts');
     const isWindows = process.platform === 'win32';
@@ -486,7 +729,7 @@ Options:
     return spawn(resolveNodeExecutable(), [hostEntry], { env, stdio: ['ignore', 'pipe', 'pipe'], shell: false, windowsHide: true });
   };
 
-  const restartHostForWorkspace = async (requestedRoot) => {
+  const restartHostForWorkspace = async (requestedRoot, workspaceGeneration = 1) => {
     const workspaceRoot = path.resolve(requestedRoot);
     const stats = fs.statSync(workspaceRoot);
     if (!stats.isDirectory()) throw new Error(`Workspace is not a directory: ${workspaceRoot}`);
@@ -501,7 +744,7 @@ Options:
       });
     }
     config.workspaceRoot = workspaceRoot;
-    hostProcess = spawnReplacementHost(workspaceRoot);
+    hostProcess = spawnReplacementHost(workspaceRoot, workspaceGeneration);
     hostProcess.stdout?.on('data', (data) => {
       const text = data.toString().trim();
       if (text) console.log(`[agent-host] ${text}`);
@@ -527,11 +770,36 @@ Options:
       };
       probe();
     });
-    return { workspaceRoot };
+    return { activated: true };
   };
 
+  const revealWorkspace = async (targetPath) => {
+    const command = process.platform === 'win32' ? 'explorer.exe' : process.platform === 'darwin' ? 'open' : 'xdg-open';
+    const child = spawn(command, [targetPath], { shell: false, windowsHide: true, stdio: 'ignore' });
+    await new Promise((resolve, reject) => {
+      child.once('error', reject);
+      child.once('spawn', resolve);
+    });
+  };
+  const workspaceBroker = config.workspaceBroker || createWorkspaceBroker({
+    picker: workspacePicker,
+    registry: workspaceRegistry,
+    activateWorkspace: restartHostForWorkspace,
+    revealWorkspace,
+    hostPort: config.hostPort,
+    token: config.token,
+    activeEntry: initialWorkspaceEntry,
+    allowWorkspaceWrites,
+  });
+
   // 2. Start Web UI Static Server
-  const uiServer = createStaticServer(distRoot, { token: config.token, onWorkspaceOpen: restartHostForWorkspace });
+  const uiServer = createStaticServer(distRoot, {
+    token: config.token,
+    onWorkspaceOpen: restartHostForWorkspace,
+    workspacePicker,
+    workspaceRegistry,
+    workspaceBroker,
+  });
 
   const serverPromise = new Promise((resolve, reject) => {
     uiServer.once('error', (err) => {
@@ -543,7 +811,7 @@ Options:
       const launchUrl = `http://127.0.0.1:${config.uiPort}/?hostPort=${config.hostPort}&token=${encodeURIComponent(config.token)}`;
       console.log(`[launcher] Web UI ready at:   http://127.0.0.1:${config.uiPort}`);
       console.log(`[launcher] Agent Host URL:   ws://127.0.0.1:${config.hostPort}/agent?token=${config.token.slice(0, 8)}...`);
-      console.log(`[launcher] Browser URL:      ${launchUrl}`);
+      console.log(`[launcher] Browser URL:      http://127.0.0.1:${config.uiPort} (session parameters redacted)`);
       console.log('===================================================');
 
       if (!config.noOpen && !config.dryRun) {
@@ -619,6 +887,7 @@ module.exports = {
   generateToken,
   parseArgs,
   createStaticServer,
+  createWorkspaceBroker,
   isPathWithinRoot,
   buildChildEnvironment,
   MIME_TYPES,

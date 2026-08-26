@@ -1,5 +1,51 @@
 # NanoForge Hardening & Production Readiness Progress Tracking (Phases 0–7)
 
+## Active Initiative: Seamless Local Directory Operation
+
+**Status:** IN PROGRESS — Wave 1 control-plane foundation
+**Plan:** `docs/plans/2026-08-26-seamless-local-directory-operation.md`
+**Objective:** Replace manual local-folder entry and page-reload workspace switching with a secure native-picker, private-recents, typed-broker foundation.
+
+| Lane | Owner | Exclusive files | Intended proof |
+| :--- | :--- | :--- | :--- |
+| A — Workspace control protocol | protocol worker | `packages/protocol/src/workspace.ts`, `packages/protocol/src/workspace.test.ts`, `src/lib/workspaceBrokerClient.ts`, `src/lib/__tests__/workspaceBrokerClient.test.ts` | Protocol and client tests |
+| B — Launcher workspace broker | launcher worker | `scripts/workspace-picker.cjs`, `scripts/workspace-registry.cjs`, `scripts/nanoforge-launcher.cjs`, `scripts/__tests__/workspace-picker.test.ts`, `scripts/__tests__/workspace-registry.test.ts`, `scripts/__tests__/nanoforge-launcher.workspace.test.ts` | Launcher/registry tests |
+| C — Integration and verification | root | `PROGRESS.md` plus integration-only follow-up files | Combined diff review, typecheck, lint, full suite, build |
+
+**Wave 1 acceptance:** Typed choose/activate/current/recents control-plane contract; native-picker adapter with explicit cancellation; private, atomically written recent-workspace registry; no canonical paths persisted in browser state; no existing local-workspace behavior regresses.
+
+**Open decisions:** The first Windows picker uses an injectable OS adapter; implementation will choose the smallest dependency-free mechanism that produces a native folder dialog. Browser File System Access handles are not the host authority.
+
+**Wave 1 evidence (pending integration reconciliation):**
+
+- Lane A: protocol broker tests `6/6`, client tests `3/3`, protocol and app TypeScript checks passed.
+- Lane B: `cmd.exe /c npx vitest run scripts/__tests__` passed `7` files / `34` tests; registry and picker are deliberately injectable until packaging wiring is added.
+- Lane C: host workspace-context test passed `3/3`; `cmd.exe /c pnpm typecheck:host` passed.
+- Root review found two integration defects before acceptance: launcher endpoints and response frames do not yet match the new broker-client contract, and recent-list currently exposes registry paths to the browser. Wave 2 owns resolving both before any UI is connected.
+
+**Wave 2 outcome: ACCEPTED (2026-08-26)**
+
+- Reconciled the launcher to the typed broker contract, created the native-picker/private-registry services in normal launcher runs, and bundled both sidecars into release packaging.
+- Replaced `window.prompt` and `window.location.reload()` folder flow with picker -> opaque activation -> candidate-first host reconnection. Browser persistence receives only the opaque ID and display-safe label.
+- Added generation propagation (`NANOFORGE_WORKSPACE_GENERATION`) from launcher replacement host to the host descriptor, preventing successful-looking handoffs from failing generation validation.
+- Added immutable host-side `WorkspaceContext`; its browser-safe serialization omits the canonical root and display path.
+- Independently corrected the picker flow to activate a selected workspace before marking it ready, and corrected lint failures found during the final gate.
+
+**Fresh verification:**
+
+- `cmd.exe /c pnpm typecheck` — PASS (6 Turbo tasks).
+- `cmd.exe /c pnpm lint` — PASS.
+- `cmd.exe /c pnpm test -- --run --reporter=dot` — PASS (full suite; includes launcher packaging test).
+- Focused connected-workflow suite — PASS, 3 files / 13 tests.
+- `cmd.exe /c pnpm build` — PASS (production Vite build).
+- `git diff --check` — PASS.
+
+**Known limits / next milestone:** Active runs still use the existing confirmation dialog rather than the planned task-inventory switch dialog; the native picker and packaged executable require a manual visible Windows smoke run before a release claim. Large-directory pagination, full file mutations, and reveal-in-Explorer UI wiring remain later plan modules.
+
+**Launcher bootstrap fix (2026-08-26):** `loadHostSettings()` now consumes the launcher's ephemeral `hostPort`/`token` URL parameters without persisting the token. This fixes the standalone UI incorrectly showing “Local folder selection is available only from the NanoForge launcher” while opened from the launcher UI URL. `pnpm build` passed after the change; live UI reload reports `Local runtime: No workspace` (connected and awaiting a folder) rather than host offline.
+
+---
+
 ## Master Phase Status Matrix
 
 | Phase | Description | Status | Changed Files | Tests Added / Updated | Verification Gates |
@@ -217,3 +263,13 @@ Executed full static and integration verification across all workspace packages,
 
 ## Historical Workspace Context (Pre-Hardening Baseline)
 Prior implementation waves (Wave 1 Workspace/Chat migration, Swarm slash commands integration, Local Drive workspace picker & reviewed writes, and NanoGPT presentation readiness waves A/A2) established the initial feature surface through commit `0c95978`. The hardening roadmap (Phases 0–7) builds directly on this baseline to deliver enterprise-grade security, lifecycle stability, and production readiness.
+## 2026-08-26 — Host bundle protocol refresh
+
+- Rebuilt the packaged `apps/agent-host/dist/server.mjs` via `pnpm package`; the launcher executes this bundle rather than the TypeScript build output.
+- Restarted the launcher on UI `4183` / host `4184` with the authenticated session URL. The UI now stays connected; with no selected directory it reports `Workspace unavailable` instead of closing the socket with `4400 invalid message`.
+- Verified host `/health` returns `200` and the live browser page remains reachable after reload.
+## 2026-08-26 — Launcher origin allowlist and recent-folder reconnect
+
+- Added the packaged launcher UI origins (`http://localhost:4183` and `http://127.0.0.1:4183`) to the agent-host WebSocket allowlist.
+- Rebuilt and restarted the launcher with a fresh token after the prior token was consumed.
+- Live browser verification: selecting the first `skills` entry under Recent folders changed the runtime indicator to `Runtime ready`; no 4401 unauthorized-origin error remained.

@@ -65,7 +65,7 @@ import {
 } from "@/lib/hostClient";
 import type { CommandResultFrame } from "@protocol/commands";
 import type { ExecuteCommandInput, HostWorkspaceDescriptor } from "@/lib/hostClient";
-import type { WorkspaceWriteResult } from "@protocol/workspace";
+import type { WorkspaceBrokerConnection, WorkspaceWriteResult } from "@protocol/workspace";
 import type { DirEntry, FileStat, SearchMatch, GitFileStatus } from "@/types/workspace";
 import {
   useBrowserPermissions,
@@ -105,6 +105,16 @@ function defaultStorage(): Storage | undefined {
 /** Never throws; absent/corrupt payload → the disabled default. */
 export function loadHostSettings(storage: Storage | undefined = defaultStorage()): HostSettings {
   try {
+    // Standalone launcher sessions provide ephemeral host credentials in the
+    // page URL. Consume them at startup, but never write the token to storage.
+    if (typeof globalThis.location !== "undefined") {
+      const query = new URLSearchParams(globalThis.location.search);
+      const hostPort = Number(query.get("hostPort"));
+      const launcherToken = query.get("token");
+      if (Number.isInteger(hostPort) && hostPort > 0 && hostPort <= 65535 && launcherToken) {
+        return { enabled: true, port: hostPort, token: launcherToken };
+      }
+    }
     const raw = storage?.getItem(HOST_SETTINGS_KEY);
     if (!raw) return DEFAULT_HOST_SETTINGS;
     const parsed = JSON.parse(raw) as Partial<HostSettings>;
@@ -213,6 +223,7 @@ export interface HostClientLike {
   gitStatus?(): Promise<GitFileStatus[]>;
   watch?(): Promise<void>;
   unwatch?(): Promise<void>;
+  describeWorkspace?(): Promise<HostWorkspaceDescriptor>;
   selectWorkspace?(selectionToken: string): Promise<HostWorkspaceDescriptor>;
   openWorkspace?(path: string): Promise<HostWorkspaceDescriptor>;
   toggleIntegration?(kind: "rules" | "skill" | "mcp", id: string, enabled: boolean): Promise<void>;
@@ -315,6 +326,8 @@ export interface HostSession {
   unwatchWorkspace: () => Promise<boolean>;
   selectWorkspace: (selectionToken: string) => Promise<HostWorkspaceDescriptor | null>;
   openWorkspace: (path: string) => Promise<HostWorkspaceDescriptor | null>;
+  /** Atomically adopt an already-prepared broker host without a page reload. */
+  reconnectToWorkspace: (connection: WorkspaceBrokerConnection) => Promise<HostWorkspaceDescriptor | null>;
   manageTask: (params: ManageTaskParams) => Promise<ManageTaskResult | null>;
   createSchedule: (params: ScheduleParams) => Promise<ScheduleResult | null>;
   cancelSchedule: (scheduleId: string) => Promise<ManageTaskResult | null>;
@@ -351,7 +364,7 @@ export interface UseHostSessionOptions {
   /** Overrides the persisted settings (tests / wiring seam). */
   settings?: HostSettings;
   /** Injectable client factory — production uses the real HostClient. */
-  createClient?: (opts: { port: number; token: string }) => HostClientLike;
+  createClient?: (opts: { port?: number; token?: string; websocketUrl?: string }) => HostClientLike;
   /** Wiring seam: called with the live session API after every render
    *  (tests / the future plan composer). */
   onApi?: (api: HostSession) => void;
@@ -476,6 +489,7 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
   const perms = useBrowserPermissions();
 
   const clientRef = useRef<HostClientLike | null>(null);
+  const clientUnsubscribeRef = useRef<(() => void) | null>(null);
   const toolRunOwners = useRef(new Map<string, string>()); // toolId -> runId
   const pendingGrants = useRef(new Map<string, PendingGrant>()); // perm key -> grant
   // Latest-value refs keep the single host subscription stable (mounted once
@@ -942,16 +956,28 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
 
   /* ------------------------- connection ------------------------------- */
 
+  const closeActiveClient = useCallback(() => {
+    clientUnsubscribeRef.current?.();
+    clientUnsubscribeRef.current = null;
+    const current = clientRef.current;
+    clientRef.current = null;
+    current?.close();
+  }, []);
+
   useEffect(() => {
     if (!connKey) return; // host disabled — nothing to connect, status derives to "off"
     const port = settings.port as number;
     const token = settings.token as string;
-    const client = (createClient ?? ((o: { port: number; token: string }) => new HostClient(o)))({
+    const client = (createClient ?? ((o: { port?: number; token?: string; websocketUrl?: string }) => new HostClient(o)))({
       port,
       token,
     });
     clientRef.current = client;
-    const unsubscribe = client.onEvent(handleHostMessage);
+    clientUnsubscribeRef.current = client.onEvent((message) => {
+      // A socket can dispatch an already-queued event after a replacement.
+      // Only the currently adopted client is allowed to mutate session state.
+      if (clientRef.current === client) handleHostMessage(message);
+    });
     let cancelled = false;
     // setState only inside these async callbacks — never synchronously in the
     // effect body (react-hooks/set-state-in-effect).
@@ -970,13 +996,58 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
     );
     return () => {
       cancelled = true;
-      unsubscribe();
-      client.close();
-      clientRef.current = null;
+      closeActiveClient();
     };
     // settings primitives only — a new settings object with the same values
     // must NOT reconnect.
-  }, [connKey, settings.port, settings.token, createClient, handleHostMessage]);
+  }, [connKey, settings.port, settings.token, createClient, handleHostMessage, closeActiveClient]);
+
+  const reconnectToWorkspace = useCallback(async (connection: WorkspaceBrokerConnection): Promise<HostWorkspaceDescriptor | null> => {
+    const current = clientRef.current;
+    if (!current) {
+      setLastError("Cannot reconnect workspace while the local host is unavailable");
+      return null;
+    }
+
+    let candidate: HostClientLike | null = null;
+    try {
+      candidate = (createClient ?? ((o: { port?: number; token?: string; websocketUrl?: string }) => new HostClient(o)))({
+        ...(connection.websocketUrl ? { websocketUrl: connection.websocketUrl } : {}),
+        ...(connection.port !== undefined ? { port: connection.port } : {}),
+        ...(connection.token ? { token: connection.token } : {}),
+      });
+      await candidate.connect();
+      if (!candidate.describeWorkspace) throw new Error("Replacement local host cannot describe its workspace");
+      const descriptor = await candidate.describeWorkspace();
+      if (descriptor.generation !== connection.generation) {
+        throw new Error(`Replacement host generation ${descriptor.generation} does not match broker generation ${connection.generation}`);
+      }
+
+      // The candidate has proved it represents the broker-selected workspace.
+      // Only now retire the old host, so a failed candidate leaves it usable.
+      clientUnsubscribeRef.current?.();
+      clientUnsubscribeRef.current = null;
+      clientRef.current = candidate;
+      clientUnsubscribeRef.current = candidate.onEvent((message) => {
+        if (clientRef.current === candidate) handleHostMessage(message);
+      });
+      current.close();
+
+      // Workspace-scoped transient UI cannot cross a host generation.
+      toolRunOwners.current.clear();
+      pendingGrants.current.clear();
+      setToolRuns([]);
+      setRoute(null);
+      setEvidence(null);
+      setLastError(null);
+      return descriptor;
+    } catch (error) {
+      candidate?.close();
+      const message = error instanceof Error ? error.message : String(error);
+      setLastError(message);
+      return null;
+    }
+  }, [createClient, handleHostMessage]);
 
   /* ------------------------- actions ---------------------------------- */
 
@@ -1563,6 +1634,7 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
     unwatchWorkspace,
     selectWorkspace,
     openWorkspace,
+    reconnectToWorkspace,
     manageTask,
     createSchedule,
     cancelSchedule,

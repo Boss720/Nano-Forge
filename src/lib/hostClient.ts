@@ -72,6 +72,7 @@ export type HostClientRequestType =
   | "run.resume"
   | "run.cancel"
   | "tool.response"
+  | "workspace.describe"
   | "workspace.open"
   | "workspace.readDir"
   | "workspace.readFile"
@@ -620,10 +621,12 @@ export interface WebSocketLike {
 export type WebSocketFactory = (url: string) => WebSocketLike;
 
 export interface HostClientOptions {
-  /** Loopback port printed by the host on startup. */
-  port: number;
-  /** Single-use bearer token. Never persisted by this client. */
-  token: string;
+  /** Loopback port printed by the host on startup. Required without websocketUrl. */
+  port?: number;
+  /** Single-use bearer token. Required without websocketUrl. Never persisted by this client. */
+  token?: string;
+  /** Ephemeral broker-supplied endpoint. It is never written to browser storage. */
+  websocketUrl?: string;
   /** Override for tests; defaults to the global WebSocket constructor. */
   WebSocketImpl?: WebSocketFactory;
   /** Bounds failed workspace requests so a missing host reply cannot hang the UI. */
@@ -937,9 +940,16 @@ export class HostClient {
   private openPromise: { resolve: () => void; reject: (e: Error) => void } | null = null;
   private closed = false;
   private readonly requestTimeoutMs: number;
+  private workspaceGeneration: number | null = null;
 
   constructor(opts: HostClientOptions) {
-    this.url = `ws://127.0.0.1:${opts.port}/agent?token=${encodeURIComponent(opts.token)}`;
+    if (opts.websocketUrl) {
+      this.url = opts.websocketUrl;
+    } else if (typeof opts.port === "number" && opts.token) {
+      this.url = `ws://127.0.0.1:${opts.port}/agent?token=${encodeURIComponent(opts.token)}`;
+    } else {
+      throw new HostConnectionError("host connection needs websocketUrl or port and token");
+    }
     this.makeSocket =
       opts.WebSocketImpl ??
       ((url: string) => new WebSocket(url) as unknown as WebSocketLike);
@@ -1025,25 +1035,34 @@ export class HostClient {
     }).then((m) => m as ToolResponseResultMessage);
   }
 
-  readDir(path = ""): Promise<DirEntry[]> { return this.requestResult({ type: "workspace.readDir", path }).then((m) => (m as { entries: DirEntry[] }).entries); }
+  /** Read the active host workspace after a fresh broker handoff. */
+  describeWorkspace(): Promise<HostWorkspaceDescriptor> {
+    return this.requestResult({ type: "workspace.describe" }).then((m) => {
+      const workspace = (m as WorkspaceReadyMessage).workspace;
+      this.workspaceGeneration = workspace.generation;
+      return workspace;
+    });
+  }
+
+  readDir(path = ""): Promise<DirEntry[]> { return this.requestResult({ type: "workspace.readDir", path, ...this.workspaceGenerationRequest() }).then((m) => (m as { entries: DirEntry[] }).entries); }
   readFile(path: string): Promise<{ path: string; content: string; language: string; size: number; modified: string; sha256: string; generation: number }> {
-    return this.requestResult({ type: "workspace.readFile", path }).then((m) => m as { path: string; content: string; language: string; size: number; modified: string; sha256: string; generation: number });
+    return this.requestResult({ type: "workspace.readFile", path, ...this.workspaceGenerationRequest() }).then((m) => m as { path: string; content: string; language: string; size: number; modified: string; sha256: string; generation: number });
   }
   stat(path: string): Promise<FileStat> {
-    return this.requestResult({ type: "workspace.stat", path }).then((m) => (m as { stat: FileStat }).stat);
+    return this.requestResult({ type: "workspace.stat", path, ...this.workspaceGenerationRequest() }).then((m) => (m as { stat: FileStat }).stat);
   }
   search(query: string, options?: { caseSensitive?: boolean; includes?: string[]; maxResults?: number }): Promise<SearchMatch[]> {
-    return this.requestResult({ type: "workspace.search", query, options }).then((m) => (m as { matches: SearchMatch[] }).matches);
+    return this.requestResult({ type: "workspace.search", query, options, ...this.workspaceGenerationRequest() }).then((m) => (m as { matches: SearchMatch[] }).matches);
   }
-  gitStatus(): Promise<GitFileStatus[]> { return this.requestResult({ type: "workspace.gitStatus" }).then((m) => (m as { files: GitFileStatus[] }).files); }
+  gitStatus(): Promise<GitFileStatus[]> { return this.requestResult({ type: "workspace.gitStatus", ...this.workspaceGenerationRequest() }).then((m) => (m as { files: GitFileStatus[] }).files); }
   writeFile(path: string, content: string, options?: { expectedSha256?: string; expectedModified?: string }): Promise<WorkspaceWriteResult> {
-    return this.requestResult({ type: "workspace.writeFile", path, content, ...options }).then((m) => {
+    return this.requestResult({ type: "workspace.writeFile", path, content, ...options, ...this.workspaceGenerationRequest() }).then((m) => {
       if (!(m as { success?: boolean }).success) throw new HostConnectionError(`host rejected write for ${path}`);
       return m as WorkspaceWriteResult;
     });
   }
-  watch(): Promise<void> { return this.sendOneWay({ type: "workspace.watch", enabled: true }); }
-  unwatch(): Promise<void> { return this.sendOneWay({ type: "workspace.watch", enabled: false }); }
+  watch(): Promise<void> { return this.sendOneWay({ type: "workspace.watch", enabled: true, ...this.workspaceGenerationRequest() }); }
+  unwatch(): Promise<void> { return this.sendOneWay({ type: "workspace.watch", enabled: false, ...this.workspaceGenerationRequest() }); }
   /** Open a path supplied by an explicit local-user action. The host validates it. */
   openWorkspace(path: string, generation = 1): Promise<HostWorkspaceDescriptor> {
     return this.requestResult({ type: "workspace.open", path, generation }).then((m) => (m as WorkspaceReadyMessage).workspace);
@@ -1211,6 +1230,10 @@ export class HostClient {
     if (!this.ws || this.ws.readyState !== WS_OPEN) return Promise.reject(new HostConnectionError("not connected to agent host"));
     this.ws.send(JSON.stringify(msg));
     return Promise.resolve();
+  }
+
+  private workspaceGenerationRequest(): { generation?: number } {
+    return this.workspaceGeneration === null ? {} : { generation: this.workspaceGeneration };
   }
 
   private pendingRequest(requestId: string, resolve: (value?: any) => void, reject: (error: Error) => void): PendingRequest {

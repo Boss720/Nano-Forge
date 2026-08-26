@@ -45,6 +45,8 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import type { useHostSession } from "@/lib/hostSession";
+import { useWorkspaceBroker, type WorkspaceBrokerClientLike, type WorkspaceBrokerMetadata } from "@/hooks/useWorkspaceBroker";
+import type { WorkspaceBrokerConnection } from "@protocol/workspace";
 import type { useArtifacts } from "@/hooks/useArtifacts";
 import type { CommandResultFrame, SlashCommandWire } from "@protocol/commands";
 import type { HostWorkspaceDescriptor } from "@/lib/hostClient";
@@ -157,6 +159,11 @@ export interface AppLayoutProps {
   onAttachWorkspaceFile?: (path: string) => void;
   allowWorkspaceWrites?: boolean;
   onToggleWorkspaceWrites?: (enabled: boolean) => void;
+  /** Ephemeral launcher broker dependency injection; never persisted. */
+  workspaceBrokerClient?: WorkspaceBrokerClientLike;
+  workspaceBrokerMetadata?: WorkspaceBrokerMetadata | null;
+  /** Future host-session dynamic reconnect seam. The current host session has no safe implementation. */
+  onConnectionMetadata?: (connection: WorkspaceBrokerConnection) => void;
 }
 
 export function AppLayout({
@@ -205,6 +212,9 @@ export function AppLayout({
   onAttachWorkspaceFile,
   allowWorkspaceWrites,
   onToggleWorkspaceWrites,
+  workspaceBrokerClient,
+  workspaceBrokerMetadata,
+  onConnectionMetadata,
 }: AppLayoutProps) {
   const [integrationsOpen, setIntegrationsOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -216,6 +226,7 @@ export function AppLayout({
   const [workspaceRecovery, setWorkspaceRecovery] = useState<{ status: "ready" | "unavailable" | "connecting" | "unsupported"; message?: string }>({ status: "ready" });
   const [remoteViewer, setRemoteViewer] = useState<{ path: string; language: string; content: string } | null>(null);
   const [workspaceAttachmentRequest, setWorkspaceAttachmentRequest] = useState<string | null>(null);
+  const workspaceBroker = useWorkspaceBroker({ client: workspaceBrokerClient, metadata: workspaceBrokerMetadata });
 
   const handleSwarmCommand = useCallback(
     async (wire: SlashCommandWire): Promise<CommandResultFrame> => {
@@ -311,62 +322,93 @@ export function AppLayout({
       const approved = window.confirm("Opening another folder interrupts active local work. Continue?");
       if (!approved) return;
     }
-    const folderPath = window.prompt("Enter the local folder path to open (for example C:\\Projects\\MyApp).");
-    if (!folderPath?.trim()) return;
-    setWorkspaceRecovery({ status: "connecting", message: "Opening local folder…" });
-
-    // The standalone launcher owns the privileged host process. Ask it to
-    // restart the host with the new root so filesystem, terminals, watchers,
-    // memory, policy, and subagents switch atomically together.
-    try {
-      const token = new URLSearchParams(window.location.search).get("token");
-      const response = await fetch("/api/workspace", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-        body: JSON.stringify({ path: folderPath.trim() }),
-      });
-      if (response.ok) {
-        onUpdateWorkspaceLocation?.(activeWorkspace?.id ?? activeWorkspaceId, {
-          kind: "local",
-          hostWorkspaceId: `local-${crypto.randomUUID()}`,
-          displayPath: folderPath.trim(),
-          lastOpenedAt: Date.now(),
-          status: "ready",
-        });
-        setWorkspaceRecovery({ status: "ready", message: "Workspace switched. Reconnecting to the new local root…" });
-        window.location.reload();
-        return;
-      }
-    } catch {
-      // Embedded/non-launcher hosts use the websocket seam below.
-    }
-
-    const descriptor = await host.openWorkspace(folderPath.trim());
-    if (!descriptor) {
-      setWorkspaceRecovery({ status: "unavailable", message: host.lastError ?? "The local host could not open that folder." });
+    if (!workspaceBroker.available) {
+      setWorkspaceRecovery({ status: "unsupported", message: "Local folder selection is available only from the NanoForge launcher." });
       return;
     }
-    setOpenedWorkspace(descriptor);
-    const location: WorkspaceLocation = { kind: "local", hostWorkspaceId: descriptor.id, displayPath: descriptor.displayPath, lastOpenedAt: Date.now(), status: "ready" };
-    if (activeWorkspace) onUpdateWorkspaceLocation?.(activeWorkspace.id, location);
-    setWorkspaceRecovery({ status: "ready" });
-  }, [activeWorkspace, activeWorkspaceId, host, onUpdateWorkspaceLocation, running]);
+    setWorkspaceRecovery({ status: "connecting", message: "Waiting for the native folder picker…" });
+    const selection = await workspaceBroker.choose();
+    if (!selection) {
+      setWorkspaceRecovery({ status: "ready" });
+      return;
+    }
+    setWorkspaceRecovery({ status: "connecting", message: "Starting the selected local workspace…" });
+    const result = await workspaceBroker.activate(selection.workspace.workspaceId);
+    if (!result) {
+      setWorkspaceRecovery({ status: "unavailable", message: "The selected folder could not be opened. Your current workspace is unchanged." });
+      return;
+    }
+    const location: WorkspaceLocation = {
+      kind: "local",
+      hostWorkspaceId: result.workspace.workspaceId,
+      displayPath: result.workspace.label,
+      lastOpenedAt: Date.now(),
+      status: "ready",
+    };
+    const targetWorkspaceId = activeWorkspace?.id ?? activeWorkspaceId;
+    if (result.connection) {
+      setWorkspaceRecovery({ status: "connecting", message: "Connecting the selected local workspace…" });
+      const descriptor = await host.reconnectToWorkspace(result.connection);
+      if (!descriptor) {
+        onUpdateWorkspaceLocation?.(targetWorkspaceId, { ...location, status: "unavailable" });
+        setWorkspaceRecovery({ status: "unavailable", message: host.lastError ?? "The selected folder could not be connected. Your previous local host remains active." });
+        return;
+      }
+      setOpenedWorkspace(descriptor);
+      onConnectionMetadata?.(result.connection);
+      onUpdateWorkspaceLocation?.(targetWorkspaceId, location);
+      setWorkspaceRecovery({ status: "ready" });
+      return;
+    }
+    onUpdateWorkspaceLocation?.(targetWorkspaceId, { ...location, status: "unavailable" });
+    setOpenedWorkspace(null);
+    setWorkspaceRecovery({ status: "unavailable", message: "Folder selected. Dynamic host reconnection is not available in this session, so the active host was left unchanged." });
+  }, [activeWorkspace?.id, activeWorkspaceId, host, onConnectionMetadata, onUpdateWorkspaceLocation, running, workspaceBroker]);
 
   const reconnectWorkspace = useCallback(() => {
     if (activeWorkspace?.location) setWorkspaceRecovery({ status: "unavailable", message: "Reconnect the local host, then reopen this folder from Recent folders." });
     else void openFolder();
   }, [activeWorkspace?.location, openFolder]);
 
-  const openRecentWorkspace = useCallback((workspaceId: string) => {
-    onSelectWorkspace(workspaceId);
-    const location = workspaces.find((workspace) => workspace.id === workspaceId)?.location;
-    if (!location) return;
+  const openRecentWorkspace = useCallback(async (workspaceId: string) => {
+    const workspace = workspaces.find((candidate) => candidate.location?.hostWorkspaceId === workspaceId);
+    if (!workspace) return;
+    if (!workspaceBroker.available) {
+      setWorkspaceRecovery({ status: "unsupported", message: "Recent local folders can only be opened from the NanoForge launcher." });
+      return;
+    }
+    setWorkspaceRecovery({ status: "connecting", message: "Opening local folder…" });
+    const result = await workspaceBroker.activate(workspaceId);
+    if (!result) {
+      setWorkspaceRecovery({ status: "unavailable", message: "The selected recent folder could not be opened." });
+      return;
+    }
+    const location: WorkspaceLocation = {
+      kind: "local",
+      hostWorkspaceId: result.workspace.workspaceId,
+      displayPath: result.workspace.label,
+      lastOpenedAt: Date.now(),
+      status: "ready",
+    };
+    if (result.connection) {
+      setWorkspaceRecovery({ status: "connecting", message: "Connecting the selected local workspace…" });
+      const descriptor = await host.reconnectToWorkspace(result.connection);
+      if (!descriptor) {
+        onUpdateWorkspaceLocation?.(workspace.id, { ...location, status: "unavailable" });
+        setWorkspaceRecovery({ status: "unavailable", message: host.lastError ?? "The selected folder could not be connected. Your previous local host remains active." });
+        return;
+      }
+      setOpenedWorkspace(descriptor);
+      onConnectionMetadata?.(result.connection);
+      onUpdateWorkspaceLocation?.(workspace.id, location);
+      onSelectWorkspace(workspace.id);
+      setWorkspaceRecovery({ status: "ready" });
+      return;
+    }
+    onUpdateWorkspaceLocation?.(workspace.id, { ...location, status: "unavailable" });
     setOpenedWorkspace(null);
-    setWorkspaceRecovery({ status: "unavailable", message: `Reopen ${location.displayPath} through the local host to restore access.` });
-  }, [onSelectWorkspace, workspaces]);
+    setWorkspaceRecovery({ status: "unavailable", message: "Folder selected. Dynamic host reconnection is not available in this session, so the active host was left unchanged." });
+  }, [host, onConnectionMetadata, onSelectWorkspace, onUpdateWorkspaceLocation, workspaceBroker, workspaces]);
 
   const openWorkspaceFile = useCallback(async (path: string) => {
     const file = await host.readWorkspaceFile(path);

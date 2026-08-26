@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  workspaceBrokerConnectionSchema,
+  workspaceBrokerRequestSchema,
+  workspaceBrokerResponseSchema,
+  workspaceControlDescriptorSchema,
   workspaceDescriptorSchema,
   workspaceOpenRequestSchema,
   workspaceReadySchema,
@@ -65,5 +69,48 @@ describe("workspace protocol", () => {
       at: "2026-08-22T12:00:00.000Z",
     });
     expect(parsed.requestId).toBe("req-2");
+  });
+
+  describe("launcher workspace broker control frames", () => {
+    const controlDescriptor = {
+      workspaceId: "workspace-0123456789abcdef",
+      label: "alpha",
+      generation: 2,
+      capabilities: descriptor.capabilities,
+    };
+
+    it("accepts opaque, display-safe control descriptors without a root path", () => {
+      expect(workspaceControlDescriptorSchema.parse(controlDescriptor)).toEqual(controlDescriptor);
+      expect(workspaceControlDescriptorSchema.safeParse({
+        ...controlDescriptor,
+        rootPath: "C:\\projects\\alpha",
+      }).success).toBe(false);
+    });
+
+    it("rejects malformed broker control frames", () => {
+      expect(workspaceBrokerRequestSchema.safeParse({
+        type: "workspace.activate",
+        requestId: "request-1",
+        workspaceId: "workspace-0123456789abcdef",
+      }).success).toBe(false);
+      expect(workspaceBrokerResponseSchema.safeParse({
+        type: "workspace.current.result",
+        requestId: "request-1",
+        workspace: { ...controlDescriptor, rootPath: "C:\\projects\\alpha" },
+      }).success).toBe(false);
+    });
+
+    it("allows loopback connection metadata without treating it as a descriptor field", () => {
+      expect(workspaceBrokerConnectionSchema.parse({
+        websocketUrl: "ws://127.0.0.1:48123",
+        port: 48123,
+        token: "ephemeral-token",
+        generation: 2,
+      }).generation).toBe(2);
+      expect(workspaceBrokerConnectionSchema.safeParse({
+        websocketUrl: "wss://host.example.test:48123",
+        generation: 2,
+      }).success).toBe(false);
+    });
   });
 });

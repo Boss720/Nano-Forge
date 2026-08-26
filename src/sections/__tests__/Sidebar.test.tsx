@@ -98,7 +98,7 @@ describe("Sidebar", () => {
     await user.click(screen.getByRole("button", { name: "…/main" }));
     expect(onOpenFolder).toHaveBeenCalledOnce();
     expect(onReconnectWorkspace).toHaveBeenCalledOnce();
-    expect(onOpenRecentWorkspace).toHaveBeenCalledWith("workspace-main");
+    expect(onOpenRecentWorkspace).toHaveBeenCalledWith("host-main");
     expect(screen.getByText("Host disconnected")).toBeInTheDocument();
   });
 
