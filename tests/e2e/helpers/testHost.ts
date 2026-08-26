@@ -89,6 +89,7 @@ export async function launchE2ETestHost(options: { port?: number; allowWorkspace
 
   const host = await createHost({
     port: options.port ?? 0,
+    allowNonBrowserClients: true,
     session: {
       workspaceRoot: workspace.root,
       allowWorkspaceWrites: options.allowWorkspaceWrites ?? true,
@@ -174,12 +175,20 @@ export async function launchE2ETestHost(options: { port?: number; allowWorkspace
         }
       }
 
-      while (Date.now() - startTime < timeoutMs) {
-        const remaining = timeoutMs - (Date.now() - startTime);
-        if (remaining <= 0) break;
-        const msg = await nextMessage(remaining);
-        if (predicate(msg)) {
-          return msg;
+      const unmatched: Record<string, unknown>[] = [];
+      try {
+        while (Date.now() - startTime < timeoutMs) {
+          const remaining = timeoutMs - (Date.now() - startTime);
+          if (remaining <= 0) break;
+          const msg = await nextMessage(remaining);
+          if (predicate(msg)) {
+            return msg;
+          }
+          unmatched.push(msg);
+        }
+      } finally {
+        if (unmatched.length > 0) {
+          messages.unshift(...unmatched);
         }
       }
       throw new Error(`findMessage predicate not matched within ${timeoutMs}ms`);
@@ -238,6 +247,7 @@ export async function launchE2ETestHost(options: { port?: number; allowWorkspace
     url,
     token: host.token,
     close: async () => {
+      await subagentSupervisor.dispose();
       await daemonManager.dispose();
       await host.close();
       await workspace.cleanup();

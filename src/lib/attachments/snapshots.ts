@@ -3,7 +3,11 @@ export interface AttachmentSnapshotStore {
   save(snapshotId: string, content: string): Promise<void>;
   load(snapshotId: string): Promise<string | undefined>;
   remove(snapshotId: string): Promise<void>;
+  clear(): Promise<void>;
+  keys?(): Promise<string[]>;
 }
+
+export const MAX_SNAPSHOT_STORAGE_BYTES = 50 * 1024 * 1024; // 50MB
 
 export class MemoryAttachmentSnapshotStore implements AttachmentSnapshotStore {
   private readonly snapshots = new Map<string, string>();
@@ -18,6 +22,14 @@ export class MemoryAttachmentSnapshotStore implements AttachmentSnapshotStore {
 
   async remove(snapshotId: string): Promise<void> {
     this.snapshots.delete(snapshotId);
+  }
+
+  async clear(): Promise<void> {
+    this.snapshots.clear();
+  }
+
+  async keys(): Promise<string[]> {
+    return Array.from(this.snapshots.keys());
   }
 }
 
@@ -53,6 +65,16 @@ class IndexedDbAttachmentSnapshotStore implements AttachmentSnapshotStore {
   async remove(snapshotId: string): Promise<void> {
     const db = await this.open();
     await transaction(db, "readwrite", (store) => store.delete(snapshotId));
+  }
+
+  async clear(): Promise<void> {
+    const db = await this.open();
+    await transaction(db, "readwrite", (store) => store.clear());
+  }
+
+  async keys(): Promise<string[]> {
+    const db = await this.open();
+    return transaction(db, "readonly", (store) => store.getAllKeys()) as Promise<string[]>;
   }
 }
 

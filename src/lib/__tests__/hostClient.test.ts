@@ -191,8 +191,8 @@ describe("HostClient requests", () => {
     const frame = ws.sentFrames()[0];
     expect(frame).toMatchObject({ type: "plan.submit", plan });
     expect(frame.requestId).toEqual(expect.any(String));
-    ws.receive({ type: "run.event", runId: "r1", event: "accepted", requestId: frame.requestId });
-    await expect(done).resolves.toBeDefined();
+    ws.receive({ type: "plan.submit.result", requestId: frame.requestId, runId: "r1", accepted: true, at: new Date().toISOString() });
+    await expect(done).resolves.toMatchObject({ type: "plan.submit.result", runId: "r1", accepted: true });
   });
 
   it("approval.grant / approval.deny emit the exact approval frames", async () => {
@@ -207,8 +207,8 @@ describe("HostClient requests", () => {
       runId: "run-1",
       stepId: "step-7",
     });
-    ws.receive({ type: "run.event", runId: "run-1", event: "approval.granted", requestId: grantFrame.requestId });
-    await expect(grant).resolves.toBeDefined();
+    ws.receive({ type: "approval.grant.result", requestId: grantFrame.requestId, runId: "run-1", stepId: "step-7", resolved: true, at: new Date().toISOString() });
+    await expect(grant).resolves.toMatchObject({ type: "approval.grant.result", runId: "run-1", stepId: "step-7", resolved: true });
 
     const deny = client.denyApproval("run-1", "step-8");
     const denyFrame = ws.sentFrames()[1];
@@ -218,8 +218,8 @@ describe("HostClient requests", () => {
       runId: "run-1",
       stepId: "step-8",
     });
-    ws.receive({ type: "run.event", runId: "run-1", event: "approval.denied", requestId: denyFrame.requestId });
-    await expect(deny).resolves.toBeDefined();
+    ws.receive({ type: "approval.deny.result", requestId: denyFrame.requestId, runId: "run-1", stepId: "step-8", resolved: true, at: new Date().toISOString() });
+    await expect(deny).resolves.toMatchObject({ type: "approval.deny.result", runId: "run-1", stepId: "step-8", resolved: true });
   });
 
   it("run.pause and run.cancel send their control frames", async () => {
@@ -228,14 +228,14 @@ describe("HostClient requests", () => {
     const p1 = client.pauseRun("r9");
     const f1 = ws.sentFrames()[0];
     expect(f1).toMatchObject({ type: "run.pause", runId: "r9" });
-    ws.receive({ type: "run.state", runId: "r9", state: "paused", requestId: f1.requestId });
-    await expect(p1).resolves.toBeDefined();
+    ws.receive({ type: "run.pause.result", requestId: f1.requestId, runId: "r9", at: new Date().toISOString() });
+    await expect(p1).resolves.toMatchObject({ type: "run.pause.result", runId: "r9" });
 
     const p2 = client.cancelRun("r9");
     const f2 = ws.sentFrames()[1];
     expect(f2).toMatchObject({ type: "run.cancel", runId: "r9" });
-    ws.receive({ type: "run.event", runId: "r9", event: "cancelled", requestId: f2.requestId });
-    await expect(p2).resolves.toBeDefined();
+    ws.receive({ type: "run.cancel.result", requestId: f2.requestId, runId: "r9", at: new Date().toISOString() });
+    await expect(p2).resolves.toMatchObject({ type: "run.cancel.result", runId: "r9" });
   });
 
   it("rejecting a request produces NO tool execution frame — only approval.deny", async () => {
@@ -244,7 +244,7 @@ describe("HostClient requests", () => {
     // host proposes a tool; the user denies it
     const deny = client.denyApproval("run-1", "step-3");
     const frame = ws.sentFrames()[0];
-    ws.receive({ type: "run.event", runId: "run-1", event: "approval.denied", requestId: frame.requestId });
+    ws.receive({ type: "approval.deny.result", requestId: frame.requestId, runId: "run-1", stepId: "step-3", resolved: true, at: new Date().toISOString() });
     await expect(deny).resolves.toBeDefined();
 
     // the exact and only frame on the wire is the denial — the client never
@@ -352,6 +352,13 @@ describe("parseHostMessage", () => {
         }),
       ),
     ).toMatchObject({ type: "command.result", requestId: "req-1" });
+    expect(parseHostMessage(JSON.stringify({ type: "plan.submit.result", requestId: "r1", runId: "run-1", accepted: true, at: "2026-08-26T00:00:00Z" }))).toMatchObject({ type: "plan.submit.result" });
+    expect(parseHostMessage(JSON.stringify({ type: "run.pause.result", requestId: "r1", runId: "run-1", at: "2026-08-26T00:00:00Z" }))).toMatchObject({ type: "run.pause.result" });
+    expect(parseHostMessage(JSON.stringify({ type: "run.resume.result", requestId: "r1", runId: "run-1", at: "2026-08-26T00:00:00Z" }))).toMatchObject({ type: "run.resume.result" });
+    expect(parseHostMessage(JSON.stringify({ type: "run.cancel.result", requestId: "r1", runId: "run-1", at: "2026-08-26T00:00:00Z" }))).toMatchObject({ type: "run.cancel.result" });
+    expect(parseHostMessage(JSON.stringify({ type: "approval.grant.result", requestId: "r1", runId: "run-1", stepId: "s1", resolved: true, at: "2026-08-26T00:00:00Z" }))).toMatchObject({ type: "approval.grant.result" });
+    expect(parseHostMessage(JSON.stringify({ type: "approval.deny.result", requestId: "r1", runId: "run-1", stepId: "s1", resolved: true, at: "2026-08-26T00:00:00Z" }))).toMatchObject({ type: "approval.deny.result" });
+    expect(parseHostMessage(JSON.stringify({ type: "tool.response.result", requestId: "r1", resolved: true, at: "2026-08-26T00:00:00Z" }))).toMatchObject({ type: "tool.response.result" });
   });
 
   it("rejects non-JSON, arrays, unknown types, and bad field types", () => {

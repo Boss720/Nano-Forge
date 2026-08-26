@@ -1,167 +1,219 @@
-# Local Workspace Assessment and Proposal Review
+# NanoForge Hardening & Production Readiness Progress Tracking (Phases 0–7)
 
-## Objective
+## Master Phase Status Matrix
 
-Assess the current NanoForge workspace and produce a concrete, prioritized set of feature and quality-of-life recommendations. This review is read-only with respect to existing source, tests, and generated artifacts.
+| Phase | Description | Status | Changed Files | Tests Added / Updated | Verification Gates |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Phase 0** | Baseline Inspection & Verification Setup | **COMPLETED** | `PROGRESS.md` | Baseline Recorded (60 test files / 616 tests) | Typecheck: PASS<br>Lint: PASS<br>Tests: 616/616 PASS<br>Build: PASS |
+| **Phase 1** | Repair Host Run-Control Acknowledgements | **COMPLETED** | `packages/protocol/src/lifecycle.ts`<br>`packages/protocol/src/__tests__/lifecycle.test.ts`<br>`apps/agent-host/src/protocol.ts`<br>`apps/agent-host/src/session.ts`<br>`apps/agent-host/src/session.runControl.test.ts`<br>`apps/agent-host/src/session.runControl.adversarial.test.ts`<br>`src/lib/hostClient.ts`<br>`src/lib/hostSession.ts`<br>`src/lib/__tests__/hostClient.test.ts`<br>`src/lib/__tests__/hostClient.runControl.test.ts`<br>`src/lib/__tests__/hostClient.runControl.adversarial.test.ts` | Unit tests (`lifecycle.test.ts`, `hostClient.test.ts`, `hostClient.runControl.test.ts`, `hostClient.runControl.adversarial.test.ts`) & Integration/Adversarial tests (`session.runControl.test.ts`, `session.runControl.adversarial.test.ts`) | Typecheck: PASS<br>tsc -b: PASS<br>Lint: PASS<br>test: 623/623 PASS<br>build: PASS |
+| **Phase 2** | Harden Swarm Slash Commands & Subagent Paths | **COMPLETED** | `packages/protocol/src/subagents.ts`<br>`apps/agent-host/src/session.ts`<br>`apps/agent-host/src/agents/supervisor.ts`<br>`apps/agent-host/src/session.command.adversarial.test.ts`<br>`apps/agent-host/src/agents/agents.adversarial.test.ts` | Unit tests (`session.command.test.ts`) & Adversarial tests (`session.command.adversarial.test.ts`, `agents.adversarial.test.ts`) | Typecheck: PASS<br>tsc -b: PASS<br>Lint: PASS<br>test: 625/625 PASS |
+| **Phase 3** | Reviewed Local Writes Opt-In & Conflict Safety | **COMPLETED** | `scripts/nanoforge-launcher.cjs`<br>`src/types/index.ts`<br>`src/sections/ConnectDialog.tsx`<br>`src/hooks/useAgentOrchestration.ts`<br>`src/hooks/__tests__/useAgentOrchestration.test.tsx`<br>`src/sections/__tests__/ConnectDialog.writes.test.tsx`<br>`scripts/__tests__/nanoforge-launcher.writes.test.ts` | Unit & hook tests (`useAgentOrchestration.test.tsx`, `ConnectDialog.writes.test.tsx`, `nanoforge-launcher.writes.test.ts`) | Typecheck: PASS<br>tsc -b: PASS<br>Lint: PASS<br>test: 635/635 PASS |
+| **Phase 4** | Fix Session Lifecycle Leaks & Cancellation Correctness | **COMPLETED** | `apps/agent-host/src/session.ts`<br>`apps/agent-host/src/agents/supervisor.ts`<br>`apps/agent-host/src/daemons/supervisor.ts`<br>`apps/agent-host/src/daemons/scheduler.ts`<br>`src/hooks/useAgentOrchestration.ts`<br>`apps/agent-host/src/lifecycle.test.ts` | Disconnect lifecycle tests (11 connect/disconnect cycles with zero listener warnings), run-scoped cancellation tests | Typecheck: PASS<br>tsc -b: PASS<br>Lint: PASS<br>Zero MaxListenersExceededWarning |
+| **Phase 5** | Tighten Loopback Origin & Search Handling | **COMPLETED** | `apps/agent-host/src/server.ts`<br>`apps/agent-host/src/workspace/filesystem.ts`<br>`apps/agent-host/src/security_invariants.adversarial.test.ts` | Exact allowed origin tests, null/missing origin rejection tests, `--` positional delimiter search injection tests | Typecheck: PASS<br>tsc -b: PASS<br>Lint: PASS<br>test:host: PASS |
+| **Phase 6** | Attachment Retention & Swarm UX Semantics | **COMPLETED** | `src/lib/attachments/validation.ts`<br>`src/lib/attachments/snapshots.ts`<br>`src/hooks/useSessionPersistence.ts`<br>`src/sections/ConnectDialog.tsx`<br>`apps/agent-host/src/agents/supervisor.ts`<br>`src/lib/attachments/validation.test.ts`<br>`src/lib/attachments/snapshots.test.ts` | Snapshot store clear/keys tests, expanded sensitive filename pattern tests, chat snapshot pruning tests | Typecheck: PASS<br>tsc -b: PASS<br>Lint: PASS<br>test: PASS |
+| **Phase 7** | Final Verification & Release Readiness | **COMPLETED** | `tests/e2e/e2e_phase7_smoke.test.ts`<br>`tests/e2e/helpers/testHost.ts`<br>`PROGRESS.md` | Full E2E smoke integration test (origin check, default write denial, reviewed write with SHA-256, conflict rejection, plan submit/pause/cancel ACKs, slash inspect confinement) | Typecheck: PASS (4 pkgs)<br>Lint: PASS (0 errs)<br>Tests: 643/643 PASS (64 files)<br>Build: PASS (dist & bundle)<br>No Listener Warnings |
 
-## Local Workspace Context
+---
 
-- Root: `C:\Users\Hp\Documents\kimi\Workspaces\kpkoj\nano-forge`
-- Review basis: the files currently present in this local workspace.
-- Git metadata, history, branch state, and diffs are outside the assessment scope.
+## Phase 0: Baseline Inspection & Verification Setup
 
-## Lanes
+### Status: COMPLETED
 
-- Assessment subagent: architecture, code quality, performance, evidence-backed observations.
-- Proposal subagent: actionable feature/QoL ideas, each with rationale, scope fit, effort, and impact.
-- Coordinator: pass the assessment handoff to the proposal lane, independently reconcile findings, and produce the requested output.
+### Description
+Establish a clean baseline on the `hardening-phases-0-7` feature branch by verifying existing codebase health across all packages, running full static analysis, typechecking, linting, and comprehensive test suites, and cataloging pre-existing defects and quality signals.
 
-## Wave 1 Status
+### Changed Files
+- `PROGRESS.md`: Initialized comprehensive Phase 0–7 tracking matrix and baseline record.
 
-- Dispatched two read-only local-workspace lanes: assessment and feature/QoL proposals.
-- Assessment report completed.
-- Proposal report completed independently, then refined after receiving the assessment handoff.
+### Tests Added / Updated
+- Baseline suite verified: 60 test files, 616 tests passed across root, protocol, agent-host, core, sdk, and E2E suites.
 
-## Wave 1 Evidence
+### Verification Results
 
-- Local stack: TypeScript monorepo with React/Vite frontend, Fastify/WebSocket host, shared protocol/core/SDK packages, and pnpm/Turbo orchestration.
-- Fresh assessment proof: all listed package typechecks and `pnpm lint` passed; root `pnpm test` reported 1 failed file and 50 passed, with 1 failed test and 581 passed.
-- Assessment findings: request-correlation inconsistency; per-socket disposal of shared PTY/daemon resources; synchronous audit I/O; repeated full-session persistence/rendering during streams; artifact sandbox/message validation gap; large-diff and unbounded-resource risks.
-- Proposal handoff completed: the proposal lane elevated reliability, lifecycle verification, performance, sandbox hardening, and audit/session visibility in that order.
+| Gate / Command | Result | Notes / Details |
+| :--- | :--- | :--- |
+| `cmd.exe /c pnpm typecheck` | **PASS** (code 0) | 6/6 Turbo tasks successful across `@nanoforge/protocol`, `@nanoforge/core`, `@nanoforge/sdk`, `@nanoforge/agent-host` |
+| `cmd.exe /c pnpm exec tsc -b` | **PASS** (code 0) | 0 root frontend TypeScript diagnostics |
+| `cmd.exe /c pnpm lint` | **PASS** (code 0) | 0 ESLint errors/warnings across entire workspace |
+| `cmd.exe /c pnpm test -- --run` | **PASS** (code 0) | 60 test files passed, 616 tests passed (28.28s) |
+| `cmd.exe /c pnpm test:protocol` | **PASS** (code 0) | 18 test files passed, 378 tests passed (2.28s) |
+| `cmd.exe /c pnpm test:host` | **PASS** (code 0) | 44 test files passed, 418 tests passed (9.08s) |
+| `cmd.exe /c pnpm test:core` | **PASS** (code 0) | 8 test files passed, 95 tests passed (1.70s) |
+| `cmd.exe /c pnpm test:sdk` | **PASS** (code 0) | 1 test file passed, 13 tests passed (0.95s) |
+| `cmd.exe /c pnpm test:e2e` | **PASS** (code 0) | 8 test files passed, 178 tests passed (7.71s) |
 
-## Verification Plan
+---
 
-- Independently inspect the local directory structure and relevant files.
-- Treat subagent reports as claims until corroborated against the workspace.
-- Do not run mutating commands or alter existing user changes.
+## Phase 1: Repair Host Run-Control Acknowledgements
 
-## Open Decisions
+### Status: COMPLETED
 
-- Product goals and user priorities are not explicitly documented in the request; proposals must remain within the apparent NanoForge agent-platform scope and call out assumptions.
+### Description
+Ensured all host run-control and mutation operations (`plan.submit`, `run.pause`, `run.resume`, `run.cancel`, `approval.grant`, `approval.deny`, `tool.response`) return typed success/error responses containing the caller's original `requestId`. For plan submissions, the acknowledgement frame carries both `runId` and `planId`. Eliminated client-side request timeouts caused by mismatched/untyped notifications and removed silent `.catch(() => {})` error swallowing in `hostSession.ts`, routing errors to `setLastError`.
 
-## Implementation Objective
+### Key Objectives Achieved
+1. Introduced 7 typed success-result schemas in `packages/protocol/src/lifecycle.ts` and unit tested them in `packages/protocol/src/__tests__/lifecycle.test.ts`.
+2. Updated `apps/agent-host/src/protocol.ts` to re-export schemas and accept `requestId: idSchema.optional()` on all client mutation request schemas and host error frame.
+3. Updated `apps/agent-host/src/session.ts` to emit typed result frames with `requestId` and `runId`, route `unknown_run` errors with `requestId` and `runId`, and support `SocketApprovalGate.resolve` by exact `requestId` or `${runId}:${stepId}` prefix.
+4. Updated `src/lib/hostClient.ts` to parse typed result frames and resolve `submitPlan`, `pauseRun`, `resumeRun`, `cancelRun`, `grantApproval`, `denyApproval`, and `sendToolResponse` immediately via `requestResult`.
+5. Updated `src/lib/hostSession.ts` to route errors from `sendGrant`, `runApproved`, `pause`, `cancel`, and `stopToolRun` to `setLastError`.
+6. Added full client-host integration tests in `apps/agent-host/src/session.runControl.test.ts` covering immediate resolution, runId retrieval, pause/resume/cancel results, approval resolution, unknown run error handling, and zero pending frame leaks.
 
-- Make workspaces and chats easier to create and manage from the left sidebar.
-- Preserve existing sessions and files through a versioned local persistence migration.
-- Keep workspace removal non-destructive: remove the app reference, never delete files from disk.
+### Changed Files
+- `packages/protocol/src/lifecycle.ts`
+- `packages/protocol/src/__tests__/lifecycle.test.ts`
+- `apps/agent-host/src/protocol.ts`
+- `apps/agent-host/src/session.ts`
+- `apps/agent-host/src/session.runControl.test.ts`
+- `apps/agent-host/src/session.runControl.adversarial.test.ts`
+- `src/lib/hostClient.ts`
+- `src/lib/hostSession.ts`
+- `src/lib/__tests__/hostClient.test.ts`
+- `src/lib/__tests__/hostClient.runControl.test.ts`
+- `src/lib/__tests__/hostClient.runControl.adversarial.test.ts`
 
-## Implementation Waves
+---
 
-- Wave 1A: workspace/chat data model and persistence migration — completed.
-- Wave 1B: sidebar interaction surface — completed.
-- Wave 2: layout wiring, compatibility, tests, and independent verification — completed.
+## Phase 2: Harden Swarm Slash Commands & Subagent Paths
 
-## Implementation Evidence
+### Status: COMPLETED
 
-- Added Workspace and Chat types, version 2 persistence, legacy payload migration/aliases, and management actions for create/switch/rename/archive/delete/duplicate/pin.
-- Replaced the flat sidebar with workspace grouping, pinned/recent/archived chats, search, inline rename, action controls, empty states, and preserved file selection.
-- Wired desktop and mobile AppLayout instances to the new hook contract.
-- Added focused persistence, hook, and sidebar tests.
-- Final local verification: `pnpm test` — 53 files, 589 tests passed; `pnpm lint` passed; `pnpm build` passed.
-- Build warnings retained: existing ThemeCustomizer import/chunking warning and large bundle warning.
+### Description
+Replaced raw string casting of slash-command arguments with protocol Zod schema validation (`invokeSubagentParamsSchema`, `manageSubagentsParamsSchema`, `sendMessageParamsSchema`). Confined subagent inspection and metadata paths strictly within `.agents/<name>_<shortId>` inside the workspace root using multi-pass sanitization, allowlist enforcement, and canonical + relative path checks.
 
-## Swarm Integration Objective
+### Key Objectives Achieved
+1. Built a typed command adapter in `apps/agent-host/src/session.ts` for slash command parsing (`/swarm run`, `/swarm inspect`, `/swarm list`, `/swarm tree`, `/swarm pause`, `/swarm resume`, `/swarm stop`, `/swarm message`) with strict protocol Zod schema validation and structured error response `{ code: "invalid_command", issues: [...] }`.
+2. Restricted `/swarm inspect` to `manageSubagentsInspectFileSchema` enum values (`progress.md`, `BRIEFING.md`, `handoff.md`, `DISPATCH.md`, `analysis.md`).
+3. Added defense-in-depth in `SubagentSupervisor.manageSubagents()` validating allowlist compliance, multi-pass path sanitization (rejecting null bytes and URL encodings), `.agents` containment, and subagent directory lexical/canonical confinement before reading files.
+4. Validated and normalized subagent names in `SubagentSupervisor.spawnSubagent()` using `validateSubagentName()` (enforcing `/^[a-zA-Z0-9_\-]+$/`, rejecting path separators, `..`, drive prefixes, control chars) and verified metadata directory confinement inside `<workspaceRoot>/.agents`.
+5. Added comprehensive unit and adversarial test suites covering traversal attempts (`--file ../../../secret`, `/etc/passwd`, `C:\Windows\win.ini`), URL encodings (`%2e%2e%2f`), malicious names, invalid budgets/timeouts, and valid inspection of all 5 allowed files.
 
-- Integrate intuitive subagent swarm launching and management into chat.
-- Add compatible slash commands using the existing command parser and protocol frames.
-- Preserve current supervisor limits, workspace isolation, approvals, budgets, and audit behavior.
+### Changed Files
+- `packages/protocol/src/subagents.ts`
+- `apps/agent-host/src/session.ts`
+- `apps/agent-host/src/agents/supervisor.ts`
+- `apps/agent-host/src/session.command.adversarial.test.ts`
+- `apps/agent-host/src/agents/agents.adversarial.test.ts`
 
-## Swarm Implementation Waves
+---
 
-- Wave S1A: protocol command definitions and parser tests — completed.
-- Wave S1B: swarm panel/launch UX — completed.
-- Wave S1C: host/client command execution wiring — completed.
-- Wave S2: composer/layout integration and verification — completed.
+## Phase 3: Reviewed Local Writes Opt-In & Conflict Safety
 
-## Swarm Implementation Evidence
+### Status: COMPLETED
 
-- Added `/swarm`, `/agents`, and `/agent` definitions to the shared protocol registry, including aliases, typed operations, and parser/result schemas.
-- Added a guided launch flow with role templates, mission goal, concurrency/depth/budget validation, dry-run preview, explicit confirmation, and a mission overview with focus/inspect actions.
-- Added typed `command.execute`/`command.result` host-client correlation, disconnect handling, and structured unsupported-command errors.
-- Integrated the composer so swarm commands execute through the host instead of being sent as ordinary model prompts. Bare `/swarm` opens the control plane; aliases normalize to the same host operation; command outcomes render inline.
-- Corrected host dispatch so documented `/swarm run "goal"` treats the quoted goal as the prompt, and added dispatcher coverage for `/agents` defaulting to list.
-- Feature-specific verification: protocol 17 files/375 tests passed; host 42 files/396 tests passed; composer swarm coverage passed; app, host, protocol, and all package typechecks passed; `pnpm lint` and `pnpm build` passed.
-- Repository-wide `pnpm test` result: 50 files/587 tests passed and 4 existing E2E files/8 tests failed in host-daemon timing, standalone-host startup, and lazy-dock import scenarios; no failures were in the new swarm/protocol/composer coverage.
-- Build warnings retained: existing ThemeCustomizer import/chunking warning and large bundle warning.
+### Description
+Ensured local workspace writes are genuinely opt-in (disabled by default in launcher) and protected against concurrent modification conflicts via atomic hash/mtime verification.
 
-## Local Workspace and File Attachment Planning Objective
+### Key Objectives Achieved
+1. Changed `scripts/nanoforge-launcher.cjs` so `NANOFORGE_ALLOW_WORKSPACE_WRITES` defaults to `0` (disabled by default).
+2. Added an explicit user-facing "Enable reviewed local writes" setting tab in `src/sections/ConnectDialog.tsx` showing the active workspace root and requiring deliberate confirmation.
+3. Updated `VirtualFile` in `src/types/index.ts` to retain `sha256`, `modified`, and `size`.
+4. In `src/hooks/useAgentOrchestration.ts`, `writeWorkspaceFile` transmits `expectedSha256` and `expectedModified`; catches `write_conflict` without marking patches applied and surfaces an actionable conflict notice.
+5. Preserved host-side `allowWorkspaceWrites` check as the definitive privileged security boundary.
 
-- Define an implementation-ready plan for opening a workspace from a local drive, working against that directory safely, and making file attachment functional in chat.
-- Scope was local-workspace implementation; no Git metadata or repository history was required.
-- Lanes: local workspace discovery/security; attachment UX/data flow; integrated rollout and acceptance criteria.
+### Changed Files
+- `scripts/nanoforge-launcher.cjs`
+- `src/types/index.ts`
+- `src/sections/ConnectDialog.tsx`
+- `src/hooks/useAgentOrchestration.ts`
+- `src/hooks/__tests__/useAgentOrchestration.test.tsx`
+- `src/sections/__tests__/ConnectDialog.writes.test.tsx`
+- `scripts/__tests__/nanoforge-launcher.writes.test.ts`
 
-## Local Workspace and File Attachment Planning Evidence
+---
 
-- Three independent read-only lanes completed; no source files were modified.
-- Local workspace finding: frontend workspaces are `localStorage` chat containers, while the agent host uses a fixed startup `workspaceRoot`; there is no folder picker, workspace-open protocol, or active-root binding.
-- Attachment finding: `ChatComposer` creates `@file` mentions, but `ChatPanel` drops them, orchestration accepts only text, and context packing serializes only message content. There is no browser file picker or drag/drop flow.
-- Existing host foundation: directory listing, secure file reads, writes, stat/search, and watcher support exist, but the browser client lacks read-file/stat/watch wrappers and correlated filesystem result handling.
-- Recommended implementation order: workspace identity/protocol; one shared workspace-scoped host runtime; local-folder picker and safe switching; complete client filesystem bridge; live explorer; first-class attachment snapshots/context; reviewed versioned writes; security and lifecycle tests.
-- Critical risks: arbitrary-root authority, split roots between filesystem/terminal/subagents, stale requests after switching, path disclosure in browser persistence, direct overwrite without version checks, and large/binary/secret attachments.
+## Phase 4: Fix Session Lifecycle Leaks & Cancellation Correctness
 
-## Full Local Workspace and Attachment Implementation
+### Status: COMPLETED
 
-- User requested implementation of all eight workspace, explorer, attachment, write-safety, and recovery proposals.
-- Scope remains local-drive functionality in the current browser + local agent-host architecture; Git metadata is intentionally outside scope.
-- Wave 1 lanes and exclusive ownership:
-  - Host/runtime lane: `packages/protocol`, `apps/agent-host`, `scripts/nanoforge-launcher.cjs`.
-  - Frontend workspace lane: workspace state/persistence, `src/lib/hostClient.ts`, `src/lib/hostSession.ts`, `src/hooks/use-workspace.ts`, explorer/sidebar/layout surfaces.
-  - Attachment lane: attachment store/types plus composer, chat/orchestration/context and attachment tests.
-  - Reviewed-write/recovery lane: host write safety/tests and integration-only recovery surfaces not owned by the other lanes.
-- Coordinator reconciliation completed across protocol, host runtime, launcher, frontend workspace UX, attachments, and reviewed writes.
+### Description
+Eliminated EventEmitter listener leaks on `DaemonSupervisor`, `TaskScheduler`, and `SubagentSupervisor` by storing and invoking unsubscribe callbacks on WebSocket close. Refactored orchestration cancellation from global refs to run-scoped cancellation objects.
 
-## Implementation Completion Evidence
+### Key Objectives Achieved
+1. In `apps/agent-host/src/session.ts`, stored unsubscribe handles (`unsubSubagents`, `unsubMemory`, `unsubSupervisor`, `unsubScheduler`, `unsubEventLog`) and invoked each on socket close.
+2. In `apps/agent-host/src/agents/supervisor.ts`, stored `unsubDaemons` and `unsubScheduler` from constructor and invoked them in `dispose()`.
+3. Set `setMaxListeners(100)` on `DaemonSupervisor`, `TaskScheduler`, and `SubagentSupervisor`.
+4. Guarded shared daemon/pty manager disposal so server-owned instances persist while connection-owned instances tear down cleanly.
+5. In `src/hooks/useAgentOrchestration.ts`, replaced global `demoCancelledRef`/`abortRef` with run-scoped `ActiveRun` object `{ runId, sessionId, agentMsgId, cancelled, controller }`.
+6. Verified 11 connect/disconnect cycles in `lifecycle.test.ts` with zero listener warnings.
 
-- Open Folder now validates a user-entered local directory through the loopback launcher API, restarts the agent host with the new root, waits for `/health`, persists opaque workspace metadata, and reloads the UI. Embedded hosts retain the correlated websocket fallback.
-- The host runtime binds filesystem, policy, audit, coordinator, PTY, daemons, subagents, and memory to one canonical root. Cross-root websocket switching returns `reconnect_required`; launcher restart performs the atomic replacement boundary.
-- Sidebar workspace explorer is host-backed with lazy tree loading, search, Git status refresh, file preview, attach-to-chat, error/reconnect states, recent folders, and active-run confirmation.
-- Attachments support `@file`, paperclip picker, drag/drop, workspace-relative reads, IndexedDB snapshots, content-free persisted metadata, bounded untrusted context blocks, size/count limits, blocked binary/secret/archive types, retry/remove/truncation states, and message chips.
-- Accepted patches hydrate the current workspace file, obtain an mtime snapshot, call the host reviewed-write route, and only mark the patch applied after the host performs an atomic write. The launcher opts this route into the explicit UI approval workflow; the host-side default remains disabled for direct embeddings.
-- Fresh verification: app `tsc --noEmit` passed; focused UI tests 5 files/41 tests passed; protocol 18 files/378 tests passed; agent-host 43 files/406 tests passed; root `pnpm test` 58 files/611 tests passed; `pnpm lint` passed with no warnings; `pnpm build` passed.
-- Live launcher proof: `/api/workspace` switched the running host to a temporary local folder and back to `C:\Users\Hp\Documents\kimi\Workspaces\kpkoj\nano-forge`, with successful replacement-host health responses.
-- Build warning retained: Vite reports the existing ThemeCustomizer static/dynamic import overlap and large bundle-size warning; neither blocks the implemented features.
+### Changed Files
+- `apps/agent-host/src/session.ts`
+- `apps/agent-host/src/agents/supervisor.ts`
+- `apps/agent-host/src/daemons/supervisor.ts`
+- `apps/agent-host/src/daemons/scheduler.ts`
+- `src/hooks/useAgentOrchestration.ts`
+- `apps/agent-host/src/lifecycle.test.ts`
 
-## NanoGPT Presentation Readiness Review
+---
 
-- Objective: produce an evidence-backed plan for must-do fixes, quality-of-life improvements, additional features, and collaboration positioning before presenting NanoForge to the NanoGPT team.
-- Scope: read-only assessment of the current local workspace and running app. Git metadata/history is intentionally excluded.
-- Independent lanes:
-  - Product/demo lane: first-run UX, demo narrative, visual polish, discoverability, and video/live-demo readiness.
-  - Technical/release lane: architecture overview, deployment reproducibility, security/privacy, tests, packaging, and operational risks.
-  - NanoGPT/collaboration lane: provider integration depth, missing NanoGPT-specific capabilities, partnership options, and proposal framing.
-- Coordinator: corroborate findings against local files and current app, rank by presentation impact, and define acceptance criteria and effort.
-- Status: all three independent lanes completed and were reconciled. No product source was modified.
-- Plan artifact: `docs/plans/2026-08-22-nanogpt-presentation-readiness.md`.
-- Highest-priority findings independently corroborated:
-  - Scripted demo patches can reach the host write callback and must be isolated from real disk writes.
-  - Workspace reads lack sensitive-file deny rules; daemon tasks inherit the host environment; write authorization is globally enabled by the launcher.
-  - Static launcher path/URI handling needs real regression hardening.
-  - README/UI/SDK/release materials conflict on affiliation, key storage, model counts, endpoints, and versions.
-  - Browser-direct NanoGPT calls exist, but no real authenticated contract smoke result or first-class host-routed NanoGPT provider was found.
-- Release recommendation: private walkthrough only after safe demo isolation, truthful copy, and a real NanoGPT golden-path test; downloadable pilot only after all P0 security and packaging gates; hosted trial deferred pending tenant isolation.
+## Phase 5: Tighten Loopback Origin & Search Handling
 
-## NanoGPT Readiness Implementation Wave A
+### Status: COMPLETED
 
-- Objective: implement the first presentation-readiness gates without disturbing unrelated local work.
-- Security lane: sensitive workspace path policy, daemon environment isolation, and launcher path/URI hardening. Allowlist: `apps/agent-host/src/workspace/**`, `apps/agent-host/src/daemons/supervisor.ts`, `scripts/nanoforge-launcher.cjs`, and their focused tests.
-- Demo lane: default-deny workspace writes for demo/browser-direct flows and separate local-runtime/API status signals. Allowlist: orchestration and top-level status surfaces plus focused tests.
-- Documentation lane: NanoGPT-facing README, technical overview, known limitations, and collaboration framing. Allowlist: `README.md`, `docs/technical-overview.md`, `docs/known-limitations.md`, and SDK-facing docs only.
-- Coordinator work: reconcile independent patches, update contradictory UI copy outside the delegated allowlists, run the required verification gates, and prepare the requested remote push.
-- Existing `.agents/**` and generated release artifacts remain outside the release commit unless explicitly needed by the project source.
+### Description
+Enforced strict WebSocket origin validation on the agent host, rejecting `null`, missing origins, and unapproved wildcards. Hardened workspace search against ripgrep command-line flag injection.
 
-## NanoGPT Readiness Implementation Wave A2
+### Key Objectives Achieved
+1. In `apps/agent-host/src/server.ts`, implemented `DEFAULT_ALLOWED_ORIGINS` (`http://localhost:3000`, `http://127.0.0.1:3000`, `http://localhost:4173`, `http://127.0.0.1:4173`, `http://localhost:5173`, `http://127.0.0.1:5173`, `http://localhost:4040`, `http://127.0.0.1:4040`, `https://nano-gpt.com`).
+2. Rejected `null` and missing origins by default unless `allowNonBrowserClients: true` is explicitly provided.
+3. In `apps/agent-host/src/workspace/filesystem.ts`, placed `--` positional delimiter before search queries in `handleSearch` to prevent ripgrep option injection (e.g. `--help`, `-F`).
+4. Clamped `maxResults` to `[1, 500]`, validated include glob patterns, and returned structured `WorkspaceFileError` on tool errors.
 
-- Status: in progress after the local baseline was published to `origin/main` at commit `0c95978`.
-- Security lane owner: workspace policy, daemon environment, launcher boundary, and focused adversarial tests. No frontend or documentation overlap.
-- Demo lane owner: orchestration write capability gate, API/local runtime status, and focused UI tests. No host security or documentation overlap.
-- Documentation lane owner: NanoGPT-facing README, technical overview, known limitations, and collaboration framing. No product source overlap.
-- Acceptance gate: workers must provide raw focused verification; coordinator must inspect the complete combined diff and independently run app/package typechecks, full tests, lint, and build before accepting the wave.
-- Git boundary: generated `.agents/**` records are local swarm metadata and remain excluded from product commits; all product changes from this wave will be committed and pushed after verification.
+### Changed Files
+- `apps/agent-host/src/server.ts`
+- `apps/agent-host/src/workspace/filesystem.ts`
+- `apps/agent-host/src/security_invariants.adversarial.test.ts`
 
-## NanoGPT Readiness Implementation Wave A2 Evidence
+---
 
-- Completed three independent lanes and reconciled their patches: sensitive workspace policy and watcher/search filtering; minimal child environments and hardened launcher containment; virtual-by-default demo writes and separate API/runtime status; NanoGPT-facing README, technical overview, known limitations, SDK guidance, and presentation checklist.
-- Coordinator corrections: removed stale hard-coded catalog counts and local-storage key wording from UI copy, aligned ChatComposer tests with the truthful runtime label, and corrected strict typing/lint issues in the new focused tests.
-- Independent verification: app, protocol, host, core, and SDK typechecks passed; `pnpm lint` passed; full `pnpm test` passed with 60 files / 616 tests; `pnpm build` passed.
-- Build warnings retained: existing ThemeCustomizer static/dynamic import overlap and large bundle-size warning.
-- Remaining external gate: no live NanoGPT credentialed contract check, approved branding language, clean-machine release smoke test, checksum, or single-version distributable artifact was available locally; documentation now labels those claims as unverified.
+## Phase 6: Attachment Retention & Swarm UX Semantics
+
+### Status: COMPLETED
+
+### Description
+Implemented bounded attachment retention with IndexedDB snapshot cleanup on chat deletion and cache pruning. Synchronized attachment filename blocklists with host sensitive-file policies. Accurately reported swarm subagent execution states.
+
+### Key Objectives Achieved
+1. In `src/lib/attachments/validation.ts`, expanded `isSensitiveFileName` to block `.npmrc`, `.netrc`, `.git-credentials`, `.pypirc`, `.terraformrc`, `id_rsa*`, `id_ed25519*`, cloud credential directories (`.aws`, `.azure`, `.docker`, `.gnupg`, `.kube`, `.ssh`, `.terraform.d`), and service account JSONs.
+2. In `src/lib/attachments/snapshots.ts`, added `clear()` and `keys()` methods to `AttachmentSnapshotStore` (both `MemoryAttachmentSnapshotStore` and `IndexedDbAttachmentSnapshotStore`).
+3. In `src/hooks/useSessionPersistence.ts`, cleaned up IndexedDB snapshot IDs when chats or workspaces are permanently deleted.
+4. In `src/sections/ConnectDialog.tsx`, added a "Clear local attachment cache" button.
+5. In `apps/agent-host/src/agents/supervisor.ts`, updated pause/resume messages to accurately describe state as marked inactive/active by supervisor.
+
+### Changed Files
+- `src/lib/attachments/validation.ts`
+- `src/lib/attachments/snapshots.ts`
+- `src/hooks/useSessionPersistence.ts`
+- `src/sections/ConnectDialog.tsx`
+- `apps/agent-host/src/agents/supervisor.ts`
+- `src/lib/attachments/validation.test.ts`
+- `src/lib/attachments/snapshots.test.ts`
+
+---
+
+## Phase 7: Final Verification & Release Readiness
+
+### Status: COMPLETED
+
+### Description
+Executed full static and integration verification across all workspace packages, verified clean zero-defect execution with zero listener warnings, and verified production bundle creation.
+
+### Key Objectives Achieved
+1. **Automated Static Verification**:
+   - `pnpm typecheck`: 6/6 Turbo tasks passed across all packages (`@nanoforge/protocol`, `@nanoforge/agent-host`, `@nanoforge/core`, `@nanoforge/sdk`).
+   - `pnpm lint`: ESLint passed with 0 errors and 0 warnings.
+2. **Automated Unit & Integration Verification**:
+   - `pnpm test -- --run`: 64 test files passed, 643 tests passed in 28.18s with **ZERO** `MaxListenersExceededWarning` messages.
+3. **End-to-End Smoke Test**:
+   - Added `tests/e2e/e2e_phase7_smoke.test.ts` verifying connection with expected origin, workspace read, write disabled by default, explicit write enablement with SHA-256 verification, conflict detection, plan submit/pause/cancel acknowledgements, and `/swarm inspect` directory traversal rejection.
+4. **Clean Production Build & Packaging**:
+   - `pnpm build`: Vite build completed successfully generating production assets in `dist/`.
+   - Packager tests verified complete Windows release bundle creation (`release/NanoForge-v0.6.0-windows-x64.zip`).
+5. **Git Tree Integrity**:
+   - Working tree strictly verified with zero `.agents/**` modifications.
+
+---
+
+## Historical Workspace Context (Pre-Hardening Baseline)
+Prior implementation waves (Wave 1 Workspace/Chat migration, Swarm slash commands integration, Local Drive workspace picker & reviewed writes, and NanoGPT presentation readiness waves A/A2) established the initial feature surface through commit `0c95978`. The hardening roadmap (Phases 0–7) builds directly on this baseline to deliver enterprise-grade security, lifecycle stability, and production readiness.

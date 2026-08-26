@@ -95,6 +95,7 @@ export const SUBAGENT_ERROR_CODES = {
   ERR_SUBAGENT_INVALID_STATE_TRANSITION: "ERR_SUBAGENT_INVALID_STATE_TRANSITION",
   ERR_SUBAGENT_CONCURRENCY_LIMIT_EXCEEDED: "ERR_SUBAGENT_CONCURRENCY_LIMIT_EXCEEDED",
   ERR_SUBAGENT_INSPECTION_FILE_NOT_FOUND: "ERR_SUBAGENT_INSPECTION_FILE_NOT_FOUND",
+  ERR_SUBAGENT_INVALID_CONFIG: "ERR_SUBAGENT_INVALID_CONFIG",
 } as const;
 
 export type SubagentErrorCode = (typeof SUBAGENT_ERROR_CODES)[keyof typeof SUBAGENT_ERROR_CODES];
@@ -104,6 +105,8 @@ export const MAX_CONCURRENT_SUBAGENTS = 8;
 export const DEFAULT_SUBAGENT_TIMEOUT_SECONDS = 600;
 export const DEFAULT_HEARTBEAT_TIMEOUT_MS = 180000; // 3 minutes
 
+export const subagentNameRegex = /^[a-zA-Z0-9_\-]+$/;
+
 /* ------------------------------------------------------------------ */
 /* 3. Core Data Contracts: Config, Info, Message                      */
 /* ------------------------------------------------------------------ */
@@ -112,7 +115,11 @@ export const DEFAULT_HEARTBEAT_TIMEOUT_MS = 180000; // 3 minutes
  * Declarative configuration for creating or defining a subagent.
  */
 export const subagentConfigSchema = z.object({
-  name: z.string().min(1).max(64),
+  name: z
+    .string()
+    .min(1)
+    .max(64)
+    .regex(subagentNameRegex, "Subagent name must contain only alphanumeric characters, hyphens, and underscores"),
   archetype: subagentArchetypeSchema,
   roles: z.array(z.string().min(1)).default([]),
   systemPrompt: z.string().max(65536).optional(),
@@ -262,7 +269,12 @@ export type SubagentLifecycleEvent = z.infer<typeof subagentLifecycleEventSchema
  */
 export const invokeSubagentParamsSchema = z.object({
   archetype: subagentArchetypeSchema,
-  name: z.string().min(1).max(64).optional(),
+  name: z
+    .string()
+    .min(1)
+    .max(64)
+    .regex(subagentNameRegex, "Subagent name must contain only alphanumeric characters, hyphens, and underscores")
+    .optional(),
   roles: z.array(z.string().min(1)).default([]),
   prompt: z.string().min(1).max(32768),
   workspaceIsolation: workspaceIsolationModeSchema.default("inherit"),
@@ -350,7 +362,11 @@ export type SendMessageResult = z.infer<typeof sendMessageResultSchema>;
  * `define_subagent` tool schemas
  */
 export const defineSubagentParamsSchema = z.object({
-  name: z.string().min(1).max(64),
+  name: z
+    .string()
+    .min(1)
+    .max(64)
+    .regex(subagentNameRegex, "Subagent name must contain only alphanumeric characters, hyphens, and underscores"),
   archetype: subagentArchetypeSchema.default("custom"),
   description: z.string().min(1).max(1024),
   systemPromptTemplate: z.string().min(1).max(32768),
@@ -458,7 +474,7 @@ export function isSubagentWaiting(state: SubagentState): boolean {
  */
 export function validateSubagentName(name: string): boolean {
   if (!name || name.length < 1 || name.length > 64) return false;
-  return /^[a-zA-Z0-9_\-]+$/.test(name);
+  return subagentNameRegex.test(name);
 }
 
 /**

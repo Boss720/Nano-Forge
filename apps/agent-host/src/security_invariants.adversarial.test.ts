@@ -56,28 +56,40 @@ describe("Challenger 1 — Backend Security Invariants", () => {
     });
 
     it("2.1: isAllowedOrigin strictly evaluates origin strings against allowlist", () => {
-      // 1. Legitimate allowed origins
+      // 1. Legitimate exact allowed origins
+      expect(isAllowedOrigin("http://localhost:3000")).toBe(true);
+      expect(isAllowedOrigin("http://127.0.0.1:3000")).toBe(true);
+      expect(isAllowedOrigin("http://localhost:4173")).toBe(true);
+      expect(isAllowedOrigin("http://127.0.0.1:4173")).toBe(true);
       expect(isAllowedOrigin("http://localhost:5173")).toBe(true);
       expect(isAllowedOrigin("http://127.0.0.1:4040")).toBe(true);
-      expect(isAllowedOrigin("http://localhost")).toBe(true);
-      expect(isAllowedOrigin("http://127.0.0.1")).toBe(true);
       expect(isAllowedOrigin("https://nano-gpt.com")).toBe(true);
-      expect(isAllowedOrigin("https://staging.nano-gpt.com")).toBe(true);
-      expect(isAllowedOrigin("https://app.nano-gpt.com")).toBe(true);
-      expect(isAllowedOrigin(undefined)).toBe(true); // CLI / direct connection without Origin header
 
-      // 2. Malicious and external origins
+      // 2. Reject missing / null / CLI origins by default unless explicit transport mode is requested
+      expect(isAllowedOrigin(undefined)).toBe(false);
+      expect(isAllowedOrigin("null")).toBe(false);
+      expect(isAllowedOrigin(undefined, undefined, true)).toBe(true); // explicit CLI transport mode
+      expect(isAllowedOrigin("null", undefined, true)).toBe(true);
+
+      // 3. Reject wrong ports and unrelated localhost-like origins
+      expect(isAllowedOrigin("http://localhost:9999")).toBe(false);
+      expect(isAllowedOrigin("http://127.0.0.1:8080")).toBe(false);
+      expect(isAllowedOrigin("http://localhost.evil.com")).toBe(false);
+      expect(isAllowedOrigin("http://127.0.0.1.evil.com")).toBe(false);
+
+      // 4. Reject arbitrary *.nano-gpt.com subdomains
+      expect(isAllowedOrigin("https://staging.nano-gpt.com")).toBe(false);
+      expect(isAllowedOrigin("https://app.nano-gpt.com")).toBe(false);
+      expect(isAllowedOrigin("https://evil.nano-gpt.com")).toBe(false);
+      expect(isAllowedOrigin("http://attacker-nano-gpt.com")).toBe(false);
+      expect(isAllowedOrigin("https://nano-gpt.com.attacker.com")).toBe(false);
+
+      // 5. Malicious and external origins
       expect(isAllowedOrigin("http://malicious-site.com")).toBe(false);
       expect(isAllowedOrigin("https://evil-attacker.io")).toBe(false);
       expect(isAllowedOrigin("http://pwned.org")).toBe(false);
 
-      // 3. Domain Spoofing / Prefix / Postfix tricks
-      expect(isAllowedOrigin("http://attacker-nano-gpt.com")).toBe(false);
-      expect(isAllowedOrigin("https://nano-gpt.com.attacker.com")).toBe(false);
-      expect(isAllowedOrigin("http://127.0.0.1.evil.com")).toBe(false);
-      expect(isAllowedOrigin("http://localhost.evil.com")).toBe(false);
-
-      // 4. Non-HTTP / malformed origins
+      // 6. Non-HTTP / malformed origins
       expect(isAllowedOrigin("javascript:void(0)")).toBe(false);
       expect(isAllowedOrigin("data:text/html,bad")).toBe(false);
       expect(isAllowedOrigin(":::malformed")).toBe(false);
@@ -92,6 +104,8 @@ describe("Challenger 1 — Backend Security Invariants", () => {
         "http://attacker-nano-gpt.com",
         "https://nano-gpt.com.attacker.com",
         "http://127.0.0.1.evil.com",
+        "https://evil.nano-gpt.com",
+        "http://localhost:9999",
       ];
 
       for (const attackOrigin of attackOrigins) {
@@ -111,7 +125,9 @@ describe("Challenger 1 — Backend Security Invariants", () => {
 
       const validOrigins = [
         "https://nano-gpt.com",
-        "https://app.nano-gpt.com",
+        "http://localhost:3000",
+        "http://localhost:4173",
+        "http://127.0.0.1:4173",
         "http://localhost:5173",
         "http://127.0.0.1:4040",
       ];

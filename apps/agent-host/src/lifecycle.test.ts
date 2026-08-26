@@ -73,7 +73,9 @@ describe("Host Graceful Termination & WebSocket Draining", () => {
 
   it("drains active WebSocket connections with code 1001 and host.closing frame on close", async () => {
     host = await createHost();
-    const ws = new NativeWebSocket(agentUrl(host));
+    const ws = new NativeWebSocket(agentUrl(host), {
+      headers: { Origin: "http://localhost:3000" },
+    });
 
     const messages: any[] = [];
     ws.on("message", (data) => {
@@ -124,6 +126,32 @@ describe("Host Graceful Termination & WebSocket Draining", () => {
 
     expect(opened).toBe(true);
     ws.close();
+  });
+
+  it("performs 11 connect/disconnect cycles cleanly without EventEmitter listener leaks", async () => {
+    host = await createHost();
+
+    for (let i = 0; i < 11; i++) {
+      const token = host.tokenStore.issue();
+      const ws = new NativeWebSocket(agentUrl(host, token), {
+        headers: { Origin: "http://localhost:3000" },
+      });
+
+      await new Promise<void>((resolve, reject) => {
+        ws.on("open", () => resolve());
+        ws.on("error", reject);
+      });
+
+      const closePromise = new Promise<void>((resolve) => {
+        ws.on("close", () => resolve());
+      });
+      ws.close();
+      await closePromise;
+    }
+
+    // Verify listeners count on host-shared daemon supervisor and scheduler did not grow unbounded
+    expect(host.daemonManager.supervisor.listenerCount("task.event" as any)).toBeLessThanOrEqual(5);
+    expect(host.daemonManager.scheduler.listenerCount("schedule.event" as any)).toBeLessThanOrEqual(5);
   });
 });
 

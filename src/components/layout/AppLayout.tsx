@@ -155,6 +155,8 @@ export interface AppLayoutProps {
   handlePatchDecision: (messageId: string, decision: "applied" | "rejected") => void;
   /** Attachment lane consumes this seam once it owns chat attachment state. */
   onAttachWorkspaceFile?: (path: string) => void;
+  allowWorkspaceWrites?: boolean;
+  onToggleWorkspaceWrites?: (enabled: boolean) => void;
 }
 
 export function AppLayout({
@@ -201,6 +203,8 @@ export function AppLayout({
   handleStop,
   handlePatchDecision,
   onAttachWorkspaceFile,
+  allowWorkspaceWrites,
+  onToggleWorkspaceWrites,
 }: AppLayoutProps) {
   const [integrationsOpen, setIntegrationsOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -742,6 +746,9 @@ export function AppLayout({
             setSettingsOpen(false);
             setThemeOpen(true);
           }}
+          activeWorkspaceRoot={activeWorkspace?.location?.displayPath}
+          allowWorkspaceWrites={allowWorkspaceWrites}
+          onToggleWorkspaceWrites={onToggleWorkspaceWrites}
         />
       </ErrorBoundary>
 

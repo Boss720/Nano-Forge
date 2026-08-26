@@ -78,6 +78,7 @@ function parseArgs(argv = process.argv.slice(2)) {
     dryRun: false,
     distRoot: '',
     workspaceRoot: process.env.NANOFORGE_WORKSPACE || '',
+    allowWorkspaceWrites: process.env.NANOFORGE_ALLOW_WORKSPACE_WRITES === '1',
     help: false,
   };
 
@@ -95,6 +96,8 @@ function parseArgs(argv = process.argv.slice(2)) {
       args.token = argv[++i];
     } else if (arg.startsWith('--token=')) {
       args.token = arg.split('=')[1];
+    } else if (arg === '--allow-workspace-writes' || arg === '--allow-writes') {
+      args.allowWorkspaceWrites = true;
     } else if (arg === '--no-open' || arg === '--headless') {
       args.noOpen = true;
     } else if (arg === '--dry-run') {
@@ -345,6 +348,7 @@ Options:
   --port, -p, --ui-port <port>    Web UI static server port (default: 4173)
   --host-port <port>              Agent host daemon port (default: 4174)
   --token, -t <token>             Authentication session token (default: generated)
+  --allow-workspace-writes        Permit reviewed file writes to the local workspace root (default: disabled)
   --root <path>                   Custom static dist root directory
   --workspace <path>              Canonical local workspace for host startup
   --no-open, --headless           Do not automatically open default browser
@@ -354,6 +358,7 @@ Options:
     return { status: 'help' };
   }
 
+  const allowWorkspaceWrites = (Boolean(config.allowWorkspaceWrites) || process.env.NANOFORGE_ALLOW_WORKSPACE_WRITES === '1') ? '1' : '0';
   const distRoot = resolveDistRoot(config.distRoot);
   const hostEntry = resolveHostEntry();
   if (config.workspaceRoot) {
@@ -378,6 +383,7 @@ Options:
   console.log(`[launcher] Host Port:   ${config.hostPort}`);
   console.log(`[launcher] UI Port:     ${config.uiPort}`);
   console.log(`[launcher] Workspace:   ${config.workspaceRoot || process.cwd()}`);
+  console.log(`[launcher] Writes:      ${allowWorkspaceWrites === '1' ? 'ENABLED (opt-in)' : 'DISABLED (default)'}`);
   console.log(`[launcher] Auth Token:  ${config.token.slice(0, 8)}... (redacted)`);
 
   let hostProcess = null;
@@ -392,7 +398,7 @@ Options:
       TOKEN: config.token,
       HOST: '127.0.0.1',
       NANOFORGE_WORKSPACE: config.workspaceRoot || process.cwd(),
-      NANOFORGE_ALLOW_WORKSPACE_WRITES: '1',
+      NANOFORGE_ALLOW_WORKSPACE_WRITES: allowWorkspaceWrites,
     });
 
     if (isTypeScript) {
@@ -467,7 +473,7 @@ Options:
       TOKEN: config.token,
       HOST: '127.0.0.1',
       NANOFORGE_WORKSPACE: workspaceRoot,
-      NANOFORGE_ALLOW_WORKSPACE_WRITES: '1',
+      NANOFORGE_ALLOW_WORKSPACE_WRITES: allowWorkspaceWrites,
     });
     const isTypeScript = hostEntry.endsWith('.ts');
     const isWindows = process.platform === 'win32';

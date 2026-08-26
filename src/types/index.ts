@@ -145,6 +145,9 @@ export interface VirtualFile {
   path: string;
   language: string;
   content: string;
+  size?: number;
+  modified?: string;
+  sha256?: string;
 }
 
 /**

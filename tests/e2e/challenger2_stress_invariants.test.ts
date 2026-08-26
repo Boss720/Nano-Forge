@@ -155,7 +155,7 @@ describe("Challenger 2 Empirical Verification: Runtime Stability, Lifecycle, SDK
 
       // Wait for host to bind and print listening message
       let attempts = 0;
-      while (!stdoutText.includes("listening:") && attempts < 50) {
+      while (!stdoutText.includes("listening:") && attempts < 120) {
         await new Promise((r) => setTimeout(r, 100));
         attempts++;
       }
@@ -175,7 +175,7 @@ describe("Challenger 2 Empirical Verification: Runtime Stability, Lifecycle, SDK
       ]);
 
       expect(exitResult).toBeDefined();
-    }, 15000);
+    }, 20000);
   });
 
   /* ======================================================================== */

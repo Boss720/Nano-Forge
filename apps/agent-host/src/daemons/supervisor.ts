@@ -149,6 +149,7 @@ export class DaemonSupervisor extends EventEmitter {
 
   constructor(workspaceRoot?: string) {
     super();
+    this.setMaxListeners(100);
     this.workspaceRoot = workspaceRoot ? path.resolve(workspaceRoot) : undefined;
   }
 

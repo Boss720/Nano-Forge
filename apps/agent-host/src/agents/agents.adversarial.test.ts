@@ -159,4 +159,100 @@ describe("Subagent Adversarial & Attack Vector Tests", () => {
     const history = supervisor.mailbox.getHistory(child.subagentId);
     expect(history.length).toBe(50);
   });
+
+  /* ------------------------------------------------------------------------ */
+  /* Subagent Name Path Confinement & Traversal Attacks                       */
+  /* ------------------------------------------------------------------------ */
+
+  it("rejects malicious subagent names attempting directory traversal during spawnSubagent", async () => {
+    const hostileNames = [
+      "../../outside",
+      "..\\..\\windows\\system32",
+      "/etc/shadow",
+      "C:\\Windows\\System32",
+      "agent; rm -rf /",
+      "agent\0null",
+      "agent name with spaces",
+      "a".repeat(65),
+    ];
+
+    for (const badName of hostileNames) {
+      await expect(
+        supervisor.spawnSubagent({
+          archetype: "explorer",
+          name: badName,
+          prompt: "Test traversal name",
+        })
+      ).rejects.toThrow();
+    }
+
+    // Verify nothing escaped into tmpRoot root outside .agents
+    const rootEntries = await fs.readdir(tmpRoot);
+    expect(rootEntries.filter((e) => e !== ".agents")).toEqual([]);
+  });
+
+  it("inspect action blocks traversal attempts, absolute paths, null bytes, and non-allowlisted files", async () => {
+    const agent = await supervisor.spawnSubagent({
+      archetype: "implementer",
+      name: "secure_worker",
+      prompt: "Execute secure tasks",
+    });
+
+    const hostileInspectFiles = [
+      "../../../secret",
+      "..\\..\\secret",
+      "/etc/passwd",
+      "C:\\Windows\\win.ini",
+      "%2e%2e%2fsecret",
+      "%252e%252e%252fsecret",
+      "passwords.txt",
+      "id_rsa",
+      "progress.md\0.txt",
+    ];
+
+    for (const badFile of hostileInspectFiles) {
+      const res = await supervisor.manageSubagents({
+        action: "inspect",
+        subagentId: agent.subagentId,
+        // @ts-expect-error test runtime rejection of unauthorized files
+        inspectFile: badFile,
+      });
+
+      expect(res.success).toBe(false);
+      expect(res.message).toContain("ERR_SUBAGENT_INSPECTION_FILE_NOT_FOUND");
+    }
+  });
+
+  it("inspect action successfully reads all 5 valid inspection files within subagent metadata directory", async () => {
+    const agent = await supervisor.spawnSubagent({
+      archetype: "implementer",
+      name: "valid_worker",
+      prompt: "Execute valid inspection tests",
+    });
+
+    const node = supervisor.registry.get(agent.subagentId)!;
+    const metadataDir = path.resolve(tmpRoot, node.metadataDir);
+
+    const testFiles = [
+      { name: "progress.md" as const, content: "# Progress: Step 1 complete" },
+      { name: "BRIEFING.md" as const, content: "# Briefing: Mission Alpha" },
+      { name: "handoff.md" as const, content: "# Handoff: Findings verified" },
+      { name: "DISPATCH.md" as const, content: "## Dispatch: 2026-08-26" },
+      { name: "analysis.md" as const, content: "# Analysis: Codebase is secure" },
+    ];
+
+    for (const { name, content } of testFiles) {
+      await fs.writeFile(path.join(metadataDir, name), content, "utf8");
+
+      const result = await supervisor.manageSubagents({
+        action: "inspect",
+        subagentId: agent.subagentId,
+        inspectFile: name,
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.inspectedContent).toBe(content);
+      expect(result.detail?.name).toBe(node.name);
+    }
+  });
 });

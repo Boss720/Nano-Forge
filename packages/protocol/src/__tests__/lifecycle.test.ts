@@ -11,6 +11,13 @@ import {
   isAgentLifecycleActive,
   isAgentLifecycleTerminal,
   isValidAgentStateTransition,
+  planSubmitResultSchema,
+  runPauseResultSchema,
+  runResumeResultSchema,
+  runCancelResultSchema,
+  approvalGrantResultSchema,
+  approvalDenyResultSchema,
+  toolResponseResultSchema,
   runLifecycleEventSchema,
   runStateSchema,
   type AgentLifecycleEvent,
@@ -372,6 +379,93 @@ describe("Agent Lifecycle Wire Protocol", () => {
       };
       const parsed = runLifecycleEventSchema.parse(event);
       expect(parsed).toEqual(event);
+    });
+  });
+
+  describe("Run Control & Acknowledgement Result Schemas", () => {
+    const timestamp = "2026-08-26T16:00:00.000Z";
+
+    it("validates and round-trips plan.submit.result", () => {
+      const frame = {
+        type: "plan.submit.result",
+        requestId: "req-1",
+        runId: "run-101",
+        accepted: true,
+        planId: "plan-1",
+        at: timestamp,
+      };
+      const parsed = planSubmitResultSchema.parse(frame);
+      expect(parsed).toEqual(frame);
+    });
+
+    it("validates and round-trips run.pause.result", () => {
+      const frame = {
+        type: "run.pause.result",
+        requestId: "req-2",
+        runId: "run-101",
+        at: timestamp,
+      };
+      const parsed = runPauseResultSchema.parse(frame);
+      expect(parsed).toEqual(frame);
+    });
+
+    it("validates and round-trips run.resume.result", () => {
+      const frame = {
+        type: "run.resume.result",
+        requestId: "req-3",
+        runId: "run-101",
+        at: timestamp,
+      };
+      const parsed = runResumeResultSchema.parse(frame);
+      expect(parsed).toEqual(frame);
+    });
+
+    it("validates and round-trips run.cancel.result", () => {
+      const frame = {
+        type: "run.cancel.result",
+        requestId: "req-4",
+        runId: "run-101",
+        at: timestamp,
+      };
+      const parsed = runCancelResultSchema.parse(frame);
+      expect(parsed).toEqual(frame);
+    });
+
+    it("validates and round-trips approval.grant.result", () => {
+      const frame = {
+        type: "approval.grant.result",
+        requestId: "req-5",
+        runId: "run-101",
+        stepId: "step-1",
+        resolved: true,
+        at: timestamp,
+      };
+      const parsed = approvalGrantResultSchema.parse(frame);
+      expect(parsed).toEqual(frame);
+    });
+
+    it("validates and round-trips approval.deny.result", () => {
+      const frame = {
+        type: "approval.deny.result",
+        requestId: "req-6",
+        runId: "run-101",
+        stepId: "step-1",
+        resolved: false,
+        at: timestamp,
+      };
+      const parsed = approvalDenyResultSchema.parse(frame);
+      expect(parsed).toEqual(frame);
+    });
+
+    it("validates and round-trips tool.response.result", () => {
+      const frame = {
+        type: "tool.response.result",
+        requestId: "req-7",
+        resolved: true,
+        at: timestamp,
+      };
+      const parsed = toolResponseResultSchema.parse(frame);
+      expect(parsed).toEqual(frame);
     });
   });
 });

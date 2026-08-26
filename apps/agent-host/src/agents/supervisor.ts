@@ -24,6 +24,8 @@ import {
   manageSubagentsParamsSchema,
   type ManageSubagentsParams,
   type ManageSubagentsResult,
+  manageSubagentsInspectFileSchema,
+  validateSubagentName,
   sendMessageParamsSchema,
   type SendMessageParams,
   type SendMessageResult,
@@ -40,6 +42,7 @@ import type { z } from "zod";
 
 export type InvokeSubagentInput = z.input<typeof invokeSubagentParamsSchema>;
 export type SendMessageInput = z.input<typeof sendMessageParamsSchema>;
+import { sanitizePathString, isWithinWorkspace } from "../policy/policy.js";
 import { createWorktree, pruneWorktree } from "../workspace/gitWorktree.js";
 import { SubagentRegistry } from "./registry.js";
 import { SubagentMailbox } from "./mailbox.js";
@@ -73,9 +76,12 @@ export class SubagentSupervisor extends EventEmitter {
   readonly scheduler: TaskScheduler;
   readonly memory: SharedMemoryEngine;
   readonly telemetry: TelemetryTracker;
+  private readonly unsubDaemons?: () => void;
+  private readonly unsubScheduler?: () => void;
 
   constructor(options: SubagentSupervisorOptions = {}) {
     super();
+    this.setMaxListeners(100);
     this.workspaceRoot = path.resolve(options.workspaceRoot ?? process.cwd());
     this.registry = options.registry ?? new SubagentRegistry();
     this.mailbox = options.mailbox ?? new SubagentMailbox();
@@ -87,7 +93,7 @@ export class SubagentSupervisor extends EventEmitter {
     this.telemetry = options.telemetryTracker ?? new TelemetryTracker();
 
     // Forward daemon output/completion to wakeups
-    this.daemons.subscribe((event) => {
+    this.unsubDaemons = this.daemons.subscribe((event) => {
       if (event.type === "task.completed") {
         this.wakeup.wakeOnTaskCompleted(
           event.taskId,
@@ -98,7 +104,7 @@ export class SubagentSupervisor extends EventEmitter {
     });
 
     // Forward scheduler trigger to wakeups
-    this.scheduler.subscribe((event) => {
+    this.unsubScheduler = this.scheduler.subscribe((event) => {
       if (event.type === "schedule.triggered") {
         this.wakeup.wakeOnTimerExpired(event.scheduleId, event.prompt);
       }
@@ -120,13 +126,41 @@ export class SubagentSupervisor extends EventEmitter {
     const subagentId = randomUUID();
     const shortId = subagentId.slice(0, 8);
     const archetype = params.archetype;
-    const name = params.name && params.name.trim() ? params.name.trim() : `${archetype}_${shortId}`;
+    let name: string;
+    if (params.name && params.name.trim()) {
+      const candidateName = params.name.trim();
+      if (!validateSubagentName(candidateName)) {
+        throw new Error(
+          `${SUBAGENT_ERROR_CODES.ERR_SUBAGENT_INVALID_CONFIG}: Invalid subagent name '${candidateName}'. Subagent names must only contain alphanumeric characters, underscores, and hyphens (1-64 characters).`
+        );
+      }
+      name = candidateName;
+    } else {
+      name = `${archetype}_${shortId}`;
+    }
+
     const isolationMode = params.workspaceIsolation ?? "inherit";
     const startedAt = new Date().toISOString();
 
     // 2. Setup assigned metadata folder in .agents/<name>_<shortId>/
-    const metadataDirName = `.agents/${name}_${shortId}`;
+    const metadataDirName = path.posix.join(".agents", `${name}_${shortId}`);
+    const agentsBaseDir = path.resolve(this.workspaceRoot, ".agents");
     const absoluteMetadataDir = path.resolve(this.workspaceRoot, metadataDirName);
+
+    // Confinement checks
+    const relMetadataDir = path.relative(agentsBaseDir, absoluteMetadataDir);
+    if (relMetadataDir.startsWith("..") || path.isAbsolute(relMetadataDir) || relMetadataDir === "") {
+      throw new Error(
+        `${SUBAGENT_ERROR_CODES.ERR_SUBAGENT_INVALID_CONFIG}: Subagent metadata directory '${metadataDirName}' escapes the .agents boundary.`
+      );
+    }
+
+    if (!isWithinWorkspace(absoluteMetadataDir, this.workspaceRoot)) {
+      throw new Error(
+        `${SUBAGENT_ERROR_CODES.ERR_SUBAGENT_INVALID_CONFIG}: Subagent metadata directory '${metadataDirName}' escapes workspace root.`
+      );
+    }
+
     await fs.mkdir(absoluteMetadataDir, { recursive: true });
 
     // 3. Write initial agent scaffolding (BRIEFING.md, progress.md, DISPATCH.md)
@@ -332,7 +366,60 @@ export class SubagentSupervisor extends EventEmitter {
         }
 
         const fileToRead = params.inspectFile ?? "progress.md";
-        const targetPath = path.resolve(this.workspaceRoot, node.metadataDir, fileToRead);
+
+        // 1. Explicit allowlist check using manageSubagentsInspectFileSchema
+        const allowlistParsed = manageSubagentsInspectFileSchema.safeParse(fileToRead);
+        if (!allowlistParsed.success) {
+          return {
+            action: "inspect",
+            success: false,
+            message: `${SUBAGENT_ERROR_CODES.ERR_SUBAGENT_INSPECTION_FILE_NOT_FOUND}: Invalid inspection file '${fileToRead}'. Allowed inspection files are: ${manageSubagentsInspectFileSchema.options.join(", ")}`,
+          };
+        }
+
+        // 2. Multi-pass sanitize against null bytes and URL encoding
+        let sanitizedFile: string;
+        try {
+          sanitizedFile = sanitizePathString(fileToRead);
+        } catch (err) {
+          return {
+            action: "inspect",
+            success: false,
+            message: `${SUBAGENT_ERROR_CODES.ERR_SUBAGENT_INSPECTION_FILE_NOT_FOUND}: Invalid file name: ${err instanceof Error ? err.message : String(err)}`,
+          };
+        }
+
+        // 3. Confinement check: Ensure subagent metadata directory is inside .agents
+        const agentsBaseDir = path.resolve(this.workspaceRoot, ".agents");
+        const subagentDir = path.resolve(this.workspaceRoot, node.metadataDir);
+        const relSubagentDir = path.relative(agentsBaseDir, subagentDir);
+        if (relSubagentDir.startsWith("..") || path.isAbsolute(relSubagentDir) || relSubagentDir === "") {
+          return {
+            action: "inspect",
+            success: false,
+            message: `${SUBAGENT_ERROR_CODES.ERR_SUBAGENT_INSPECTION_FILE_NOT_FOUND}: Subagent metadata directory '${node.metadataDir}' escapes the .agents boundary`,
+          };
+        }
+
+        // 4. Confinement check: Ensure target path remains strictly inside subagent metadata directory
+        const targetPath = path.resolve(subagentDir, sanitizedFile);
+        const relFilePath = path.relative(subagentDir, targetPath);
+        if (relFilePath.startsWith("..") || path.isAbsolute(relFilePath) || relFilePath !== sanitizedFile) {
+          return {
+            action: "inspect",
+            success: false,
+            message: `${SUBAGENT_ERROR_CODES.ERR_SUBAGENT_INSPECTION_FILE_NOT_FOUND}: Target file escapes subagent directory: ${sanitizedFile}`,
+          };
+        }
+
+        // 5. Workspace boundary check
+        if (!isWithinWorkspace(targetPath, this.workspaceRoot)) {
+          return {
+            action: "inspect",
+            success: false,
+            message: `${SUBAGENT_ERROR_CODES.ERR_SUBAGENT_INSPECTION_FILE_NOT_FOUND}: Target file is outside workspace: ${targetPath}`,
+          };
+        }
 
         try {
           const inspectedContent = await fs.readFile(targetPath, "utf8");
@@ -346,7 +433,7 @@ export class SubagentSupervisor extends EventEmitter {
           return {
             action: "inspect",
             success: false,
-            message: `${SUBAGENT_ERROR_CODES.ERR_SUBAGENT_INSPECTION_FILE_NOT_FOUND}: Could not read ${fileToRead} for subagent ${node.id}`,
+            message: `${SUBAGENT_ERROR_CODES.ERR_SUBAGENT_INSPECTION_FILE_NOT_FOUND}: Could not read ${sanitizedFile} for subagent ${node.id}`,
           };
         }
       }
@@ -689,6 +776,8 @@ export class SubagentSupervisor extends EventEmitter {
     } catch {
       /* ignore */
     }
+    this.unsubDaemons?.();
+    this.unsubScheduler?.();
     this.scheduler.dispose();
     this.memory.dispose();
     this.mailbox.clear();

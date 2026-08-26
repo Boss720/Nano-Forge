@@ -49,6 +49,17 @@ class FakeHostClient implements HostClientLike {
   denyApproval = vi.fn(async () => {});
   pauseRun = vi.fn(async () => {});
   cancelRun = vi.fn(async () => {});
+  readFile = vi.fn(async () => ({ path: "test.ts", content: "data", language: "typescript", size: 4, modified: "2026-08-26T20:00:00Z", sha256: "abc", generation: 1 }));
+  writeFile = vi.fn(async () => ({
+    type: "workspace.writeFile.result" as const,
+    requestId: "mock-req",
+    path: "test.ts",
+    success: true as const,
+    generation: 1,
+    sha256: "def",
+    size: 4,
+    modified: "2026-08-26T20:00:00Z",
+  }));
   onEvent(handler: (msg: HostMessage) => void) {
     this.handlers.add(handler);
     return () => this.handlers.delete(handler);
@@ -263,5 +274,30 @@ describe("App host wiring", () => {
     await user.click(screen.getByRole("button", { name: "deny" }));
     expect(fake.denyApproval).toHaveBeenCalledWith("plan-browser", "browse");
     expect(fake.grantApproval).not.toHaveBeenCalled();
+  });
+
+  it("provides user-facing reviewed workspace writes toggle in settings defaulting to disabled", async () => {
+    const user = userEvent.setup();
+    const fake = new FakeHostClient();
+    renderWithHost(fake);
+    await waitFor(() => expect(fake.connect).toHaveBeenCalled());
+
+    // Open settings dialog via TopBar settings button
+    const settingsBtn = screen.getByRole("button", { name: "Settings" });
+    await user.click(settingsBtn);
+
+    // Switch to Workspace tab
+    const workspaceTabBtn = screen.getAllByRole("button", { name: /^workspace$/i })[0];
+    await user.click(workspaceTabBtn);
+
+    const checkbox = screen.getByRole("checkbox", { name: /enable reviewed local writes/i });
+    expect(checkbox).not.toBeChecked();
+
+    // Toggling requires deliberate confirmation
+    await user.click(checkbox);
+    expect(screen.getByText("Confirm Local Workspace Writes")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /enable reviewed writes/i }));
+    expect(checkbox).toBeChecked();
   });
 });

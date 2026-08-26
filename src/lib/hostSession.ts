@@ -52,7 +52,17 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ExecutionPlan, PlanStep, PlanStepStatus, ToolRun } from "@/types";
-import { HostClient, type HostMessage } from "@/lib/hostClient";
+import {
+  HostClient,
+  type HostMessage,
+  type PlanSubmitResultMessage,
+  type ApprovalGrantResultMessage,
+  type ApprovalDenyResultMessage,
+  type RunPauseResultMessage,
+  type RunResumeResultMessage,
+  type RunCancelResultMessage,
+  type ToolResponseResultMessage,
+} from "@/lib/hostClient";
 import type { CommandResultFrame } from "@protocol/commands";
 import type { ExecuteCommandInput, HostWorkspaceDescriptor } from "@/lib/hostClient";
 import type { WorkspaceWriteResult } from "@protocol/workspace";
@@ -188,13 +198,15 @@ export interface HostClientLike {
   connect(): Promise<void>;
   close(): void;
   onEvent(handler: (msg: HostMessage) => void): () => void;
-  submitPlan(plan: ExecutionPlan): Promise<void>;
-  grantApproval(runId: string, stepId: string): Promise<void>;
-  denyApproval(runId: string, stepId: string): Promise<void>;
-  pauseRun(runId: string): Promise<void>;
-  cancelRun(runId: string): Promise<void>;
+  submitPlan(plan: ExecutionPlan): Promise<PlanSubmitResultMessage | void>;
+  grantApproval(runId: string, stepId: string): Promise<ApprovalGrantResultMessage | void>;
+  denyApproval(runId: string, stepId: string, reason?: string): Promise<ApprovalDenyResultMessage | void>;
+  pauseRun(runId: string): Promise<RunPauseResultMessage | void>;
+  resumeRun?(runId: string): Promise<RunResumeResultMessage | void>;
+  cancelRun(runId: string, reason?: string): Promise<RunCancelResultMessage | void>;
+  sendToolResponse?(requestId: string, approved: boolean, reason?: string): Promise<ToolResponseResultMessage | void>;
   readDir?(path?: string): Promise<DirEntry[]>;
-  readFile?(path: string): Promise<{ path: string; content: string; language: string; size: number }>;
+  readFile?(path: string): Promise<{ path: string; content: string; language: string; size: number; modified?: string; sha256?: string; generation?: number }>;
   writeFile?(path: string, content: string, options?: { expectedSha256?: string; expectedModified?: string }): Promise<WorkspaceWriteResult>;
   stat?(path: string): Promise<FileStat>;
   search?(query: string, options?: { caseSensitive?: boolean; includes?: string[]; maxResults?: number }): Promise<SearchMatch[]>;
@@ -294,7 +306,7 @@ export interface HostSession {
   executeCommand: (input: ExecuteCommandInput) => Promise<CommandResultFrame>;
   dispatchCommand: (input: ExecuteCommandInput) => Promise<CommandResultFrame>;
   readWorkspaceDirectory: (path?: string) => Promise<DirEntry[] | null>;
-  readWorkspaceFile: (path: string) => Promise<{ path: string; content: string; language: string; size: number } | null>;
+  readWorkspaceFile: (path: string) => Promise<{ path: string; content: string; language: string; size: number; modified?: string; sha256?: string; generation?: number } | null>;
   writeWorkspaceFile: (path: string, content: string, options?: { expectedSha256?: string; expectedModified?: string }) => Promise<WorkspaceWriteResult | null>;
   statWorkspaceFile: (path: string) => Promise<FileStat | null>;
   searchWorkspace: (query: string, options?: { maxResults?: number }) => Promise<SearchMatch[] | null>;
@@ -479,8 +491,9 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
     const client = clientRef.current;
     if (!client) return;
     const p = approved ? client.grantApproval(runId, stepId) : client.denyApproval(runId, stepId);
-    void p.catch(() => {
-      /* host vanished mid-decision — the run.state/error stream surfaces it */
+    void p.catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      setLastError(message);
     });
   }, []);
 
@@ -659,7 +672,7 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
                 s.id === ev.subagentId
                   ? {
                       ...s,
-                      lastHeartbeat: ev.lastVisited,
+                      lastHeartbeat: ev.lastVisited ?? ev.at,
                       ...(ev.progressSummary ? { lastProgressSummary: ev.progressSummary } : {}),
                     }
                   : s,
@@ -999,15 +1012,24 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
     const client = clientRef.current;
     if (!current || current.id !== planId || !client) return;
     // Convention: (re)submitting the approved plan starts/resumes its run.
-    void client.submitPlan(current).catch(() => {});
+    void client.submitPlan(current).catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      setLastError(message);
+    });
   }, []);
 
   const pause = useCallback((planId: string) => {
-    void clientRef.current?.pauseRun(planId).catch(() => {});
+    void clientRef.current?.pauseRun(planId).catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      setLastError(message);
+    });
   }, []);
 
   const cancel = useCallback((planId: string) => {
-    void clientRef.current?.cancelRun(planId).catch(() => {});
+    void clientRef.current?.cancelRun(planId).catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      setLastError(message);
+    });
   }, []);
 
   const stopToolRun = useCallback((toolRunId: string) => {
@@ -1015,7 +1037,10 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
     if (!client) return;
     // The protocol cancels whole runs; map the card back to its owning run.
     const runId = toolRunOwners.current.get(toolRunId) ?? toolRunId;
-    void client.cancelRun(runId).catch(() => {});
+    void client.cancelRun(runId).catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      setLastError(message);
+    });
   }, []);
 
   const decidePermission = useCallback(
@@ -1236,9 +1261,21 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
   const readWorkspaceFile = useCallback((path: string) => withWorkspaceClient((client) =>
     client.readFile ? client.readFile(path) : Promise.reject(new Error("Host does not support workspace file reads")),
   ), [withWorkspaceClient]);
-  const writeWorkspaceFile = useCallback((path: string, content: string, options?: { expectedSha256?: string; expectedModified?: string }) => withWorkspaceClient((client) =>
-    client.writeFile ? client.writeFile(path, content, options) : Promise.reject(new Error("Host does not support reviewed workspace writes")),
-  ), [withWorkspaceClient]);
+  const writeWorkspaceFile = useCallback(
+    async (path: string, content: string, options?: { expectedSha256?: string; expectedModified?: string }): Promise<WorkspaceWriteResult | null> => {
+      const client = clientRef.current;
+      if (!client) return null;
+      if (!client.writeFile) throw new Error("Host does not support reviewed workspace writes");
+      try {
+        return await client.writeFile(path, content, options);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setLastError(message);
+        throw err;
+      }
+    },
+    [],
+  );
   const statWorkspaceFile = useCallback((path: string) => withWorkspaceClient((client) =>
     client.stat ? client.stat(path) : Promise.reject(new Error("Host does not support workspace file stats")),
   ), [withWorkspaceClient]);
@@ -1547,4 +1584,3 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
 
   return api;
 }
-

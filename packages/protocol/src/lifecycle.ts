@@ -202,3 +202,69 @@ export const LIFECYCLE_ERROR_CODES = {
   ERR_AGENT_EXECUTION_TIMEOUT: "ERR_AGENT_EXECUTION_TIMEOUT",
 } as const;
 export type LifecycleErrorCode = (typeof LIFECYCLE_ERROR_CODES)[keyof typeof LIFECYCLE_ERROR_CODES];
+
+/* ------------------------------------------------------------------ */
+/* 5. Run Control & Acknowledgement Result Schemas                   */
+/* ------------------------------------------------------------------ */
+
+export const planSubmitResultSchema = z.object({
+  type: z.literal("plan.submit.result"),
+  requestId: z.string().min(1).max(128),
+  runId: z.string().min(1).max(128),
+  accepted: z.boolean().default(true),
+  planId: z.string().optional(),
+  at: z.string().min(1),
+});
+export type PlanSubmitResult = z.infer<typeof planSubmitResultSchema>;
+
+export const runPauseResultSchema = z.object({
+  type: z.literal("run.pause.result"),
+  requestId: z.string().min(1).max(128),
+  runId: z.string().min(1).max(128),
+  at: z.string().min(1),
+});
+export type RunPauseResult = z.infer<typeof runPauseResultSchema>;
+
+export const runResumeResultSchema = z.object({
+  type: z.literal("run.resume.result"),
+  requestId: z.string().min(1).max(128),
+  runId: z.string().min(1).max(128),
+  at: z.string().min(1),
+});
+export type RunResumeResult = z.infer<typeof runResumeResultSchema>;
+
+export const runCancelResultSchema = z.object({
+  type: z.literal("run.cancel.result"),
+  requestId: z.string().min(1).max(128),
+  runId: z.string().min(1).max(128),
+  at: z.string().min(1),
+});
+export type RunCancelResult = z.infer<typeof runCancelResultSchema>;
+
+export const approvalGrantResultSchema = z.object({
+  type: z.literal("approval.grant.result"),
+  requestId: z.string().min(1).max(128),
+  runId: z.string().min(1).max(128).optional(),
+  stepId: z.string().min(1).max(128).optional(),
+  resolved: z.boolean().default(true),
+  at: z.string().min(1),
+});
+export type ApprovalGrantResult = z.infer<typeof approvalGrantResultSchema>;
+
+export const approvalDenyResultSchema = z.object({
+  type: z.literal("approval.deny.result"),
+  requestId: z.string().min(1).max(128),
+  runId: z.string().min(1).max(128).optional(),
+  stepId: z.string().min(1).max(128).optional(),
+  resolved: z.boolean().default(true),
+  at: z.string().min(1),
+});
+export type ApprovalDenyResult = z.infer<typeof approvalDenyResultSchema>;
+
+export const toolResponseResultSchema = z.object({
+  type: z.literal("tool.response.result"),
+  requestId: z.string().min(1).max(128),
+  resolved: z.boolean().default(true),
+  at: z.string().min(1),
+});
+export type ToolResponseResult = z.infer<typeof toolResponseResultSchema>;

@@ -136,6 +136,7 @@ export const workspaceErrorCodeSchema = z.enum([
   "binary_file",
   "write_conflict",
   "write_not_approved",
+  "invalid_search",
   "io_error",
 ]);
 export type WorkspaceErrorCode = z.infer<typeof workspaceErrorCodeSchema>;
