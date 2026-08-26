@@ -15,6 +15,7 @@ import {
   createTokenStore,
   HOST_VERSION,
   type HostHandle,
+  type HostOptions,
 } from "./server";
 
 /* Minimal structural typing over the native WebSocket (no DOM lib needed). */
@@ -67,6 +68,9 @@ async function tempWorkspace(label: string): Promise<string> {
 
 const agentUrl = (h: HostHandle, token?: string): string =>
   `ws://127.0.0.1:${h.port}/agent${token === undefined ? "" : `?token=${token}`}`;
+
+const createNodeWsHost = (options: HostOptions = {}): Promise<HostHandle> =>
+  createHost({ ...options, allowNonBrowserClients: true });
 
 function waitForClose(ws: WsLike): Promise<{ code: number; reason: string }> {
   return new Promise((resolve) => {
@@ -121,7 +125,7 @@ describe("token store", () => {
 describe("authenticated local host", () => {
   it("pins PTY, daemon, subagent, memory, and session roots to one canonical workspace", async () => {
     const root = await tempWorkspace("consistent-root");
-    host = await createHost({ session: { workspaceRoot: root } });
+    host = await createNodeWsHost({ session: { workspaceRoot: root } });
     const canonical = await fs.realpath(root);
     expect(host.workspace.displayPath).toBe(canonical);
     expect(host.ptyManager.workspaceRoot).toBe(canonical);
@@ -133,7 +137,7 @@ describe("authenticated local host", () => {
   it("correlates stale generations and validates switches as reconnect-required", async () => {
     const root = await tempWorkspace("current-root");
     const nextRoot = await tempWorkspace("next-root");
-    host = await createHost({ session: { workspaceRoot: root } });
+    host = await createNodeWsHost({ session: { workspaceRoot: root } });
     const ws = new NativeWebSocket(agentUrl(host, host.token));
     await waitForOpen(ws);
     const ready = await nextMessage(ws);
@@ -154,7 +158,7 @@ describe("authenticated local host", () => {
   it("returns correlated watch results and reviewed-write conflicts", async () => {
     const root = await tempWorkspace("reviewed-write");
     await fs.writeFile(path.join(root, "note.txt"), "original", "utf8");
-    host = await createHost({ session: { workspaceRoot: root, allowWorkspaceWrites: true } });
+    host = await createNodeWsHost({ session: { workspaceRoot: root, allowWorkspaceWrites: true } });
     const ws = new NativeWebSocket(agentUrl(host, host.token));
     await waitForOpen(ws);
     await nextMessage(ws);
@@ -182,7 +186,7 @@ describe("authenticated local host", () => {
   });
 
   it("binds loopback only and answers /health", async () => {
-    host = await createHost();
+    host = await createNodeWsHost();
     expect(host.port).toBeGreaterThan(0);
     const address = host.app.server.address();
     expect(typeof address === "object" && address?.address).toBe("127.0.0.1");
@@ -199,14 +203,14 @@ describe("authenticated local host", () => {
   });
 
   it("closes an unauthenticated socket (missing token) with 4401", async () => {
-    host = await createHost();
+    host = await createNodeWsHost();
     const ws = new NativeWebSocket(agentUrl(host));
     const { code } = await waitForClose(ws);
     expect(code).toBe(CLOSE_UNAUTHORIZED);
   });
 
   it("closes sockets with malformed or unknown tokens with 4401", async () => {
-    host = await createHost();
+    host = await createNodeWsHost();
     const malformed = new NativeWebSocket(agentUrl(host, "not-a-real-token"));
     expect((await waitForClose(malformed)).code).toBe(CLOSE_UNAUTHORIZED);
 
@@ -215,7 +219,7 @@ describe("authenticated local host", () => {
   });
 
   it("accepts a valid token once, then rejects its reuse with 4401", async () => {
-    host = await createHost();
+    host = await createNodeWsHost();
 
     const first = new NativeWebSocket(agentUrl(host, host.token));
     await waitForOpen(first);
@@ -232,7 +236,7 @@ describe("authenticated local host", () => {
   });
 
   it("answers ping with pong over an authenticated socket", async () => {
-    host = await createHost();
+    host = await createNodeWsHost();
     const ws = new NativeWebSocket(agentUrl(host, host.token));
     await waitForOpen(ws);
     await nextMessage(ws); // host.ready
@@ -244,7 +248,7 @@ describe("authenticated local host", () => {
   });
 
   it("queues a run on plan.submit", async () => {
-    host = await createHost();
+    host = await createNodeWsHost();
     const ws = new NativeWebSocket(agentUrl(host, host.token));
     await waitForOpen(ws);
     await nextMessage(ws); // host.ready
@@ -263,7 +267,7 @@ describe("authenticated local host", () => {
   });
 
   it("closes with 4400 on a malformed (non-JSON) frame", async () => {
-    host = await createHost();
+    host = await createNodeWsHost();
     const ws = new NativeWebSocket(agentUrl(host, host.token));
     await waitForOpen(ws);
     await nextMessage(ws); // host.ready
@@ -273,7 +277,7 @@ describe("authenticated local host", () => {
   });
 
   it("closes with 4400 on a schema violation", async () => {
-    host = await createHost();
+    host = await createNodeWsHost();
     const ws = new NativeWebSocket(agentUrl(host, host.token));
     await waitForOpen(ws);
     await nextMessage(ws); // host.ready
@@ -283,7 +287,7 @@ describe("authenticated local host", () => {
   });
 
   it("closes with 4400 on an unknown message type", async () => {
-    host = await createHost();
+    host = await createNodeWsHost();
     const ws = new NativeWebSocket(agentUrl(host, host.token));
     await waitForOpen(ws);
     await nextMessage(ws); // host.ready
@@ -293,7 +297,7 @@ describe("authenticated local host", () => {
   });
 
   it("handles memory RPCs (set, get, query, delete) and broadcasts memory events", async () => {
-    host = await createHost();
+    host = await createNodeWsHost();
     const ws = new NativeWebSocket(agentUrl(host, host.token));
     const received: Record<string, unknown>[] = [];
     const waiters: ((msg: Record<string, unknown>) => void)[] = [];
