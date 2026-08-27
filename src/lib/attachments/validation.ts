@@ -4,11 +4,42 @@ export const MAX_ATTACHMENTS = 5;
 export const MAX_ATTACHMENT_BYTES = 512 * 1024;
 export const MAX_TOTAL_ATTACHMENT_BYTES = 1024 * 1024;
 
-const BLOCKED_NAME = /(^|\/)\.env(?:\.|$)|(^|\/)id_rsa(?:\.|$)|\.(?:pem|key|p12|pfx|exe|dll|msi|bat|cmd|com|ps1|sh|zip|rar|7z|tar|gz|bz2|xz|db|sqlite|pdf|docx?|xlsx?|pptx?)$/i;
-const TEXT_EXTENSION = /\.(?:txt|md|mdx|json|jsonc|ya?ml|toml|xml|csv|ts|tsx|js|jsx|mjs|cjs|css|scss|sass|less|html?|vue|svelte|py|rb|go|rs|java|kt|kts|c|cc|cpp|cxx|h|hpp|cs|php|swift|sql|sh|bash|zsh|fish|ini|cfg|conf|envrc|dockerfile)$/i;
+const SENSITIVE_DIRECTORIES = new Set([
+  ".aws",
+  ".azure",
+  ".docker",
+  ".gnupg",
+  ".kube",
+  ".ssh",
+  ".terraform.d",
+]);
+
+const SENSITIVE_BASENAME_PATTERNS = [
+  /^\.env(?:$|[._-])/i,
+  /^(?:\.envrc|\.git-credentials|\.npmrc|\.netrc|\.pypirc|\.terraformrc)$/i,
+  /^id_(?:rsa|dsa|ecdsa|ed25519)(?:$|[._-])/i,
+  /(?:^|[-_.])(credentials?|secrets?|tokens?)(?:[-_.]|$)/i,
+  /(?:^|[-_.])(?:private[-_.]?key|api[-_.]?key)(?:[-_.]|$)/i,
+  /\.(?:pem|key|p12|pfx|jks|kdb|tfvars|tfvars\.json|secret|secrets)$/i,
+  /^(?:firebase-adminsdk|service[-_.]?account)[-_.]?.*\.json$/i,
+  /^(?:local\.settings|appsettings(?:\.[^.]+)?)\.json$/i,
+];
+
+const BINARY_AND_ARCHIVE_EXTENSIONS = /\.(?:exe|dll|msi|bat|cmd|com|ps1|sh|zip|rar|7z|tar|gz|bz2|xz|db|sqlite|pdf|docx?|xlsx?|pptx?)$/i;
+
+const TEXT_EXTENSION = /\.(?:txt|md|mdx|json|jsonc|ya?ml|toml|xml|csv|ts|tsx|js|jsx|mjs|cjs|css|scss|sass|less|html?|vue|svelte|py|rb|go|rs|java|kt|kts|c|cc|cpp|cxx|h|hpp|cs|php|swift|sql|bash|zsh|fish|ini|cfg|conf|dockerfile)$/i;
 
 export function isWorkspaceRelativePath(path: string): boolean {
   return Boolean(path) && !/^(?:[a-z]:[\\/]|[\\/]{1,2})/i.test(path) && !path.split(/[\\/]/).includes("..");
+}
+
+export function isSensitiveFileName(name: string): boolean {
+  const parts = name.replace(/\\/g, "/").split("/").filter(Boolean);
+  if (parts.some((part) => SENSITIVE_DIRECTORIES.has(part.toLowerCase()))) {
+    return true;
+  }
+  const basename = parts.at(-1) || name;
+  return SENSITIVE_BASENAME_PATTERNS.some((pattern) => pattern.test(basename));
 }
 
 export function languageForName(name: string): string {
@@ -21,7 +52,9 @@ export function languageForName(name: string): string {
 }
 
 export function validateFileName(name: string, mimeType = ""): string | undefined {
-  if (BLOCKED_NAME.test(name)) return "This file type may contain secrets, binaries, or archives and cannot be attached.";
+  if (isSensitiveFileName(name) || BINARY_AND_ARCHIVE_EXTENSIONS.test(name)) {
+    return "This file type may contain secrets, binaries, or archives and cannot be attached.";
+  }
   if (mimeType && !mimeType.startsWith("text/") && !/(json|xml|javascript|typescript|yaml|toml|csv)/i.test(mimeType)) {
     return "Only text and code files can be attached.";
   }

@@ -46,10 +46,18 @@ export interface UseAgentOrchestrationProps {
   /** Injectable for deterministic tests; defaults to IndexedDB in browsers. */
   attachmentSnapshots?: AttachmentSnapshotStore;
   /** Host-backed file reads/writes used by the reviewed local-write path. */
-  readWorkspaceFile?: (path: string) => Promise<{ path: string; content: string; language: string; size: number } | null>;
+  readWorkspaceFile?: (path: string) => Promise<{ path: string; content: string; language: string; size?: number; modified?: string; sha256?: string; generation?: number } | null>;
   writeWorkspaceFile?: (path: string, content: string, options?: { expectedSha256?: string; expectedModified?: string }) => Promise<unknown>;
   /** Virtual patches are the safe default; App opts into disk writes explicitly. */
   workspaceWriteCapability?: "virtual" | "live";
+}
+
+interface ActiveRun {
+  runId: string;
+  sessionId: string;
+  agentMsgId: string;
+  cancelled: boolean;
+  controller: AbortController;
 }
 
 export function useAgentOrchestration({
@@ -71,8 +79,7 @@ export function useAgentOrchestration({
   workspaceWriteCapability = "virtual",
 }: UseAgentOrchestrationProps) {
   const [running, setRunning] = useState(false);
-  const abortRef = useRef<AbortController | null>(null);
-  const demoCancelledRef = useRef(false);
+  const activeRunRef = useRef<ActiveRun | null>(null);
   const snapshots = attachmentSnapshots ?? getAttachmentSnapshotStore();
 
   const patchMessage = useCallback(
@@ -137,6 +144,16 @@ export function useAgentOrchestration({
         ...(auto ? { auto } : {}),
       };
 
+      const runId = crypto.randomUUID();
+      const activeRun: ActiveRun = {
+        runId,
+        sessionId: sid,
+        agentMsgId: agentMsg.id,
+        cancelled: false,
+        controller: new AbortController(),
+      };
+      activeRunRef.current = activeRun;
+
       setSessions((prev) =>
         prev.map((s) =>
           s.id !== sid
@@ -152,30 +169,45 @@ export function useAgentOrchestration({
       setRunning(true);
 
       void persistAttachmentSnapshots(attachments, snapshots).then(async (persisted) => {
+        if (activeRun.cancelled || activeRunRef.current !== activeRun) {
+          return;
+        }
+
         if (attachments.length > 0) {
           patchMessage(sid, userMsg.id, (message) => ({ ...message, attachments: persisted }));
         }
 
         if (!connected) {
-          demoCancelledRef.current = false;
           runDemoAgent(
             text,
             {
-              onToolCall: (t: ToolCall) =>
-                patchMessage(sid, agentMsg.id, (m) => ({ ...m, toolCalls: [...(m.toolCalls ?? []), t] })),
-              onToolUpdate: (id, status, durationMs) =>
+              onToolCall: (t: ToolCall) => {
+                if (activeRun.cancelled) return;
+                patchMessage(sid, agentMsg.id, (m) => ({ ...m, toolCalls: [...(m.toolCalls ?? []), t] }));
+              },
+              onToolUpdate: (id, status, durationMs) => {
+                if (activeRun.cancelled) return;
                 patchMessage(sid, agentMsg.id, (m) => ({
                   ...m,
                   toolCalls: m.toolCalls?.map((t) => (t.id === id ? { ...t, status, durationMs } : t)),
-                })),
+                }));
+              },
               onPatch: (p: Patch) => {
+                if (activeRun.cancelled) return;
                 patchMessage(sid, agentMsg.id, (m) => ({ ...m, patch: p }));
                 artifactsManager.addPatchArtifact(p);
               },
-              onDelta: (d) => patchMessage(sid, agentMsg.id, (m) => ({ ...m, content: m.content + d })),
-              onDone: (u) => finishRun(sid, agentMsg.id, u),
+              onDelta: (d) => {
+                if (activeRun.cancelled) return;
+                patchMessage(sid, agentMsg.id, (m) => ({ ...m, content: m.content + d }));
+              },
+              onDone: (u) => {
+                if (activeRun.cancelled) return;
+                if (activeRunRef.current === activeRun) activeRunRef.current = null;
+                finishRun(sid, agentMsg.id, u);
+              },
             },
-            () => demoCancelledRef.current,
+            () => activeRun.cancelled,
           );
           return;
         }
@@ -188,6 +220,11 @@ export function useAgentOrchestration({
           budgetTokens,
           snapshots,
         );
+
+        if (activeRun.cancelled || activeRunRef.current !== activeRun) {
+          return;
+        }
+
         if (contextResult.updates.length > 0) {
           patchMessage(sid, userMsg.id, (message) => ({
             ...message,
@@ -195,49 +232,53 @@ export function useAgentOrchestration({
           }));
         }
         const wire = contextResult.context;
-        const controller = new AbortController();
-        abortRef.current = controller;
         let streamed = "";
         let x402Content: string | null = null;
 
         streamChat(
-        connection.baseUrl,
-        connection.apiKey,
-        selectedModel,
-        wire,
-        {
-          onDelta: (d) => {
-            streamed += d;
-            patchMessage(sid, agentMsg.id, (m) => ({ ...m, content: m.content + d }));
+          connection.baseUrl,
+          connection.apiKey,
+          selectedModel,
+          wire,
+          {
+            onDelta: (d) => {
+              if (activeRun.cancelled) return;
+              streamed += d;
+              patchMessage(sid, agentMsg.id, (m) => ({ ...m, content: m.content + d }));
+            },
+            onDone: (u) => {
+              if (activeRun.cancelled) return;
+              if (activeRunRef.current === activeRun) activeRunRef.current = null;
+              const patch = extractPatch(streamed);
+              if (patch) {
+                patchMessage(sid, agentMsg.id, (m) => ({ ...m, patch }));
+                artifactsManager.addPatchArtifact(patch);
+              }
+              finishRun(sid, agentMsg.id, u);
+            },
+            onX402: (err) => {
+              if (activeRun.cancelled) return;
+              x402Content =
+                `**Accountless payment required (HTTP 402).** This request needs a per-request payment` +
+                (err.quote ? ` of **${formatQuote(err.quote)}**` : "") +
+                `. Pay per request without an account, or add a subscription key in Settings to skip per-request payments.`;
+            },
+            onError: (err) => {
+              if (activeRun.cancelled) return;
+              if (activeRunRef.current === activeRun) activeRunRef.current = null;
+              patchMessage(sid, agentMsg.id, (m) => ({
+                ...m,
+                content: m.content + (x402Content ? `\n\n${x402Content}` : `\n\n**Error:** ${err}`),
+              }));
+              finishRun(sid, agentMsg.id, { input: 0, output: 0 }, { errored: true });
+            },
           },
-          onDone: (u) => {
-            abortRef.current = null;
-            const patch = extractPatch(streamed);
-            if (patch) {
-              patchMessage(sid, agentMsg.id, (m) => ({ ...m, patch }));
-              artifactsManager.addPatchArtifact(patch);
-            }
-            finishRun(sid, agentMsg.id, u);
-          },
-          onX402: (err) => {
-            x402Content =
-              `**Accountless payment required (HTTP 402).** This request needs a per-request payment` +
-              (err.quote ? ` of **${formatQuote(err.quote)}**` : "") +
-              `. Pay per request without an account, or add a subscription key in Settings to skip per-request payments.`;
-          },
-          onError: (err) => {
-            abortRef.current = null;
-            patchMessage(sid, agentMsg.id, (m) => ({
-              ...m,
-              content: m.content + (x402Content ? `\n\n${x402Content}` : `\n\n**Error:** ${err}`),
-            }));
-            finishRun(sid, agentMsg.id, { input: 0, output: 0 }, { errored: true });
-          },
-        },
-        controller.signal,
-        { temperature: genPrefs.temperature, maxTokens: genPrefs.maxTokens },
+          activeRun.controller.signal,
+          { temperature: genPrefs.temperature, maxTokens: genPrefs.maxTokens },
         );
       }).catch((error) => {
+        if (activeRun.cancelled) return;
+        if (activeRunRef.current === activeRun) activeRunRef.current = null;
         patchMessage(sid, agentMsg.id, (message) => ({
           ...message,
           content: `${message.content}\n\n**Error:** ${error instanceof Error ? error.message : String(error)}`,
@@ -262,17 +303,29 @@ export function useAgentOrchestration({
   );
 
   const handleStop = useCallback(() => {
-    abortRef.current?.abort();
-    demoCancelledRef.current = true;
-    setRunning(false);
-    setSessions((prev) =>
-      prev.map((s) => ({
-        ...s,
-        messages: s.messages.map((m) =>
-          m.streaming ? { ...m, streaming: false, content: m.content + "\n\n*stopped by user*" } : m,
+    const currentRun = activeRunRef.current;
+    if (currentRun) {
+      currentRun.cancelled = true;
+      currentRun.controller.abort();
+      activeRunRef.current = null;
+      setRunning(false);
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.id !== currentRun.sessionId
+            ? s
+            : {
+                ...s,
+                messages: s.messages.map((m) =>
+                  m.id === currentRun.agentMsgId || (m.streaming && m.role === "assistant")
+                    ? { ...m, streaming: false, content: m.content + "\n\n*stopped by user*" }
+                    : m,
+                ),
+              },
         ),
-      })),
-    );
+      );
+    } else {
+      setRunning(false);
+    }
   }, [setSessions]);
 
   const handlePatchDecision = useCallback(
@@ -282,12 +335,20 @@ export function useAgentOrchestration({
       if (!patch || patch.status === decision) return;
       void (async () => {
         let workingFiles = files;
+        let currentRead: { path: string; content: string; language: string; size?: number; modified?: string; sha256?: string; generation?: number } | null = null;
         const liveWorkspaceWrite = workspaceWriteCapability === "live";
         if (liveWorkspaceWrite && writeWorkspaceFile && readWorkspaceFile) {
-          const current = await readWorkspaceFile(patch.file);
-          if (current) {
+          currentRead = await readWorkspaceFile(patch.file);
+          if (currentRead) {
             const existing = workingFiles.findIndex((file) => file.path === patch.file);
-            const hydrated: VirtualFile = { path: current.path, content: current.content, language: current.language };
+            const hydrated: VirtualFile = {
+              path: currentRead.path,
+              content: currentRead.content,
+              language: currentRead.language,
+              size: currentRead.size,
+              modified: currentRead.modified,
+              sha256: currentRead.sha256,
+            };
             workingFiles = existing === -1
               ? [...workingFiles, hydrated]
               : workingFiles.map((file, index) => (index === existing ? hydrated : file));
@@ -301,7 +362,10 @@ export function useAgentOrchestration({
           : patch.status === "applied" ? revertPatch(workingFiles, patch) : workingFiles;
         const nextContent = nextFiles.find((file) => file.path === patch.file)?.content;
         if (liveWorkspaceWrite && writeWorkspaceFile && nextContent !== undefined) {
-          await writeWorkspaceFile(patch.file, nextContent);
+          await writeWorkspaceFile(patch.file, nextContent, {
+            expectedSha256: currentRead?.sha256,
+            expectedModified: currentRead?.modified,
+          });
         }
 
         if (decision === "applied" || patch.status === "applied") setFiles(nextFiles);
@@ -317,9 +381,17 @@ export function useAgentOrchestration({
           handleSend(verificationPrompt(patch.file, nextContent ?? ""), { auto: true });
         }
       })().catch((error) => {
+        const errText = error instanceof Error ? error.message : String(error);
+        const isConflict =
+          errText.toLowerCase().includes("write_conflict") ||
+          errText.toLowerCase().includes("changed since review");
+        const notice = isConflict
+          ? "File changed since review; refresh and review again."
+          : `Write not applied: ${errText}`;
+
         patchMessage(session.id, messageId, (message) => ({
           ...message,
-          content: `${message.content}\n\n**Write not applied:** ${error instanceof Error ? error.message : String(error)}`,
+          content: `${message.content}\n\n**${notice}**`,
         }));
       });
 

@@ -51,28 +51,46 @@ export const CLOSE_INVALID_MESSAGE = 4400;
 
 export const MAX_WS_PAYLOAD_BYTES = 5 * 1024 * 1024; // 5MB
 
+export const DEFAULT_ALLOWED_ORIGINS: readonly string[] = [
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+  "http://localhost:4173",
+  "http://127.0.0.1:4173",
+  // The packaged launcher serves the UI on 4183 by default.
+  "http://localhost:4183",
+  "http://127.0.0.1:4183",
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "http://localhost:4040",
+  "http://127.0.0.1:4040",
+  "https://nano-gpt.com",
+];
+
 export function isAllowedOrigin(
   origin?: string,
   allowedOrigins?: (string | RegExp)[],
+  allowNonBrowser = false,
 ): boolean {
-  if (!origin || origin === "null") return true; // CLI / non-browser / file origin
+  if (!origin || origin === "null") {
+    return Boolean(allowNonBrowser);
+  }
   try {
     const url = new URL(origin);
-    const hostname = url.hostname.toLowerCase();
-    if (
-      hostname === "localhost" ||
-      hostname === "127.0.0.1" ||
-      hostname === "::1" ||
-      hostname === "0.0.0.0" ||
-      hostname === "nano-gpt.com" ||
-      hostname.endsWith(".nano-gpt.com")
-    ) {
-      return true;
-    }
-    if (allowedOrigins) {
-      for (const allowed of allowedOrigins) {
-        if (typeof allowed === "string" && (origin === allowed || hostname === allowed)) return true;
-        if (allowed instanceof RegExp && allowed.test(origin)) return true;
+    const normalized = `${url.protocol}//${url.host}`.toLowerCase();
+    const effective = allowedOrigins && allowedOrigins.length > 0
+      ? allowedOrigins
+      : DEFAULT_ALLOWED_ORIGINS;
+
+    for (const allowed of effective) {
+      if (typeof allowed === "string") {
+        const normAllowed = allowed.toLowerCase().trim();
+        if (normalized === normAllowed || origin.toLowerCase().trim() === normAllowed) {
+          return true;
+        }
+      } else if (allowed instanceof RegExp) {
+        if (allowed.test(normalized) || allowed.test(origin)) {
+          return true;
+        }
       }
     }
   } catch {
@@ -161,6 +179,8 @@ export interface HostOptions {
   maxPayload?: number;
   /** Additional allowed origins for WebSocket connections. */
   allowedOrigins?: (string | RegExp)[];
+  /** Whether to accept missing/null origins from non-browser/CLI transports. Defaults to false. */
+  allowNonBrowserClients?: boolean;
   /** Authenticated-socket handler; defaults to {@link attachAgentProtocol}. */
   attach?: ProtocolAttachment;
   /** Configuration for the real coordinator/workspace session. */
@@ -192,8 +212,13 @@ export interface HostHandle {
 }
 
 export async function createHost(options: HostOptions = {}): Promise<HostHandle> {
+  const configuredGeneration = Number(process.env.NANOFORGE_WORKSPACE_GENERATION ?? "1");
+  const workspaceGeneration = Number.isSafeInteger(configuredGeneration) && configuredGeneration > 0
+    ? configuredGeneration
+    : 1;
   const validatedWorkspace = await validateWorkspaceRoot(
     options.session?.workspaceRoot ?? process.env.NANOFORGE_WORKSPACE ?? process.cwd(),
+    workspaceGeneration,
   );
   const workspaceRoot = validatedWorkspace.canonicalRoot;
   const app = Fastify({ logger: options.logger ?? false });
@@ -320,7 +345,7 @@ export async function createHost(options: HostOptions = {}): Promise<HostHandle>
       return;
     }
     const origin = req.headers.origin;
-    if (!isAllowedOrigin(origin, options.allowedOrigins)) {
+    if (!isAllowedOrigin(origin, options.allowedOrigins, options.allowNonBrowserClients)) {
       socket.close(CLOSE_UNAUTHORIZED, "unauthorized origin");
       return;
     }

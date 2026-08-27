@@ -21,6 +21,19 @@ describe("browser attachment validation", () => {
 
   it("rejects secret, archive, executable, and binary inputs", async () => {
     expect(validateFileName(".env")).toMatch(/secrets/i);
+    expect(validateFileName(".env.production")).toMatch(/secrets/i);
+    expect(validateFileName(".npmrc")).toMatch(/secrets/i);
+    expect(validateFileName(".netrc")).toMatch(/secrets/i);
+    expect(validateFileName(".git-credentials")).toMatch(/secrets/i);
+    expect(validateFileName(".pypirc")).toMatch(/secrets/i);
+    expect(validateFileName("id_rsa")).toMatch(/secrets/i);
+    expect(validateFileName("id_ed25519")).toMatch(/secrets/i);
+    expect(validateFileName(".ssh/config")).toMatch(/secrets/i);
+    expect(validateFileName(".aws/credentials")).toMatch(/secrets/i);
+    expect(validateFileName("server.key")).toMatch(/secrets/i);
+    expect(validateFileName("cert.pem")).toMatch(/secrets/i);
+    expect(validateFileName("firebase-adminsdk.json")).toMatch(/secrets/i);
+    expect(validateFileName("service-account.json")).toMatch(/secrets/i);
     expect(validateFileName("bundle.zip")).toMatch(/secrets|binaries|archives/i);
     expect(validateFileName("run.exe")).toMatch(/secrets|binaries|archives/i);
     const binary = await readBrowserFile(textFile("payload.ts", "a\0b", "text/typescript"));

@@ -234,31 +234,40 @@ describe("Tier 4 - Real-World Application Workflows", () => {
     });
 
     expect(task.status).toBe("running");
-    await new Promise((r) => setTimeout(r, 450));
+    let initialSummary = supervisor.getTask(task.taskId);
+    for (let i = 0; i < 40 && !initialSummary?.recentLogs?.includes("DAEMON_ONLINE"); i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      initialSummary = supervisor.getTask(task.taskId);
+    }
 
     // 2. Verify initial output in ring buffer
-    const initialSummary = supervisor.getTask(task.taskId);
     expect(initialSummary?.recentLogs).toContain("DAEMON_ONLINE");
 
     // 3. Send interactive input
     const inputRes = await supervisor.sendInput(task.taskId, "PING_COMMAND");
     expect(inputRes.success).toBe(true);
-    await new Promise((r) => setTimeout(r, 350));
+    let updatedSummary = supervisor.getTask(task.taskId);
+    for (let i = 0; i < 40 && !updatedSummary?.recentLogs?.includes("ECHO:PING_COMMAND"); i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      updatedSummary = supervisor.getTask(task.taskId);
+    }
 
     // 4. Verify echo response
-    const updatedSummary = supervisor.getTask(task.taskId);
     expect(updatedSummary?.recentLogs).toContain("ECHO:PING_COMMAND");
 
     // 5. Send graceful shutdown command
     await supervisor.sendInput(task.taskId, "SHUTDOWN");
-    await new Promise((r) => setTimeout(r, 450));
+    let finalSummary = supervisor.getTask(task.taskId);
+    for (let i = 0; i < 40 && finalSummary?.status === "running"; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      finalSummary = supervisor.getTask(task.taskId);
+    }
 
-    const finalSummary = supervisor.getTask(task.taskId);
     expect(["completed", "killed", "failed"]).toContain(finalSummary?.status);
     expect(finalSummary?.recentLogs).toContain("ECHO:SHUTDOWN");
 
     await supervisor.killAll();
-  });
+  }, 20000);
 
   /* ====================================================================== */
   /* Scenario 4: Failure Escalation Ladder & Replacement Recovery           */

@@ -7,6 +7,7 @@ import App from "@/App";
 import type { HostClientLike, HostSession } from "@/lib/hostSession";
 import type { HostMessage } from "@/lib/hostClient";
 import type { ExecutionPlan } from "@/types";
+import { STORAGE_KEY } from "@/lib/persist";
 
 /**
  * App-level wiring tests for the agent platform (Tasks 3/7/10/14/17).
@@ -37,6 +38,7 @@ afterEach(cleanup);
 
 beforeEach(() => {
   localStorage.clear();
+  window.history.replaceState({}, "", "/");
 });
 
 /** Fake host client: records outbound calls, lets the test emit host frames. */
@@ -49,6 +51,17 @@ class FakeHostClient implements HostClientLike {
   denyApproval = vi.fn(async () => {});
   pauseRun = vi.fn(async () => {});
   cancelRun = vi.fn(async () => {});
+  readFile = vi.fn(async () => ({ path: "test.ts", content: "data", language: "typescript", size: 4, modified: "2026-08-26T20:00:00Z", sha256: "abc", generation: 1 }));
+  writeFile = vi.fn(async () => ({
+    type: "workspace.writeFile.result" as const,
+    requestId: "mock-req",
+    path: "test.ts",
+    success: true as const,
+    generation: 1,
+    sha256: "def",
+    size: 4,
+    modified: "2026-08-26T20:00:00Z",
+  }));
   onEvent(handler: (msg: HostMessage) => void) {
     this.handlers.add(handler);
     return () => this.handlers.delete(handler);
@@ -110,6 +123,56 @@ describe("App host-absent default", () => {
 });
 
 describe("App host wiring", () => {
+  it("leaves the selected workspace untouched when the native picker is cancelled", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", "/?hostPort=4174&token=launcher-token");
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => new Response(JSON.stringify(
+      String(input).endsWith("/workspace/recent")
+        ? { type: "workspace.recent.list.result", requestId: "recent-1", workspaces: [] }
+        : { type: "workspace.broker.error", requestId: "choose-1", code: "picker_cancelled", message: "cancelled", recoverable: true },
+    ), { status: 200 }));
+
+    render(<App />);
+    await user.click(screen.getByRole("button", { name: /open local folder/i }));
+
+    await waitFor(() => expect(screen.queryByRole("heading", { name: /recent folders/i })).not.toBeInTheDocument());
+    expect(localStorage.getItem(STORAGE_KEY) ?? "").not.toContain("workspace-opaque");
+  });
+
+  it("opens a native folder through the broker, persists only safe metadata, and does not prompt for a path", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", "/?hostPort=4174&token=launcher-token");
+    const nativePath = "C:\\Users\\Hp\\private-project";
+    const brokerWorkspace = {
+      workspaceId: "workspace-opaque-1",
+      label: "private-project",
+      generation: 1,
+      capabilities: { read: true, stat: true, watch: true, search: true, git: true, terminal: true, subagents: true, memory: true, reviewedWrite: false },
+    };
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => new Response(JSON.stringify(
+      String(input).endsWith("/workspace/recent")
+        ? { type: "workspace.recent.list.result", requestId: "recent-1", workspaces: [] }
+        : String(input).endsWith("/workspace/activate")
+          ? { type: "workspace.activate.result", requestId: "activate-1", workspace: brokerWorkspace }
+          : { type: "workspace.choose.result", requestId: "choose-1", workspace: brokerWorkspace },
+    ), { status: 200 }));
+    const prompt = vi.spyOn(window, "prompt");
+
+    render(<App />);
+    await user.click(screen.getByRole("button", { name: /open local folder/i }));
+
+    await waitFor(() => expect(fetcher).toHaveBeenCalledWith(
+      `${window.location.origin}/workspace/choose`,
+      expect.objectContaining({ method: "POST" }),
+    ));
+    await waitFor(() => expect(fetcher).toHaveBeenCalledWith(
+      `${window.location.origin}/workspace/activate`,
+      expect.objectContaining({ method: "POST" }),
+    ));
+    expect(localStorage.getItem(STORAGE_KEY) ?? "").not.toContain(nativePath);
+    expect(prompt).not.toHaveBeenCalled();
+  });
+
   it("shows PlanPanel once a plan is set via the wiring seam and flows approve/run to the host", async () => {
     const user = userEvent.setup();
     const fake = new FakeHostClient();
@@ -263,5 +326,30 @@ describe("App host wiring", () => {
     await user.click(screen.getByRole("button", { name: "deny" }));
     expect(fake.denyApproval).toHaveBeenCalledWith("plan-browser", "browse");
     expect(fake.grantApproval).not.toHaveBeenCalled();
+  });
+
+  it("provides user-facing reviewed workspace writes toggle in settings defaulting to disabled", async () => {
+    const user = userEvent.setup();
+    const fake = new FakeHostClient();
+    renderWithHost(fake);
+    await waitFor(() => expect(fake.connect).toHaveBeenCalled());
+
+    // Open settings dialog via TopBar settings button
+    const settingsBtn = screen.getByRole("button", { name: "Settings" });
+    await user.click(settingsBtn);
+
+    // Switch to Workspace tab
+    const workspaceTabBtn = screen.getAllByRole("button", { name: /^workspace$/i })[0];
+    await user.click(workspaceTabBtn);
+
+    const checkbox = screen.getByRole("checkbox", { name: /enable reviewed local writes/i });
+    expect(checkbox).not.toBeChecked();
+
+    // Toggling requires deliberate confirmation
+    await user.click(checkbox);
+    expect(screen.getByText("Confirm Local Workspace Writes")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /enable reviewed writes/i }));
+    expect(checkbox).toBeChecked();
   });
 });

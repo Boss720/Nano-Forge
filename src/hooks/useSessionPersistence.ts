@@ -3,6 +3,7 @@ import type { Chat, Session, UsageRun, UsageTotals, VirtualFile, Workspace, Work
 import { FALLBACK_MODELS, VIRTUAL_PROJECT } from "@/lib/catalog";
 import { createDebouncedSaver, loadState, STORAGE_KEY } from "@/lib/persist";
 import { downloadSessionMarkdown } from "@/lib/exporter";
+import { getAttachmentSnapshotStore } from "@/lib/attachments/snapshots";
 
 export function createNewSession(modelId: string): Session {
   return {
@@ -197,6 +198,19 @@ export function useSessionPersistence(defaultModelId: string = FALLBACK_MODELS[3
 
   const deleteChat = useCallback((id: string) => {
     if (sessions.length <= 1) return;
+    const targetChat = workspaces.flatMap((w) => w.chats).find((c) => c.id === id);
+    if (targetChat) {
+      const snapshotIds = targetChat.messages
+        .flatMap((m) => m.attachments ?? [])
+        .map((a) => a.snapshotId)
+        .filter((sid): sid is string => Boolean(sid));
+      if (snapshotIds.length > 0) {
+        const store = getAttachmentSnapshotStore();
+        for (const sid of snapshotIds) {
+          void store.remove(sid).catch(() => undefined);
+        }
+      }
+    }
     const next = workspaces.map((workspace) => ({
       ...workspace,
       chats: workspace.chats.filter((chat) => chat.id !== id),
@@ -259,6 +273,20 @@ export function useSessionPersistence(defaultModelId: string = FALLBACK_MODELS[3
 
   const deleteWorkspace = useCallback((id: string) => {
     if (workspaces.length <= 1) return;
+    const targetWorkspace = workspaces.find((w) => w.id === id);
+    if (targetWorkspace) {
+      const snapshotIds = targetWorkspace.chats
+        .flatMap((c) => c.messages)
+        .flatMap((m) => m.attachments ?? [])
+        .map((a) => a.snapshotId)
+        .filter((sid): sid is string => Boolean(sid));
+      if (snapshotIds.length > 0) {
+        const store = getAttachmentSnapshotStore();
+        for (const sid of snapshotIds) {
+          void store.remove(sid).catch(() => undefined);
+        }
+      }
+    }
     const next = workspaces.filter((workspace) => workspace.id !== id);
     setWorkspaces(next);
     if (activeWorkspaceIdState === id) {

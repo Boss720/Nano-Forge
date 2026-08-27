@@ -13,6 +13,22 @@ import { z } from "zod";
 import { executionPlanSchema, type ExecutionPlan } from "@protocol/plan";
 import { jsonValueSchema } from "@protocol/json";
 import {
+  planSubmitResultSchema,
+  runPauseResultSchema,
+  runResumeResultSchema,
+  runCancelResultSchema,
+  approvalGrantResultSchema,
+  approvalDenyResultSchema,
+  toolResponseResultSchema,
+  type PlanSubmitResult,
+  type RunPauseResult,
+  type RunResumeResult,
+  type RunCancelResult,
+  type ApprovalGrantResult,
+  type ApprovalDenyResult,
+  type ToolResponseResult,
+} from "@protocol/lifecycle";
+import {
   workspaceDescribeRequestSchema,
   workspaceErrorSchema,
   workspaceGitStatusRequestSchema,
@@ -28,6 +44,79 @@ import {
   workspaceWriteRequestSchema,
   workspaceWriteResultSchema,
 } from "@protocol/workspace";
+import {
+  invokeSubagentParamsSchema,
+  invokeSubagentResultSchema,
+  manageSubagentsParamsSchema,
+  manageSubagentsResultSchema,
+  sendMessageParamsSchema,
+  sendMessageResultSchema,
+  defineSubagentParamsSchema,
+  defineSubagentResultSchema,
+  subagentInfoSchema,
+  subagentMessageSchema,
+  subagentLifecycleEventSchema,
+} from "@protocol/subagents";
+import {
+  manageTaskParamsSchema,
+  manageTaskResultSchema,
+  scheduleParamsSchema,
+  scheduleResultSchema,
+  taskSummarySchema,
+  taskLifecycleEventSchema,
+} from "@protocol/tasks";
+import {
+  memorySetParamsSchema,
+  memorySetResultSchema,
+  memoryGetParamsSchema,
+  memoryGetResultSchema,
+  memoryQueryParamsSchema,
+  memoryQueryResultSchema,
+  memoryDeleteParamsSchema,
+  memoryDeleteResultSchema,
+  memoryLifecycleEventSchema,
+} from "@protocol/memory";
+import {
+  voiceCallStatusSchema,
+  voiceCallEndReasonSchema,
+  voiceInterruptReasonSchema,
+  voiceProfileSchema,
+  voiceParticipantSchema,
+  voiceCallSessionSchema,
+  voiceTranscriptFrameSchema,
+  voiceTtsChunkSchema,
+  voiceTurnSyncSchema,
+  voiceInterruptFrameSchema,
+  type VoiceCallStatus,
+  type VoiceCallEndReason,
+  type VoiceInterruptReason,
+  type VoiceProfile,
+  type VoiceParticipant,
+  type VoiceCallSession,
+  type VoiceTranscriptFrame,
+  type VoiceTtsChunk,
+  type VoiceTurnSync,
+  type VoiceInterruptFrame,
+  type VoiceClientMessage,
+  type VoiceHostEvent,
+} from "@protocol/voice";
+
+export {
+  planSubmitResultSchema,
+  runPauseResultSchema,
+  runResumeResultSchema,
+  runCancelResultSchema,
+  approvalGrantResultSchema,
+  approvalDenyResultSchema,
+  toolResponseResultSchema,
+  type PlanSubmitResult,
+  type RunPauseResult,
+  type RunResumeResult,
+  type RunCancelResult,
+  type ApprovalGrantResult,
+  type ApprovalDenyResult,
+  type ToolResponseResult,
+};
 
 /** Canonical run lifecycle states shared with the UI tool cards. */
 export const RUN_STATES = [
@@ -69,6 +158,7 @@ export type ToolRequestMessage = z.infer<typeof toolRequestSchema>;
  */
 export const planSubmitSchema = z.object({
   type: z.literal("plan.submit"),
+  requestId: idSchema.optional(),
   plan: z.looseObject({
     id: idSchema,
     goal: z.string().max(8192),
@@ -160,63 +250,6 @@ export const integrationsSnapshotSchema = z.object({
 });
 export type IntegrationsSnapshot = z.infer<typeof integrationsSnapshotSchema>;
 
-import {
-  invokeSubagentParamsSchema,
-  invokeSubagentResultSchema,
-  manageSubagentsParamsSchema,
-  manageSubagentsResultSchema,
-  sendMessageParamsSchema,
-  sendMessageResultSchema,
-  defineSubagentParamsSchema,
-  defineSubagentResultSchema,
-  subagentInfoSchema,
-  subagentMessageSchema,
-  subagentLifecycleEventSchema,
-} from "@protocol/subagents";
-import {
-  manageTaskParamsSchema,
-  manageTaskResultSchema,
-  scheduleParamsSchema,
-  scheduleResultSchema,
-  taskSummarySchema,
-  taskLifecycleEventSchema,
-} from "@protocol/tasks";
-import {
-  memorySetParamsSchema,
-  memorySetResultSchema,
-  memoryGetParamsSchema,
-  memoryGetResultSchema,
-  memoryQueryParamsSchema,
-  memoryQueryResultSchema,
-  memoryDeleteParamsSchema,
-  memoryDeleteResultSchema,
-  memoryLifecycleEventSchema,
-} from "@protocol/memory";
-import {
-  voiceCallStatusSchema,
-  voiceCallEndReasonSchema,
-  voiceInterruptReasonSchema,
-  voiceProfileSchema,
-  voiceParticipantSchema,
-  voiceCallSessionSchema,
-  voiceTranscriptFrameSchema,
-  voiceTtsChunkSchema,
-  voiceTurnSyncSchema,
-  voiceInterruptFrameSchema,
-  type VoiceCallStatus,
-  type VoiceCallEndReason,
-  type VoiceInterruptReason,
-  type VoiceProfile,
-  type VoiceParticipant,
-  type VoiceCallSession,
-  type VoiceTranscriptFrame,
-  type VoiceTtsChunk,
-  type VoiceTurnSync,
-  type VoiceInterruptFrame,
-  type VoiceClientMessage,
-  type VoiceHostEvent,
-} from "@protocol/voice";
-
 /* ------------------------------------------------------------------------ */
 /* Client -> Host                                                           */
 /* ------------------------------------------------------------------------ */
@@ -224,17 +257,33 @@ import {
 export const clientMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("ping") }),
   planSubmitSchema,
-  z.object({ type: z.literal("approval.grant"), requestId: idSchema }),
+  z.object({
+    type: z.literal("approval.grant"),
+    requestId: idSchema,
+    runId: idSchema.optional(),
+    stepId: idSchema.optional(),
+  }),
   z.object({
     type: z.literal("approval.deny"),
     requestId: idSchema,
+    runId: idSchema.optional(),
+    stepId: idSchema.optional(),
     reason: z.string().max(4096).optional(),
   }),
-  z.object({ type: z.literal("run.pause"), runId: idSchema }),
-  z.object({ type: z.literal("run.resume"), runId: idSchema }),
+  z.object({
+    type: z.literal("run.pause"),
+    runId: idSchema,
+    requestId: idSchema.optional(),
+  }),
+  z.object({
+    type: z.literal("run.resume"),
+    runId: idSchema,
+    requestId: idSchema.optional(),
+  }),
   z.object({
     type: z.literal("run.cancel"),
     runId: idSchema,
+    requestId: idSchema.optional(),
     reason: z.string().max(4096).optional(),
   }),
   /** Client answer to a host `tool.approval_required` request. */
@@ -445,9 +494,18 @@ export const hostMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("error"),
     code: z.string().min(1).max(128),
     message: z.string().max(4096),
+    requestId: idSchema.optional(),
     runId: idSchema.optional(),
     at: atSchema.optional(),
   }),
+  // Run Control & Acknowledgement Result Frames
+  planSubmitResultSchema,
+  runPauseResultSchema,
+  runResumeResultSchema,
+  runCancelResultSchema,
+  approvalGrantResultSchema,
+  approvalDenyResultSchema,
+  toolResponseResultSchema,
   // Workspace RPC Results
   workspaceReadySchema,
   workspaceErrorSchema,

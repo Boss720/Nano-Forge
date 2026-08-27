@@ -279,6 +279,11 @@ Options:
   const bundleLauncherAlias = path.join(BUNDLE_DIR, 'launcher.cjs');
   fs.copyFileSync(launcherSrc, bundleLauncherDest);
   fs.copyFileSync(launcherSrc, bundleLauncherAlias);
+  // The launcher deliberately keeps native picker and private registry logic
+  // as sidecars so a packaged normal run has the same broker capabilities.
+  for (const sidecar of ['workspace-picker.cjs', 'workspace-registry.cjs']) {
+    fs.copyFileSync(path.join(ROOT_DIR, 'scripts', sidecar), path.join(BUNDLE_DIR, sidecar));
+  }
 
   const hostBundleFile = path.join(HOST_DIST_DIR, 'server.mjs');
   if (fs.existsSync(hostBundleFile)) {

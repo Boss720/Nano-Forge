@@ -12,11 +12,11 @@
  *
  * Wire protocol (all frames are JSON text):
  *   client -> host: plan.submit | approval.grant | approval.deny |
- *                   run.pause | run.cancel      (each carries a requestId)
+ *                   run.pause | run.resume | run.cancel (each carries a requestId)
  *   host -> client: run.state | tool.approval_required | tool.output |
- *                   run.event | error
+ *                   run.event | error | <rpcName>.result
  * A request resolves on the first host frame echoing its requestId
- * (`run.event`/`run.state`/`tool.output` = success, `error` = rejection).
+ * (typed `.result`/`workspace.ready`/etc. = success, `error`/`workspace.error` = rejection).
  * The client only ever sends approvals/pauses/cancels/plans — it NEVER emits
  * a tool execution frame; execution is the host's job after policy + grant.
  */
@@ -69,7 +69,10 @@ export type HostClientRequestType =
   | "approval.grant"
   | "approval.deny"
   | "run.pause"
+  | "run.resume"
   | "run.cancel"
+  | "tool.response"
+  | "workspace.describe"
   | "workspace.open"
   | "workspace.readDir"
   | "workspace.readFile"
@@ -102,6 +105,8 @@ export interface HostClientRequest {
   plan?: ExecutionPlan;
   runId?: string;
   stepId?: string;
+  approved?: boolean;
+  reason?: string;
   kind?: "rules" | "skill" | "mcp";
   id?: string;
   enabled?: boolean;
@@ -161,7 +166,63 @@ export interface HostErrorMessage {
   type: "error";
   code: string;
   message: string;
+  requestId?: string;
   runId?: string;
+}
+
+export interface PlanSubmitResultMessage {
+  type: "plan.submit.result";
+  requestId: string;
+  runId: string;
+  accepted?: boolean;
+  planId?: string;
+  at?: string;
+}
+
+export interface RunPauseResultMessage {
+  type: "run.pause.result";
+  requestId: string;
+  runId: string;
+  at?: string;
+}
+
+export interface RunResumeResultMessage {
+  type: "run.resume.result";
+  requestId: string;
+  runId: string;
+  at?: string;
+}
+
+export interface RunCancelResultMessage {
+  type: "run.cancel.result";
+  requestId: string;
+  runId: string;
+  at?: string;
+}
+
+export interface ApprovalGrantResultMessage {
+  type: "approval.grant.result";
+  requestId: string;
+  runId?: string;
+  stepId?: string;
+  resolved?: boolean;
+  at?: string;
+}
+
+export interface ApprovalDenyResultMessage {
+  type: "approval.deny.result";
+  requestId: string;
+  runId?: string;
+  stepId?: string;
+  resolved?: boolean;
+  at?: string;
+}
+
+export interface ToolResponseResultMessage {
+  type: "tool.response.result";
+  requestId: string;
+  resolved?: boolean;
+  at?: string;
 }
 
 export interface IntegrationsSnapshotMessage {
@@ -459,6 +520,13 @@ export type HostMessage =
   | ToolOutputMessage
   | RunEventMessage
   | HostErrorMessage
+  | PlanSubmitResultMessage
+  | RunPauseResultMessage
+  | RunResumeResultMessage
+  | RunCancelResultMessage
+  | ApprovalGrantResultMessage
+  | ApprovalDenyResultMessage
+  | ToolResponseResultMessage
   | IntegrationsSnapshotMessage
   | SubagentInvokeResultMessage
   | SubagentManageResultMessage
@@ -501,6 +569,9 @@ export type HostMessage =
   | WorkspaceReadyMessage
   | WorkspaceErrorMessage
   | { type: "workspace.readDir.result"; requestId: string; path: string; entries: DirEntry[] }
+  | { type: "workspace.readFile.result"; requestId: string; path: string; content: string; language: string; size: number; modified: string; sha256: string; generation: number }
+  | { type: "workspace.writeFile.result"; requestId: string; path: string; generation: number; success: boolean; modified?: string; sha256?: string; bytesWritten?: number }
+  | { type: "workspace.stat.result"; requestId: string; path: string; stat: FileStat; generation: number }
   | { type: "workspace.search.result"; requestId: string; matches: SearchMatch[] }
   | { type: "workspace.gitStatus.result"; requestId: string; files: GitFileStatus[] }
   | { type: "workspace.watch.result"; requestId?: string; enabled: boolean; generation: number }
@@ -550,10 +621,12 @@ export interface WebSocketLike {
 export type WebSocketFactory = (url: string) => WebSocketLike;
 
 export interface HostClientOptions {
-  /** Loopback port printed by the host on startup. */
-  port: number;
-  /** Single-use bearer token. Never persisted by this client. */
-  token: string;
+  /** Loopback port printed by the host on startup. Required without websocketUrl. */
+  port?: number;
+  /** Single-use bearer token. Required without websocketUrl. Never persisted by this client. */
+  token?: string;
+  /** Ephemeral broker-supplied endpoint. It is never written to browser storage. */
+  websocketUrl?: string;
   /** Override for tests; defaults to the global WebSocket constructor. */
   WebSocketImpl?: WebSocketFactory;
   /** Bounds failed workspace requests so a missing host reply cannot hang the UI. */
@@ -588,6 +661,13 @@ const HOST_MESSAGE_TYPES = new Set([
   "tool.output",
   "run.event",
   "error",
+  "plan.submit.result",
+  "run.pause.result",
+  "run.resume.result",
+  "run.cancel.result",
+  "approval.grant.result",
+  "approval.deny.result",
+  "tool.response.result",
   "workspace.ready",
   "workspace.error",
   "workspace.readDir.result",
@@ -688,6 +768,27 @@ export function parseHostMessage(raw: unknown): (HostMessage & WithRequestId) | 
     case "error":
       if (!isString(data.code) || !isString(data.message)) return null;
       return { ...(data as unknown as HostErrorMessage), requestId };
+    case "plan.submit.result":
+      if (!isString(data.requestId) || !isString(data.runId)) return null;
+      return { ...(data as unknown as PlanSubmitResultMessage), requestId: data.requestId as string };
+    case "run.pause.result":
+      if (!isString(data.requestId) || !isString(data.runId)) return null;
+      return { ...(data as unknown as RunPauseResultMessage), requestId: data.requestId as string };
+    case "run.resume.result":
+      if (!isString(data.requestId) || !isString(data.runId)) return null;
+      return { ...(data as unknown as RunResumeResultMessage), requestId: data.requestId as string };
+    case "run.cancel.result":
+      if (!isString(data.requestId) || !isString(data.runId)) return null;
+      return { ...(data as unknown as RunCancelResultMessage), requestId: data.requestId as string };
+    case "approval.grant.result":
+      if (!isString(data.requestId)) return null;
+      return { ...(data as unknown as ApprovalGrantResultMessage), requestId: data.requestId as string };
+    case "approval.deny.result":
+      if (!isString(data.requestId)) return null;
+      return { ...(data as unknown as ApprovalDenyResultMessage), requestId: data.requestId as string };
+    case "tool.response.result":
+      if (!isString(data.requestId)) return null;
+      return { ...(data as unknown as ToolResponseResultMessage), requestId: data.requestId as string };
     case "workspace.ready":
       if (!isRecord(data.workspace) || !isString(data.workspace.id) || !isString(data.workspace.name) || !isString(data.workspace.displayPath) || typeof data.workspace.generation !== "number") return null;
       return { ...(data as unknown as WorkspaceReadyMessage), requestId };
@@ -839,9 +940,16 @@ export class HostClient {
   private openPromise: { resolve: () => void; reject: (e: Error) => void } | null = null;
   private closed = false;
   private readonly requestTimeoutMs: number;
+  private workspaceGeneration: number | null = null;
 
   constructor(opts: HostClientOptions) {
-    this.url = `ws://127.0.0.1:${opts.port}/agent?token=${encodeURIComponent(opts.token)}`;
+    if (opts.websocketUrl) {
+      this.url = opts.websocketUrl;
+    } else if (typeof opts.port === "number" && opts.token) {
+      this.url = `ws://127.0.0.1:${opts.port}/agent?token=${encodeURIComponent(opts.token)}`;
+    } else {
+      throw new HostConnectionError("host connection needs websocketUrl or port and token");
+    }
     this.makeSocket =
       opts.WebSocketImpl ??
       ((url: string) => new WebSocket(url) as unknown as WebSocketLike);
@@ -877,45 +985,84 @@ export class HostClient {
     return () => this.subscribers.delete(handler);
   }
 
-  submitPlan(plan: ExecutionPlan): Promise<void> {
-    return this.request({ type: "plan.submit", plan });
+  submitPlan(plan: ExecutionPlan): Promise<PlanSubmitResultMessage> {
+    return this.requestResult({ type: "plan.submit", plan }).then(
+      (m) => m as PlanSubmitResultMessage,
+    );
   }
 
-  grantApproval(runId: string, stepId: string): Promise<void> {
-    return this.request({ type: "approval.grant", runId, stepId });
+  grantApproval(runId: string, stepId: string): Promise<ApprovalGrantResultMessage> {
+    return this.requestResult({ type: "approval.grant", runId, stepId }).then(
+      (m) => m as ApprovalGrantResultMessage,
+    );
   }
 
-  denyApproval(runId: string, stepId: string): Promise<void> {
-    return this.request({ type: "approval.deny", runId, stepId });
+  denyApproval(runId: string, stepId: string, reason?: string): Promise<ApprovalDenyResultMessage> {
+    return this.requestResult({
+      type: "approval.deny",
+      runId,
+      stepId,
+      ...(reason ? { reason } : {}),
+    }).then((m) => m as ApprovalDenyResultMessage);
   }
 
-  pauseRun(runId: string): Promise<void> {
-    return this.request({ type: "run.pause", runId });
+  pauseRun(runId: string): Promise<RunPauseResultMessage> {
+    return this.requestResult({ type: "run.pause", runId }).then(
+      (m) => m as RunPauseResultMessage,
+    );
   }
 
-  cancelRun(runId: string): Promise<void> {
-    return this.request({ type: "run.cancel", runId });
+  resumeRun(runId: string): Promise<RunResumeResultMessage> {
+    return this.requestResult({ type: "run.resume", runId }).then(
+      (m) => m as RunResumeResultMessage,
+    );
   }
 
-  readDir(path = ""): Promise<DirEntry[]> { return this.requestResult({ type: "workspace.readDir", path }).then((m) => (m as { entries: DirEntry[] }).entries); }
-  readFile(path: string): Promise<{ path: string; content: string; language: string; size: number }> {
-    return this.requestResult({ type: "workspace.readFile", path }).then((m) => m as { path: string; content: string; language: string; size: number });
+  cancelRun(runId: string, reason?: string): Promise<RunCancelResultMessage> {
+    return this.requestResult({
+      type: "run.cancel",
+      runId,
+      ...(reason ? { reason } : {}),
+    }).then((m) => m as RunCancelResultMessage);
+  }
+
+  sendToolResponse(requestId: string, approved: boolean, reason?: string): Promise<ToolResponseResultMessage> {
+    return this.requestResult({
+      type: "tool.response",
+      requestId,
+      approved,
+      ...(reason ? { reason } : {}),
+    }).then((m) => m as ToolResponseResultMessage);
+  }
+
+  /** Read the active host workspace after a fresh broker handoff. */
+  describeWorkspace(): Promise<HostWorkspaceDescriptor> {
+    return this.requestResult({ type: "workspace.describe" }).then((m) => {
+      const workspace = (m as WorkspaceReadyMessage).workspace;
+      this.workspaceGeneration = workspace.generation;
+      return workspace;
+    });
+  }
+
+  readDir(path = ""): Promise<DirEntry[]> { return this.requestResult({ type: "workspace.readDir", path, ...this.workspaceGenerationRequest() }).then((m) => (m as { entries: DirEntry[] }).entries); }
+  readFile(path: string): Promise<{ path: string; content: string; language: string; size: number; modified: string; sha256: string; generation: number }> {
+    return this.requestResult({ type: "workspace.readFile", path, ...this.workspaceGenerationRequest() }).then((m) => m as { path: string; content: string; language: string; size: number; modified: string; sha256: string; generation: number });
   }
   stat(path: string): Promise<FileStat> {
-    return this.requestResult({ type: "workspace.stat", path }).then((m) => (m as { stat: FileStat }).stat);
+    return this.requestResult({ type: "workspace.stat", path, ...this.workspaceGenerationRequest() }).then((m) => (m as { stat: FileStat }).stat);
   }
   search(query: string, options?: { caseSensitive?: boolean; includes?: string[]; maxResults?: number }): Promise<SearchMatch[]> {
-    return this.requestResult({ type: "workspace.search", query, options }).then((m) => (m as { matches: SearchMatch[] }).matches);
+    return this.requestResult({ type: "workspace.search", query, options, ...this.workspaceGenerationRequest() }).then((m) => (m as { matches: SearchMatch[] }).matches);
   }
-  gitStatus(): Promise<GitFileStatus[]> { return this.requestResult({ type: "workspace.gitStatus" }).then((m) => (m as { files: GitFileStatus[] }).files); }
+  gitStatus(): Promise<GitFileStatus[]> { return this.requestResult({ type: "workspace.gitStatus", ...this.workspaceGenerationRequest() }).then((m) => (m as { files: GitFileStatus[] }).files); }
   writeFile(path: string, content: string, options?: { expectedSha256?: string; expectedModified?: string }): Promise<WorkspaceWriteResult> {
-    return this.requestResult({ type: "workspace.writeFile", path, content, ...options }).then((m) => {
+    return this.requestResult({ type: "workspace.writeFile", path, content, ...options, ...this.workspaceGenerationRequest() }).then((m) => {
       if (!(m as { success?: boolean }).success) throw new HostConnectionError(`host rejected write for ${path}`);
       return m as WorkspaceWriteResult;
     });
   }
-  watch(): Promise<void> { return this.sendOneWay({ type: "workspace.watch", enabled: true }); }
-  unwatch(): Promise<void> { return this.sendOneWay({ type: "workspace.watch", enabled: false }); }
+  watch(): Promise<void> { return this.sendOneWay({ type: "workspace.watch", enabled: true, ...this.workspaceGenerationRequest() }); }
+  unwatch(): Promise<void> { return this.sendOneWay({ type: "workspace.watch", enabled: false, ...this.workspaceGenerationRequest() }); }
   /** Open a path supplied by an explicit local-user action. The host validates it. */
   openWorkspace(path: string, generation = 1): Promise<HostWorkspaceDescriptor> {
     return this.requestResult({ type: "workspace.open", path, generation }).then((m) => (m as WorkspaceReadyMessage).workspace);
@@ -1083,6 +1230,10 @@ export class HostClient {
     if (!this.ws || this.ws.readyState !== WS_OPEN) return Promise.reject(new HostConnectionError("not connected to agent host"));
     this.ws.send(JSON.stringify(msg));
     return Promise.resolve();
+  }
+
+  private workspaceGenerationRequest(): { generation?: number } {
+    return this.workspaceGeneration === null ? {} : { generation: this.workspaceGeneration };
   }
 
   private pendingRequest(requestId: string, resolve: (value?: any) => void, reject: (error: Error) => void): PendingRequest {

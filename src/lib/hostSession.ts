@@ -52,10 +52,20 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ExecutionPlan, PlanStep, PlanStepStatus, ToolRun } from "@/types";
-import { HostClient, type HostMessage } from "@/lib/hostClient";
+import {
+  HostClient,
+  type HostMessage,
+  type PlanSubmitResultMessage,
+  type ApprovalGrantResultMessage,
+  type ApprovalDenyResultMessage,
+  type RunPauseResultMessage,
+  type RunResumeResultMessage,
+  type RunCancelResultMessage,
+  type ToolResponseResultMessage,
+} from "@/lib/hostClient";
 import type { CommandResultFrame } from "@protocol/commands";
 import type { ExecuteCommandInput, HostWorkspaceDescriptor } from "@/lib/hostClient";
-import type { WorkspaceWriteResult } from "@protocol/workspace";
+import type { WorkspaceBrokerConnection, WorkspaceWriteResult } from "@protocol/workspace";
 import type { DirEntry, FileStat, SearchMatch, GitFileStatus } from "@/types/workspace";
 import {
   useBrowserPermissions,
@@ -95,6 +105,16 @@ function defaultStorage(): Storage | undefined {
 /** Never throws; absent/corrupt payload → the disabled default. */
 export function loadHostSettings(storage: Storage | undefined = defaultStorage()): HostSettings {
   try {
+    // Standalone launcher sessions provide ephemeral host credentials in the
+    // page URL. Consume them at startup, but never write the token to storage.
+    if (typeof globalThis.location !== "undefined") {
+      const query = new URLSearchParams(globalThis.location.search);
+      const hostPort = Number(query.get("hostPort"));
+      const launcherToken = query.get("token");
+      if (Number.isInteger(hostPort) && hostPort > 0 && hostPort <= 65535 && launcherToken) {
+        return { enabled: true, port: hostPort, token: launcherToken };
+      }
+    }
     const raw = storage?.getItem(HOST_SETTINGS_KEY);
     if (!raw) return DEFAULT_HOST_SETTINGS;
     const parsed = JSON.parse(raw) as Partial<HostSettings>;
@@ -188,19 +208,22 @@ export interface HostClientLike {
   connect(): Promise<void>;
   close(): void;
   onEvent(handler: (msg: HostMessage) => void): () => void;
-  submitPlan(plan: ExecutionPlan): Promise<void>;
-  grantApproval(runId: string, stepId: string): Promise<void>;
-  denyApproval(runId: string, stepId: string): Promise<void>;
-  pauseRun(runId: string): Promise<void>;
-  cancelRun(runId: string): Promise<void>;
+  submitPlan(plan: ExecutionPlan): Promise<PlanSubmitResultMessage | void>;
+  grantApproval(runId: string, stepId: string): Promise<ApprovalGrantResultMessage | void>;
+  denyApproval(runId: string, stepId: string, reason?: string): Promise<ApprovalDenyResultMessage | void>;
+  pauseRun(runId: string): Promise<RunPauseResultMessage | void>;
+  resumeRun?(runId: string): Promise<RunResumeResultMessage | void>;
+  cancelRun(runId: string, reason?: string): Promise<RunCancelResultMessage | void>;
+  sendToolResponse?(requestId: string, approved: boolean, reason?: string): Promise<ToolResponseResultMessage | void>;
   readDir?(path?: string): Promise<DirEntry[]>;
-  readFile?(path: string): Promise<{ path: string; content: string; language: string; size: number }>;
+  readFile?(path: string): Promise<{ path: string; content: string; language: string; size: number; modified?: string; sha256?: string; generation?: number }>;
   writeFile?(path: string, content: string, options?: { expectedSha256?: string; expectedModified?: string }): Promise<WorkspaceWriteResult>;
   stat?(path: string): Promise<FileStat>;
   search?(query: string, options?: { caseSensitive?: boolean; includes?: string[]; maxResults?: number }): Promise<SearchMatch[]>;
   gitStatus?(): Promise<GitFileStatus[]>;
   watch?(): Promise<void>;
   unwatch?(): Promise<void>;
+  describeWorkspace?(): Promise<HostWorkspaceDescriptor>;
   selectWorkspace?(selectionToken: string): Promise<HostWorkspaceDescriptor>;
   openWorkspace?(path: string): Promise<HostWorkspaceDescriptor>;
   toggleIntegration?(kind: "rules" | "skill" | "mcp", id: string, enabled: boolean): Promise<void>;
@@ -294,7 +317,7 @@ export interface HostSession {
   executeCommand: (input: ExecuteCommandInput) => Promise<CommandResultFrame>;
   dispatchCommand: (input: ExecuteCommandInput) => Promise<CommandResultFrame>;
   readWorkspaceDirectory: (path?: string) => Promise<DirEntry[] | null>;
-  readWorkspaceFile: (path: string) => Promise<{ path: string; content: string; language: string; size: number } | null>;
+  readWorkspaceFile: (path: string) => Promise<{ path: string; content: string; language: string; size: number; modified?: string; sha256?: string; generation?: number } | null>;
   writeWorkspaceFile: (path: string, content: string, options?: { expectedSha256?: string; expectedModified?: string }) => Promise<WorkspaceWriteResult | null>;
   statWorkspaceFile: (path: string) => Promise<FileStat | null>;
   searchWorkspace: (query: string, options?: { maxResults?: number }) => Promise<SearchMatch[] | null>;
@@ -303,6 +326,8 @@ export interface HostSession {
   unwatchWorkspace: () => Promise<boolean>;
   selectWorkspace: (selectionToken: string) => Promise<HostWorkspaceDescriptor | null>;
   openWorkspace: (path: string) => Promise<HostWorkspaceDescriptor | null>;
+  /** Atomically adopt an already-prepared broker host without a page reload. */
+  reconnectToWorkspace: (connection: WorkspaceBrokerConnection) => Promise<HostWorkspaceDescriptor | null>;
   manageTask: (params: ManageTaskParams) => Promise<ManageTaskResult | null>;
   createSchedule: (params: ScheduleParams) => Promise<ScheduleResult | null>;
   cancelSchedule: (scheduleId: string) => Promise<ManageTaskResult | null>;
@@ -339,7 +364,7 @@ export interface UseHostSessionOptions {
   /** Overrides the persisted settings (tests / wiring seam). */
   settings?: HostSettings;
   /** Injectable client factory — production uses the real HostClient. */
-  createClient?: (opts: { port: number; token: string }) => HostClientLike;
+  createClient?: (opts: { port?: number; token?: string; websocketUrl?: string }) => HostClientLike;
   /** Wiring seam: called with the live session API after every render
    *  (tests / the future plan composer). */
   onApi?: (api: HostSession) => void;
@@ -464,6 +489,7 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
   const perms = useBrowserPermissions();
 
   const clientRef = useRef<HostClientLike | null>(null);
+  const clientUnsubscribeRef = useRef<(() => void) | null>(null);
   const toolRunOwners = useRef(new Map<string, string>()); // toolId -> runId
   const pendingGrants = useRef(new Map<string, PendingGrant>()); // perm key -> grant
   // Latest-value refs keep the single host subscription stable (mounted once
@@ -479,8 +505,9 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
     const client = clientRef.current;
     if (!client) return;
     const p = approved ? client.grantApproval(runId, stepId) : client.denyApproval(runId, stepId);
-    void p.catch(() => {
-      /* host vanished mid-decision — the run.state/error stream surfaces it */
+    void p.catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      setLastError(message);
     });
   }, []);
 
@@ -659,7 +686,7 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
                 s.id === ev.subagentId
                   ? {
                       ...s,
-                      lastHeartbeat: ev.lastVisited,
+                      lastHeartbeat: ev.lastVisited ?? ev.at,
                       ...(ev.progressSummary ? { lastProgressSummary: ev.progressSummary } : {}),
                     }
                   : s,
@@ -929,16 +956,28 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
 
   /* ------------------------- connection ------------------------------- */
 
+  const closeActiveClient = useCallback(() => {
+    clientUnsubscribeRef.current?.();
+    clientUnsubscribeRef.current = null;
+    const current = clientRef.current;
+    clientRef.current = null;
+    current?.close();
+  }, []);
+
   useEffect(() => {
     if (!connKey) return; // host disabled — nothing to connect, status derives to "off"
     const port = settings.port as number;
     const token = settings.token as string;
-    const client = (createClient ?? ((o: { port: number; token: string }) => new HostClient(o)))({
+    const client = (createClient ?? ((o: { port?: number; token?: string; websocketUrl?: string }) => new HostClient(o)))({
       port,
       token,
     });
     clientRef.current = client;
-    const unsubscribe = client.onEvent(handleHostMessage);
+    clientUnsubscribeRef.current = client.onEvent((message) => {
+      // A socket can dispatch an already-queued event after a replacement.
+      // Only the currently adopted client is allowed to mutate session state.
+      if (clientRef.current === client) handleHostMessage(message);
+    });
     let cancelled = false;
     // setState only inside these async callbacks — never synchronously in the
     // effect body (react-hooks/set-state-in-effect).
@@ -957,13 +996,58 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
     );
     return () => {
       cancelled = true;
-      unsubscribe();
-      client.close();
-      clientRef.current = null;
+      closeActiveClient();
     };
     // settings primitives only — a new settings object with the same values
     // must NOT reconnect.
-  }, [connKey, settings.port, settings.token, createClient, handleHostMessage]);
+  }, [connKey, settings.port, settings.token, createClient, handleHostMessage, closeActiveClient]);
+
+  const reconnectToWorkspace = useCallback(async (connection: WorkspaceBrokerConnection): Promise<HostWorkspaceDescriptor | null> => {
+    const current = clientRef.current;
+    if (!current) {
+      setLastError("Cannot reconnect workspace while the local host is unavailable");
+      return null;
+    }
+
+    let candidate: HostClientLike | null = null;
+    try {
+      candidate = (createClient ?? ((o: { port?: number; token?: string; websocketUrl?: string }) => new HostClient(o)))({
+        ...(connection.websocketUrl ? { websocketUrl: connection.websocketUrl } : {}),
+        ...(connection.port !== undefined ? { port: connection.port } : {}),
+        ...(connection.token ? { token: connection.token } : {}),
+      });
+      await candidate.connect();
+      if (!candidate.describeWorkspace) throw new Error("Replacement local host cannot describe its workspace");
+      const descriptor = await candidate.describeWorkspace();
+      if (descriptor.generation !== connection.generation) {
+        throw new Error(`Replacement host generation ${descriptor.generation} does not match broker generation ${connection.generation}`);
+      }
+
+      // The candidate has proved it represents the broker-selected workspace.
+      // Only now retire the old host, so a failed candidate leaves it usable.
+      clientUnsubscribeRef.current?.();
+      clientUnsubscribeRef.current = null;
+      clientRef.current = candidate;
+      clientUnsubscribeRef.current = candidate.onEvent((message) => {
+        if (clientRef.current === candidate) handleHostMessage(message);
+      });
+      current.close();
+
+      // Workspace-scoped transient UI cannot cross a host generation.
+      toolRunOwners.current.clear();
+      pendingGrants.current.clear();
+      setToolRuns([]);
+      setRoute(null);
+      setEvidence(null);
+      setLastError(null);
+      return descriptor;
+    } catch (error) {
+      candidate?.close();
+      const message = error instanceof Error ? error.message : String(error);
+      setLastError(message);
+      return null;
+    }
+  }, [createClient, handleHostMessage]);
 
   /* ------------------------- actions ---------------------------------- */
 
@@ -999,15 +1083,24 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
     const client = clientRef.current;
     if (!current || current.id !== planId || !client) return;
     // Convention: (re)submitting the approved plan starts/resumes its run.
-    void client.submitPlan(current).catch(() => {});
+    void client.submitPlan(current).catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      setLastError(message);
+    });
   }, []);
 
   const pause = useCallback((planId: string) => {
-    void clientRef.current?.pauseRun(planId).catch(() => {});
+    void clientRef.current?.pauseRun(planId).catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      setLastError(message);
+    });
   }, []);
 
   const cancel = useCallback((planId: string) => {
-    void clientRef.current?.cancelRun(planId).catch(() => {});
+    void clientRef.current?.cancelRun(planId).catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      setLastError(message);
+    });
   }, []);
 
   const stopToolRun = useCallback((toolRunId: string) => {
@@ -1015,7 +1108,10 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
     if (!client) return;
     // The protocol cancels whole runs; map the card back to its owning run.
     const runId = toolRunOwners.current.get(toolRunId) ?? toolRunId;
-    void client.cancelRun(runId).catch(() => {});
+    void client.cancelRun(runId).catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      setLastError(message);
+    });
   }, []);
 
   const decidePermission = useCallback(
@@ -1236,9 +1332,21 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
   const readWorkspaceFile = useCallback((path: string) => withWorkspaceClient((client) =>
     client.readFile ? client.readFile(path) : Promise.reject(new Error("Host does not support workspace file reads")),
   ), [withWorkspaceClient]);
-  const writeWorkspaceFile = useCallback((path: string, content: string, options?: { expectedSha256?: string; expectedModified?: string }) => withWorkspaceClient((client) =>
-    client.writeFile ? client.writeFile(path, content, options) : Promise.reject(new Error("Host does not support reviewed workspace writes")),
-  ), [withWorkspaceClient]);
+  const writeWorkspaceFile = useCallback(
+    async (path: string, content: string, options?: { expectedSha256?: string; expectedModified?: string }): Promise<WorkspaceWriteResult | null> => {
+      const client = clientRef.current;
+      if (!client) return null;
+      if (!client.writeFile) throw new Error("Host does not support reviewed workspace writes");
+      try {
+        return await client.writeFile(path, content, options);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setLastError(message);
+        throw err;
+      }
+    },
+    [],
+  );
   const statWorkspaceFile = useCallback((path: string) => withWorkspaceClient((client) =>
     client.stat ? client.stat(path) : Promise.reject(new Error("Host does not support workspace file stats")),
   ), [withWorkspaceClient]);
@@ -1526,6 +1634,7 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
     unwatchWorkspace,
     selectWorkspace,
     openWorkspace,
+    reconnectToWorkspace,
     manageTask,
     createSchedule,
     cancelSchedule,
@@ -1547,4 +1656,3 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
 
   return api;
 }
-

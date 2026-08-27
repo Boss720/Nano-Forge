@@ -15,6 +15,13 @@ import {
   type CommandExecuteFrame,
   type CommandResultFrame,
 } from "@protocol/commands";
+import { z } from "zod";
+import {
+  invokeSubagentParamsSchema,
+  manageSubagentsParamsSchema,
+  sendMessageParamsSchema,
+  type ManageSubagentsAction,
+} from "@protocol/subagents";
 import {
   safeParseTerminalClientMessage,
   type TerminalServerMessage,
@@ -81,25 +88,49 @@ class SocketApprovalGate implements ApprovalGate {
   constructor(private readonly send: Send, private readonly now: () => string) {}
 
   requestApproval(request: ApprovalRequest): Promise<ApprovalOutcome> {
+    const requestId = request.runId + ":" + request.stepId + ":" + request.tool;
     this.send({
       type: "tool.approval_required",
-      requestId: request.runId + ":" + request.stepId + ":" + request.tool,
+      requestId,
       runId: request.runId,
       request: request.request,
       reason: request.reason,
       at: this.now(),
     });
-    // The request id in the public protocol must be stable and correlation
-    // safe. Coordinator-generated ids are intentionally opaque, so this
-    // gate uses the same deterministic key when resolving client responses.
-    const requestId = request.runId + ":" + request.stepId + ":" + request.tool;
     return new Promise((resolve) => this.pending.set(requestId, resolve));
   }
 
-  resolve(requestId: string, approved: boolean, reason?: string): boolean {
-    const resolve = this.pending.get(requestId);
+  resolve(
+    requestId: string,
+    approved: boolean,
+    reason?: string,
+    runId?: string,
+    stepId?: string,
+  ): boolean {
+    let keyToResolve: string | undefined;
+    if (this.pending.has(requestId)) {
+      keyToResolve = requestId;
+    } else if (runId && stepId) {
+      const prefix = `${runId}:${stepId}`;
+      for (const key of this.pending.keys()) {
+        if (key === prefix || key.startsWith(prefix + ":")) {
+          keyToResolve = key;
+          break;
+        }
+      }
+    } else {
+      for (const key of this.pending.keys()) {
+        if (key === requestId || key.startsWith(requestId + ":")) {
+          keyToResolve = key;
+          break;
+        }
+      }
+    }
+
+    if (!keyToResolve) return false;
+    const resolve = this.pending.get(keyToResolve);
     if (!resolve) return false;
-    this.pending.delete(requestId);
+    this.pending.delete(keyToResolve);
     resolve(approved ? { outcome: "granted" } : { outcome: "denied", ...(reason ? { reason } : {}) });
     return true;
   }
@@ -153,6 +184,23 @@ const flagString = (flags: Record<string, string | number | boolean>, ...names: 
   return undefined;
 };
 
+export function formatZodIssues(issues: z.ZodIssue[]): string {
+  return issues
+    .map((issue) => {
+      const pathStr = issue.path.length > 0 ? issue.path.join(".") : "parameter";
+      return `${pathStr}: ${issue.message}`;
+    })
+    .join("; ");
+}
+
+export function serializeZodIssues(issues: z.ZodIssue[]): Array<{ path: string; message: string; code: string }> {
+  return issues.map((issue) => ({
+    path: issue.path.join("."),
+    message: issue.message,
+    code: issue.code,
+  }));
+}
+
 /**
  * Dispatches the swarm slash-command subset through the supervisor API. This
  * function is exported and dependency-injected so transport tests can verify
@@ -195,29 +243,45 @@ export async function dispatchCommand(
     switch (action) {
       case "run": {
         const archetype = flagString(flags, "archetype", "type") ?? "custom";
-        const prompt = flagString(flags, "prompt") ?? positional.slice(1).join(" ");
-        if (!prompt) {
+        const prompt = flagString(flags, "prompt") ?? (embeddedAction ? positional.join(" ") : positional.slice(1).join(" "));
+        if (!prompt || !prompt.trim()) {
           return commandResult(frame, {
             success: false,
             error: "swarm run requires a prompt",
             data: { code: "invalid_command" },
           });
         }
+        const name = flagString(flags, "name");
         const roles = flagString(flags, "roles")?.split(",").map((role) => role.trim()).filter(Boolean);
+        const isolation = flagString(flags, "workspaceIsolation", "isolation");
         const timeoutValue = flags.timeoutSeconds ?? flags.timeout;
         const budgetValue = flags.budgetTokens ?? flags.budget;
+        const skills = flagString(flags, "skills")?.split(",").map((s) => s.trim()).filter(Boolean);
+        const model = flagString(flags, "model");
+
+        const rawRunParams = {
+          archetype,
+          prompt: prompt.trim(),
+          ...(name ? { name } : {}),
+          ...(roles?.length ? { roles } : {}),
+          ...(isolation ? { workspaceIsolation: isolation } : {}),
+          ...(typeof timeoutValue === "number" ? { timeoutSeconds: timeoutValue } : {}),
+          ...(typeof budgetValue === "number" ? { budgetTokens: budgetValue } : {}),
+          ...(skills?.length ? { skills } : {}),
+          ...(model ? { model } : {}),
+        };
+
+        const parseResult = invokeSubagentParamsSchema.safeParse(rawRunParams);
+        if (!parseResult.success) {
+          return commandResult(frame, {
+            success: false,
+            error: `Invalid /swarm run arguments: ${formatZodIssues(parseResult.error.issues)}`,
+            data: { code: "invalid_command", issues: serializeZodIssues(parseResult.error.issues) },
+          });
+        }
+
         const result = await supervisor.spawnSubagent(
-          {
-            archetype,
-            prompt,
-            ...(flagString(flags, "name") ? { name: flagString(flags, "name") } : {}),
-            ...(roles?.length ? { roles } : {}),
-            ...(flagString(flags, "workspaceIsolation", "isolation")
-              ? { workspaceIsolation: flagString(flags, "workspaceIsolation", "isolation") }
-              : {}),
-            ...(typeof timeoutValue === "number" ? { timeoutSeconds: timeoutValue } : {}),
-            ...(typeof budgetValue === "number" ? { budgetTokens: budgetValue } : {}),
-          } as Parameters<SubagentSupervisor["spawnSubagent"]>[0],
+          parseResult.data,
           flagString(flags, "parentId", "parent"),
         );
         return commandResult(frame, {
@@ -228,7 +292,22 @@ export async function dispatchCommand(
       }
       case "list":
       case "tree": {
-        const result = await supervisor.manageSubagents({ action: "list" }, flagString(flags, "callerId", "caller"));
+        const recursiveVal = typeof flags.recursive === "boolean" ? flags.recursive : undefined;
+        const rawListParams = {
+          action: "list" as const,
+          ...(recursiveVal !== undefined ? { recursive: recursiveVal } : {}),
+        };
+
+        const parseResult = manageSubagentsParamsSchema.safeParse(rawListParams);
+        if (!parseResult.success) {
+          return commandResult(frame, {
+            success: false,
+            error: `Invalid /swarm ${action} arguments: ${formatZodIssues(parseResult.error.issues)}`,
+            data: { code: "invalid_command", issues: serializeZodIssues(parseResult.error.issues) },
+          });
+        }
+
+        const result = await supervisor.manageSubagents(parseResult.data, flagString(flags, "callerId", "caller"));
         return commandResult(frame, {
           success: result.success,
           ...(result.message ? { output: result.message } : {}),
@@ -237,15 +316,27 @@ export async function dispatchCommand(
         });
       }
       case "inspect": {
-        const subagentId = flagString(flags, "subagentId", "agent", "id") ?? positional[1];
+        const subagentId = flagString(flags, "subagentId", "agent", "id") ?? frame.parsed?.mentions?.agents?.[0] ?? (embeddedAction ? positional[0] : positional[1]);
         if (!subagentId) {
           return commandResult(frame, { success: false, error: "swarm inspect requires a subagent id", data: { code: "invalid_command" } });
         }
-        const result = await supervisor.manageSubagents({
-          action: "inspect",
+        const fileParam = flagString(flags, "file", "inspectFile") ?? (embeddedAction ? positional[1] : positional[2]);
+        const rawInspectParams = {
+          action: "inspect" as const,
           subagentId,
-          ...(flagString(flags, "file") ? { inspectFile: flagString(flags, "file") } : {}),
-        } as Parameters<SubagentSupervisor["manageSubagents"]>[0]);
+          ...(fileParam ? { inspectFile: fileParam } : {}),
+        };
+
+        const parseResult = manageSubagentsParamsSchema.safeParse(rawInspectParams);
+        if (!parseResult.success) {
+          return commandResult(frame, {
+            success: false,
+            error: `Invalid /swarm inspect arguments: ${formatZodIssues(parseResult.error.issues)}`,
+            data: { code: "invalid_command", issues: serializeZodIssues(parseResult.error.issues) },
+          });
+        }
+
+        const result = await supervisor.manageSubagents(parseResult.data);
         return commandResult(frame, {
           success: result.success,
           ...(result.inspectedContent ? { output: result.inspectedContent } : {}),
@@ -257,32 +348,61 @@ export async function dispatchCommand(
         if (!supervisor.sendMessage) {
           return commandResult(frame, { success: false, error: "Host does not support swarm messages", data: { code: "unsupported_capability" } });
         }
-        const recipientId = flagString(flags, "recipientId", "recipient", "agent") ?? positional[1];
-        const body = flagString(flags, "body") ?? positional.slice(2).join(" ");
-        if (!recipientId || !body) {
+        const recipientId = flagString(flags, "recipientId", "recipient", "agent") ?? frame.parsed?.mentions?.agents?.[0] ?? (embeddedAction ? positional[0] : positional[1]);
+        const body = flagString(flags, "body") ?? (embeddedAction ? positional.slice(1).join(" ") : positional.slice(2).join(" "));
+        if (!recipientId || !body || !body.trim()) {
           return commandResult(frame, { success: false, error: "swarm message requires a recipient and body", data: { code: "invalid_command" } });
         }
-        const result = await supervisor.sendMessage({
+        const rawMessageParams = {
           recipientId,
           subject: flagString(flags, "subject") ?? "Direct Message",
-          body,
+          body: body.trim(),
           priority: flagString(flags, "priority") ?? "normal",
           referencedArtifacts: [],
-        } as Parameters<SubagentSupervisor["sendMessage"]>[0], flagString(flags, "senderId", "sender") ?? "root");
-        return commandResult(frame, { success: true, output: `Message ${result.messageId} delivered`, data: result as unknown as CommandResultFrame["data"] });
+        };
+
+        const parseResult = sendMessageParamsSchema.safeParse(rawMessageParams);
+        if (!parseResult.success) {
+          return commandResult(frame, {
+            success: false,
+            error: `Invalid /swarm message arguments: ${formatZodIssues(parseResult.error.issues)}`,
+            data: { code: "invalid_command", issues: serializeZodIssues(parseResult.error.issues) },
+          });
+        }
+
+        const result = await supervisor.sendMessage(
+          parseResult.data,
+          flagString(flags, "senderId", "sender") ?? "root",
+        );
+        return commandResult(frame, {
+          success: true,
+          output: `Message ${result.messageId} delivered`,
+          data: result as unknown as CommandResultFrame["data"],
+        });
       }
       case "pause":
       case "resume":
       case "stop": {
-        const subagentId = flagString(flags, "subagentId", "agent", "id") ?? positional[1];
+        const subagentId = flagString(flags, "subagentId", "agent", "id") ?? frame.parsed?.mentions?.agents?.[0] ?? (embeddedAction ? positional[0] : positional[1]);
         if (!subagentId) {
           return commandResult(frame, { success: false, error: `swarm ${action} requires a subagent id`, data: { code: "invalid_command" } });
         }
-        const result = await supervisor.manageSubagents({
-          action: action === "stop" ? "kill" : action,
+        const rawManageParams = {
+          action: (action === "stop" ? "kill" : action) as ManageSubagentsAction,
           subagentId,
           ...(action === "stop" ? { recursive: flags.recursive !== false } : {}),
-        });
+        };
+
+        const parseResult = manageSubagentsParamsSchema.safeParse(rawManageParams);
+        if (!parseResult.success) {
+          return commandResult(frame, {
+            success: false,
+            error: `Invalid /swarm ${action} arguments: ${formatZodIssues(parseResult.error.issues)}`,
+            data: { code: "invalid_command", issues: serializeZodIssues(parseResult.error.issues) },
+          });
+        }
+
+        const result = await supervisor.manageSubagents(parseResult.data);
         return commandResult(frame, {
           success: result.success,
           ...(result.success ? { output: result.message } : { error: result.message ?? `swarm ${action} failed` }),
@@ -374,23 +494,29 @@ export function attachAgentSession(
   const onTerminalMessage = (message: TerminalServerMessage) => send(message);
   ptyManager.on("message", onTerminalMessage);
 
-  subagentSupervisor.subscribe((event) => {
+  const unsubs: (() => void)[] = [];
+
+  const unsubSubagents = subagentSupervisor.subscribe((event) => {
     send({ type: "subagent.event", event, at: now() });
   });
+  if (typeof unsubSubagents === "function") unsubs.push(unsubSubagents);
 
-  memoryEngine.subscribe((event) => {
+  const unsubMemory = memoryEngine.subscribe((event) => {
     send({ type: "memory.event", event, at: now() });
   });
+  if (typeof unsubMemory === "function") unsubs.push(unsubMemory);
 
-  daemonManager.supervisor.subscribe((event) => {
+  const unsubSupervisor = daemonManager.supervisor.subscribe((event) => {
     send({ type: "task.event", event, at: now() });
   });
+  if (typeof unsubSupervisor === "function") unsubs.push(unsubSupervisor);
 
-  daemonManager.scheduler.subscribe((event) => {
+  const unsubScheduler = daemonManager.scheduler.subscribe((event) => {
     send({ type: "task.event", event, at: now() });
   });
+  if (typeof unsubScheduler === "function") unsubs.push(unsubScheduler);
 
-  eventLog.subscribeAll((event) => {
+  const unsubEventLog = eventLog.subscribeAll((event) => {
     // Submission emits its first ledger events synchronously. Defer their
     // socket fan-out so the caller always receives queued/running first.
     queueMicrotask(() => {
@@ -401,6 +527,7 @@ export function attachAgentSession(
       send({ type: "run.event", runId: event.runId, event: event.type, data: event as any, at: event.at });
     });
   });
+  if (typeof unsubEventLog === "function") unsubs.push(unsubEventLog);
   send({ type: "host.ready", version: "0.1.0", hostId: context.hostId, workspace, at: now() });
 
   const workspaceError = (
@@ -563,37 +690,138 @@ export function attachAgentSession(
         // The wire schema deliberately stays forward-compatible; the
         // coordinator performs the authoritative plan validation before a
         // step can execute.
-        const handle = coordinator.submitRun(message.plan as unknown as ExecutionPlan);
-        runs.set(handle.runId, handle);
-        send({ type: "run.state", runId: handle.runId, state: "queued", at: now() });
-        send({ type: "run.state", runId: handle.runId, state: "running", at: now() });
+        try {
+          const handle = coordinator.submitRun(message.plan as unknown as ExecutionPlan);
+          runs.set(handle.runId, handle);
+          if (message.requestId) {
+            send({
+              type: "plan.submit.result",
+              requestId: message.requestId,
+              runId: handle.runId,
+              accepted: true,
+              planId: message.plan.id,
+              at: now(),
+            });
+          }
+          send({ type: "run.state", runId: handle.runId, state: "queued", at: now() });
+          send({ type: "run.state", runId: handle.runId, state: "running", at: now() });
+        } catch (err) {
+          send({
+            type: "error",
+            code: "invalid_plan",
+            message: err instanceof Error ? err.message : String(err),
+            requestId: message.requestId,
+            at: now(),
+          });
+        }
         break;
       }
       case "run.pause": {
         const handle = runs.get(message.runId);
-        if (!handle) send({ type: "error", code: "unknown_run", message: "run not found", runId: message.runId, at: now() });
-        else handle.pause();
+        if (!handle) {
+          send({
+            type: "error",
+            code: "unknown_run",
+            message: `run not found: ${message.runId}`,
+            runId: message.runId,
+            requestId: message.requestId,
+            at: now(),
+          });
+        } else {
+          handle.pause();
+          if (message.requestId) {
+            send({
+              type: "run.pause.result",
+              requestId: message.requestId,
+              runId: message.runId,
+              at: now(),
+            });
+          }
+        }
         break;
       }
       case "run.resume": {
         const handle = runs.get(message.runId);
-        if (!handle) send({ type: "error", code: "unknown_run", message: "run not found", runId: message.runId, at: now() });
-        else handle.resume();
+        if (!handle) {
+          send({
+            type: "error",
+            code: "unknown_run",
+            message: `run not found: ${message.runId}`,
+            runId: message.runId,
+            requestId: message.requestId,
+            at: now(),
+          });
+        } else {
+          handle.resume();
+          if (message.requestId) {
+            send({
+              type: "run.resume.result",
+              requestId: message.requestId,
+              runId: message.runId,
+              at: now(),
+            });
+          }
+        }
         break;
       }
       case "run.cancel": {
         const handle = runs.get(message.runId);
-        if (!handle) send({ type: "error", code: "unknown_run", message: "run not found", runId: message.runId, at: now() });
-        else handle.cancel();
+        if (!handle) {
+          send({
+            type: "error",
+            code: "unknown_run",
+            message: `run not found: ${message.runId}`,
+            runId: message.runId,
+            requestId: message.requestId,
+            at: now(),
+          });
+        } else {
+          handle.cancel();
+          if (message.requestId) {
+            send({
+              type: "run.cancel.result",
+              requestId: message.requestId,
+              runId: message.runId,
+              at: now(),
+            });
+          }
+        }
         break;
       }
-      case "approval.grant":
-        approvalGate.resolve(message.requestId, true);
+      case "approval.grant": {
+        const resolved = approvalGate.resolve(message.requestId, true, undefined, message.runId, message.stepId);
+        send({
+          type: "approval.grant.result",
+          requestId: message.requestId,
+          runId: message.runId,
+          stepId: message.stepId,
+          resolved,
+          at: now(),
+        });
         break;
-      case "approval.deny":
-      case "tool.response":
-        approvalGate.resolve(message.requestId, message.type === "tool.response" ? message.approved : false, message.reason);
+      }
+      case "approval.deny": {
+        const resolved = approvalGate.resolve(message.requestId, false, message.reason, message.runId, message.stepId);
+        send({
+          type: "approval.deny.result",
+          requestId: message.requestId,
+          runId: message.runId,
+          stepId: message.stepId,
+          resolved,
+          at: now(),
+        });
         break;
+      }
+      case "tool.response": {
+        const resolved = approvalGate.resolve(message.requestId, message.approved, message.reason);
+        send({
+          type: "tool.response.result",
+          requestId: message.requestId,
+          resolved,
+          at: now(),
+        });
+        break;
+      }
       case "subagent.invoke": {
         try {
           const result = await subagentSupervisor.spawnSubagent(message.params, message.parentId);
@@ -687,12 +915,25 @@ export function attachAgentSession(
     }
   });
   socket.on("close", () => {
+    for (const unsub of unsubs) {
+      try {
+        unsub();
+      } catch {
+        /* ignore */
+      }
+    }
     approvalGate.close();
     void watcher?.close();
     auditStore.close();
     ptyManager.off("message", onTerminalMessage);
-    ptyManager.dispose();
-    void daemonManager.dispose();
+    if (!options.ptyManager) {
+      ptyManager.dispose();
+    }
+    if (!options.subagentSupervisor) {
+      void subagentSupervisor.dispose();
+    }
+    if (!options.daemonManager) {
+      void daemonManager.dispose();
+    }
   });
 }
-

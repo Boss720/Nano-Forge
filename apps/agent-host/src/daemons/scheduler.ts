@@ -34,6 +34,7 @@ export class TaskScheduler extends EventEmitter {
 
   constructor() {
     super();
+    this.setMaxListeners(100);
     this.startCronTicker();
   }
 

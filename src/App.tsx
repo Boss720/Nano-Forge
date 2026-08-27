@@ -1,4 +1,4 @@
-import { useCallback } from "react";
+import { useCallback, useState } from "react";
 import { useConnectionManager } from "@/hooks/useConnectionManager";
 import { useSessionPersistence } from "@/hooks/useSessionPersistence";
 import { useAgentOrchestration } from "@/hooks/useAgentOrchestration";
@@ -61,17 +61,23 @@ export default function App({ hostSession }: { hostSession?: UseHostSessionOptio
     pinChat,
   } = useSessionPersistence(selectedModel);
 
+  const [allowWorkspaceWrites, setAllowWorkspaceWrites] = useState(false);
   const activeWorkspace = workspaces.find((workspace) => workspace.id === activeWorkspaceId);
-  const workspaceWriteCapability = host.status === "connected" && activeWorkspace?.location?.status === "ready"
-    ? "live"
-    : "virtual";
+  const workspaceWriteCapability =
+    host.status === "connected" &&
+    activeWorkspace?.location?.status === "ready" &&
+    allowWorkspaceWrites
+      ? "live"
+      : "virtual";
 
-  const reviewedWorkspaceWrite = useCallback(async (path: string, content: string) => {
-    const stat = await host.statWorkspaceFile(path);
-    const result = await host.writeWorkspaceFile(path, content, stat ? { expectedModified: stat.modified } : undefined);
-    if (!result) throw new Error("The local host rejected the reviewed write.");
-    return result;
-  }, [host]);
+  const reviewedWorkspaceWrite = useCallback(
+    async (path: string, content: string, options?: { expectedSha256?: string; expectedModified?: string }) => {
+      const result = await host.writeWorkspaceFile(path, content, options);
+      if (!result) throw new Error(host.lastError ?? "The local host rejected the reviewed write.");
+      return result;
+    },
+    [host],
+  );
 
   // Agent orchestration & chat loop domain
   const {
@@ -141,6 +147,8 @@ export default function App({ hostSession }: { hostSession?: UseHostSessionOptio
       handleSend={handleSend}
       handleStop={handleStop}
       handlePatchDecision={handlePatchDecision}
+      allowWorkspaceWrites={allowWorkspaceWrites}
+      onToggleWorkspaceWrites={setAllowWorkspaceWrites}
     />
   );
 }

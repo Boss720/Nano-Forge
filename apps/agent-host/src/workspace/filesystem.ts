@@ -26,6 +26,7 @@ export class WorkspaceFileError extends Error {
       | 'file_too_large'
       | 'binary_file'
       | 'write_conflict'
+      | 'invalid_search'
       | 'io_error',
     message: string,
   ) {
@@ -206,73 +207,84 @@ export interface SearchOptions {
 }
 
 export async function handleSearch(workspaceRoot: string, query: string, options?: SearchOptions): Promise<SearchMatch[]> {
-  const maxResults = options?.maxResults ?? 100;
-  
-  try {
-    const args = ['--json', '--max-count', maxResults.toString()];
-    if (options?.caseSensitive) {
-      args.push('--case-sensitive');
-    } else {
-      args.push('--ignore-case');
-    }
-    args.push('--glob-case-insensitive');
-    
-    if (options?.includes && options.includes.length > 0) {
-      for (const pattern of options.includes) {
-        args.push('--glob', pattern);
-      }
-    }
-
-    for (const pattern of SENSITIVE_WORKSPACE_GLOB_PATTERNS) {
-      args.push('--glob', `!${pattern}`);
-    }
-    
-    args.push(query, workspaceRoot);
-
-    const { stdout } = await execa('rg', args, { reject: false });
-    if (!stdout) return [];
-
-    const matches: SearchMatch[] = [];
-    const lines = stdout.split('\n');
-    
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        const parsed = JSON.parse(line);
-        if (parsed.type === 'match') {
-          const rawPath = parsed.data.path.text;
-          const file = path.isAbsolute(rawPath) ? path.relative(workspaceRoot, rawPath) : rawPath;
-          if (isSensitiveWorkspacePath(file)) continue;
-          const lineNum = parsed.data.line_number;
-          // Note: submatches contains an array of matches on the same line
-          const matchText = parsed.data.submatches[0]?.match?.text || query;
-          const column = parsed.data.submatches[0]?.start || 0;
-          const text = parsed.data.lines.text.replace(/\r?\n$/, '');
-
-          matches.push({
-            file,
-            line: lineNum,
-            column,
-            text,
-            matchText,
-          });
-
-          if (matches.length >= maxResults) {
-            break;
-          }
-        }
-      } catch {
-        // Ignore parse errors for individual lines
-      }
-    }
-    return matches;
-  } catch {
-    // Fallback if rg is not available, though in this environment it's expected.
-    // Given the prompt, we should implement a simple fallback if rg fails to execute
-    // (e.g. ENOENT). But returning empty for now or implementing basic JS search.
-    // For simplicity, just return empty array on failure.
-    return [];
+  if (typeof query !== "string") {
+    throw new WorkspaceFileError("io_error", "search query must be a string");
   }
+  const maxResults = Math.min(Math.max(1, Number(options?.maxResults) || 100), 500);
+
+  const includes = options?.includes ?? [];
+  for (const pattern of includes) {
+    if (typeof pattern !== "string" || !pattern.trim() || pattern.includes("\0")) {
+      throw new WorkspaceFileError("io_error", `Invalid include glob pattern: ${pattern}`);
+    }
+  }
+
+  const args = ["--json", "--max-count", maxResults.toString()];
+  if (options?.caseSensitive) {
+    args.push("--case-sensitive");
+  } else {
+    args.push("--ignore-case");
+  }
+  args.push("--glob-case-insensitive");
+
+  for (const pattern of includes) {
+    args.push("--glob", pattern);
+  }
+
+  for (const pattern of SENSITIVE_WORKSPACE_GLOB_PATTERNS) {
+    args.push("--glob", `!${pattern}`);
+  }
+
+  // Use '--' before positional query so `--help` or options are not parsed as flags
+  args.push("--", query, workspaceRoot);
+
+  let result;
+  try {
+    result = await execa("rg", args, { reject: false });
+  } catch (err) {
+    throw new WorkspaceFileError("io_error", `Search failed to execute: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // In ripgrep: exit code 0 = matches found, 1 = no matches, 2 = error
+  if (result.exitCode !== undefined && result.exitCode > 1) {
+    throw new WorkspaceFileError("io_error", `Search tool error (exit code ${result.exitCode}): ${result.stderr || "ripgrep error"}`);
+  }
+
+  if (!result.stdout) return [];
+
+  const matches: SearchMatch[] = [];
+  const lines = result.stdout.split("\n");
+
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed.type === "match") {
+        const rawPath = parsed.data.path.text;
+        const file = path.isAbsolute(rawPath) ? path.relative(workspaceRoot, rawPath) : rawPath;
+        if (isSensitiveWorkspacePath(file)) continue;
+        const lineNum = parsed.data.line_number;
+        const matchText = parsed.data.submatches[0]?.match?.text || query;
+        const column = parsed.data.submatches[0]?.start || 0;
+        const text = parsed.data.lines.text.replace(/\r?\n$/, "");
+
+        matches.push({
+          file,
+          line: lineNum,
+          column,
+          text,
+          matchText,
+        });
+
+        if (matches.length >= maxResults) {
+          break;
+        }
+      }
+    } catch {
+      // Ignore JSON parse errors for non-match lines
+    }
+  }
+  return matches;
 }
 
 export async function handleGitStatus(workspaceRoot: string): Promise<GitFileStatus[]> {

@@ -213,6 +213,8 @@ describe("NanoForge Packaging & Launcher System", () => {
       expect(fs.existsSync(path.join(BUNDLE_DIR, "dist", "index.html"))).toBe(true);
       expect(fs.existsSync(path.join(BUNDLE_DIR, "nanoforge-launcher.cjs"))).toBe(true);
       expect(fs.existsSync(path.join(BUNDLE_DIR, "launcher.cjs"))).toBe(true);
+      expect(fs.existsSync(path.join(BUNDLE_DIR, "workspace-picker.cjs"))).toBe(true);
+      expect(fs.existsSync(path.join(BUNDLE_DIR, "workspace-registry.cjs"))).toBe(true);
       expect(fs.existsSync(path.join(BUNDLE_DIR, "server.mjs"))).toBe(true);
       expect(fs.existsSync(path.join(BUNDLE_DIR, "agent-host.mjs"))).toBe(true);
       expect(fs.existsSync(path.join(BUNDLE_DIR, "NanoForge.bat"))).toBe(true);
