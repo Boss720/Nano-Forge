@@ -20,10 +20,15 @@ import {
   toolResponseResultSchema,
   runLifecycleEventSchema,
   runStateSchema,
+  runtimeStateSchema,
+  isValidRuntimeTransition,
+  isRuntimeOperational,
+  isRuntimeTransitioning,
   type AgentLifecycleEvent,
   type AgentLifecycleState,
   type RunLifecycleEvent,
   type RunState,
+  type RuntimeState,
 } from "../lifecycle";
 
 describe("Agent Lifecycle Wire Protocol", () => {
@@ -466,6 +471,87 @@ describe("Agent Lifecycle Wire Protocol", () => {
       };
       const parsed = toolResponseResultSchema.parse(frame);
       expect(parsed).toEqual(frame);
+    });
+  });
+
+  describe("Runtime State Machine (7-State Machine)", () => {
+    it("validates all 7 canonical runtime states", () => {
+      const states = [
+        "starting",
+        "healthy",
+        "reconnecting",
+        "switching",
+        "ready",
+        "needs_attention",
+        "unavailable",
+      ] as const;
+
+      for (const state of states) {
+        expect(runtimeStateSchema.parse(state)).toBe(state);
+      }
+    });
+
+    it("rejects invalid runtime state strings", () => {
+      const invalid = ["idle", "connecting", "connected", "online", "broken", null, 123];
+      for (const inv of invalid) {
+        expect(() => runtimeStateSchema.parse(inv)).toThrow();
+      }
+    });
+
+    it("enforces canonical runtime state transitions", () => {
+      // starting -> healthy, ready, reconnecting, needs_attention, unavailable
+      expect(isValidRuntimeTransition("starting", "healthy")).toBe(true);
+      expect(isValidRuntimeTransition("starting", "ready")).toBe(true);
+      expect(isValidRuntimeTransition("starting", "reconnecting")).toBe(true);
+      expect(isValidRuntimeTransition("starting", "needs_attention")).toBe(true);
+      expect(isValidRuntimeTransition("starting", "unavailable")).toBe(true);
+      expect(isValidRuntimeTransition("starting", "switching")).toBe(false);
+
+      // healthy -> ready, switching, reconnecting, needs_attention, unavailable
+      expect(isValidRuntimeTransition("healthy", "ready")).toBe(true);
+      expect(isValidRuntimeTransition("healthy", "switching")).toBe(true);
+      expect(isValidRuntimeTransition("healthy", "reconnecting")).toBe(true);
+      expect(isValidRuntimeTransition("healthy", "needs_attention")).toBe(true);
+      expect(isValidRuntimeTransition("healthy", "unavailable")).toBe(true);
+
+      // ready -> healthy, switching, reconnecting, needs_attention, unavailable
+      expect(isValidRuntimeTransition("ready", "healthy")).toBe(true);
+      expect(isValidRuntimeTransition("ready", "switching")).toBe(true);
+      expect(isValidRuntimeTransition("ready", "reconnecting")).toBe(true);
+      expect(isValidRuntimeTransition("ready", "needs_attention")).toBe(true);
+      expect(isValidRuntimeTransition("ready", "unavailable")).toBe(true);
+
+      // reconnecting -> healthy, ready, starting, needs_attention, unavailable
+      expect(isValidRuntimeTransition("reconnecting", "healthy")).toBe(true);
+      expect(isValidRuntimeTransition("reconnecting", "ready")).toBe(true);
+      expect(isValidRuntimeTransition("reconnecting", "needs_attention")).toBe(true);
+      expect(isValidRuntimeTransition("reconnecting", "unavailable")).toBe(true);
+
+      // switching -> healthy, ready, reconnecting, needs_attention, unavailable
+      expect(isValidRuntimeTransition("switching", "ready")).toBe(true);
+      expect(isValidRuntimeTransition("switching", "healthy")).toBe(true);
+      expect(isValidRuntimeTransition("switching", "needs_attention")).toBe(true);
+      expect(isValidRuntimeTransition("switching", "unavailable")).toBe(true);
+
+      // idempotent self-transitions
+      expect(isValidRuntimeTransition("ready", "ready")).toBe(true);
+      expect(isValidRuntimeTransition("healthy", "healthy")).toBe(true);
+    });
+
+    it("evaluates runtime operational and transitioning helper predicates", () => {
+      expect(isRuntimeOperational("healthy")).toBe(true);
+      expect(isRuntimeOperational("ready")).toBe(true);
+      expect(isRuntimeOperational("starting")).toBe(false);
+      expect(isRuntimeOperational("reconnecting")).toBe(false);
+      expect(isRuntimeOperational("switching")).toBe(false);
+      expect(isRuntimeOperational("needs_attention")).toBe(false);
+      expect(isRuntimeOperational("unavailable")).toBe(false);
+
+      expect(isRuntimeTransitioning("starting")).toBe(true);
+      expect(isRuntimeTransitioning("reconnecting")).toBe(true);
+      expect(isRuntimeTransitioning("switching")).toBe(true);
+      expect(isRuntimeTransitioning("ready")).toBe(false);
+      expect(isRuntimeTransitioning("healthy")).toBe(false);
     });
   });
 });

@@ -18,7 +18,7 @@ The following are not claims made by this repository: official affiliation or en
 
 ## What is here
 
-The browser workbench supports model selection, streaming chat, a demo mode, local transcript/workspace persistence, reviewable diff-style output, and optional host-backed workspace/agent surfaces. The host and SDK have typed WebSocket and provider-adapter code, with automated tests, but a live NanoGPT end-to-end run is still an integration item for a pilot.
+The workbench supports model selection, streaming chat, a demo mode, local transcript/workspace persistence, reviewable diff-style output, and optional host-backed workspace/agent surfaces. On Windows, an Electron shell provides a native folder picker and starts a private loopback host for the selected folder. The host and SDK have typed WebSocket and provider-adapter code, with automated tests, but a live NanoGPT end-to-end run is still an integration item for a pilot.
 
 The source manifests currently use version `0.1.0`. Files under `release/` are not treated as a current release or compatibility proof; release provenance is documented in [known limitations](docs/known-limitations.md).
 
@@ -31,6 +31,8 @@ Browser React/Vite UI
   └─ optional WebSocket → local Fastify agent host
                           /agent?token=... (canonical)
                               └─ protocol, workspace, tools, runs, providers
+
+Windows Electron shell → native folder picker → private loopback host + React UI
 
 Shared packages: protocol schemas · core provider/agent abstractions · SDK client
 ```
@@ -74,12 +76,32 @@ pnpm start:host
 
 The canonical host URL is `ws://127.0.0.1:4040/agent?token=<token>`; `/ws` is also registered for compatibility. Do not expose the host publicly. Workspace writes are disabled by default; only enable `NANOFORGE_ALLOW_WORKSPACE_WRITES=1` for a deliberately trusted local evaluation, with a disposable workspace.
 
+### Windows desktop workflow
+
+The Windows desktop shell is the easiest way to work with a local folder. It opens the native folder picker, creates a private loopback UI/host session, and keeps the host token in memory rather than leaving it in the browser address bar.
+
+```powershell
+pnpm desktop:dev
+```
+
+Choose **Open folder** in the app, then use the workspace explorer, search, file attachments, and recent folders. Folder selection changes the host’s validated workspace root; it does not upload that folder or make it accessible on the network.
+
+Local files are read-only by default. To apply an accepted patch, open **Settings → Local Workspace**, enable **reviewed local writes** for the current session, and approve the resulting one-time prompt. The host binds that prompt to the exact request and checks the expected SHA-256 file version before it writes. Cancelling the prompt leaves the folder unchanged. The desktop shell can present these prompts, but it never auto-approves a write.
+
+To produce an NSIS installer on a machine without a locked prior Electron output, run:
+
+```powershell
+pnpm desktop:build
+```
+
+The generated installer is a local artifact; it is not committed to this repository or presented here as a published release.
+
 ## Security and write boundaries
 
 - Browser API keys are held in the live application state for requests. The connection loader removes legacy `apiKey` values from `localStorage`; only non-secret connection settings such as the base URL may be retained. This is browser-memory handling, not a secure vault.
 - Chat/workspace state and usage data are persisted locally. Treat the browser profile and any connected page as sensitive while a key is active.
 - The host binds to loopback by default, authenticates WebSockets with registered single-use tokens, validates message schemas, and confines workspace operations to a validated root.
-- Host workspace writes fail closed unless explicitly enabled and are checked against an expected file version. Read/search/terminal/subagent behavior still needs evaluation against the intended threat model before distribution.
+- Host workspace writes fail closed unless explicitly enabled and are checked against an expected file version. In the desktop shell, each write additionally requires an exact host-issued, single-use approval; the client cannot mint a grant or approve it automatically. Read/search/terminal/subagent behavior still needs evaluation against the intended threat model before distribution.
 - No hosted tenancy, remote isolation, account authorization flow, or production secret-management service is included in this repository.
 
 ## Verification
@@ -94,6 +116,7 @@ pnpm test:all
 pnpm test:sdk
 pnpm test:host
 pnpm build
+pnpm desktop:build
 ```
 
 Passing local tests prove repository behavior and mocked/provider-adapter contracts only. A live NanoGPT check must be opt-in, keep credentials outside source control, and record no secret values.

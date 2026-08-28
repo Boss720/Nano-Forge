@@ -20,6 +20,9 @@ export interface SubagentNode {
   roles: string[];
   systemPrompt?: string;
   model?: string;
+  /** Absolute host-only path used to execute the subagent. Never publish this over the browser protocol. */
+  assignedWorkspaceRoot?: string;
+  /** Project-relative directory suitable for the browser protocol ("." for the active workspace). */
   workingDirectory: string;
   metadataDir: string;
   worktreePath?: string;

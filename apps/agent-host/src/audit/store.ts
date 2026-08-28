@@ -83,6 +83,43 @@ export interface AuditArtifactRecord {
   bytes: number;
 }
 
+export type CapabilityDecision = "allow" | "deny" | "revoke";
+
+/** Safe, host-produced identifiers/digests used to explain a capability decision. */
+export interface CapabilityDecisionBinding {
+  hostId?: string;
+  sessionId?: string;
+  workspaceId?: string;
+  runId?: string;
+  stepId?: string;
+  toolId?: string;
+  argumentsDigest?: string;
+}
+
+export interface AuditCapabilityDecisionInput {
+  at?: string;
+  grantId?: string;
+  requestId?: string;
+  decision: CapabilityDecision;
+  reasonCode: string;
+  remainingUses?: number;
+  tokenDigest?: string;
+  binding?: CapabilityDecisionBinding;
+}
+
+export interface AuditCapabilityDecisionRecord {
+  id: number;
+  at: string;
+  grantId: string | null;
+  requestId: string | null;
+  decision: CapabilityDecision;
+  reasonCode: string;
+  remainingUses: number | null;
+  tokenDigest: string | null;
+  binding: CapabilityDecisionBinding;
+  eventDigest: string;
+}
+
 /** Structured (already redacted) JSON export of one run. */
 export interface AuditRunExport {
   run: AuditRunRecord;
@@ -111,6 +148,26 @@ const asString = (v: unknown): string => String(v);
 const asStringOrNull = (v: unknown): string | null =>
   v === null || v === undefined ? null : String(v);
 const asNumber = (v: unknown): number => Number(v);
+
+const normalizeDigest = (value: string, field: string): string => {
+  const hex = value.startsWith("sha256:") ? value.slice(7) : value;
+  if (!/^[0-9a-f]{64}$/i.test(hex)) throw new TypeError(`invalid ${field}`);
+  return `sha256:${hex.toLowerCase()}`;
+};
+
+const safeBinding = (binding: CapabilityDecisionBinding | undefined, secrets: readonly string[]): CapabilityDecisionBinding => {
+  if (!binding) return {};
+  const out: CapabilityDecisionBinding = {};
+  for (const key of ["hostId", "sessionId", "workspaceId", "runId", "stepId", "toolId"] as const) {
+    const value = binding[key];
+    if (value !== undefined) {
+      if (typeof value !== "string" || value.length === 0 || value.length > 256) throw new TypeError(`invalid binding ${key}`);
+      out[key] = redactText(value, secrets);
+    }
+  }
+  if (binding.argumentsDigest !== undefined) out.argumentsDigest = normalizeDigest(binding.argumentsDigest, "argumentsDigest");
+  return out;
+};
 
 /* ------------------------------------------------------------------------ */
 /* AuditStore                                                               */
@@ -154,6 +211,18 @@ export class AuditStore {
         relativePath TEXT NOT NULL,
         sha256 TEXT NOT NULL,
         bytes INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS capability_decisions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        at TEXT NOT NULL,
+        grantId TEXT,
+        requestId TEXT,
+        decision TEXT NOT NULL CHECK (decision IN ('allow', 'deny', 'revoke')),
+        reasonCode TEXT NOT NULL,
+        remainingUses INTEGER,
+        tokenDigest TEXT,
+        bindingJson TEXT NOT NULL,
+        eventDigest TEXT NOT NULL
       );
     `);
   }
@@ -234,6 +303,37 @@ export class AuditStore {
   }
 
   /**
+   * Append a capability decision. Only opaque identifiers and digests are
+   * accepted; sensitive request material is rejected before touching SQLite.
+   */
+  recordCapabilityDecision(input: AuditCapabilityDecisionInput): AuditCapabilityDecisionRecord {
+    const forbidden = ["token", "rawToken", "tokenValue", "canonicalPath", "arguments", "content", "prompt", "command", "env"];
+    const supplied = input as unknown as Record<string, unknown>;
+    if (forbidden.some((key) => Object.prototype.hasOwnProperty.call(supplied, key))) {
+      throw new TypeError("raw token or request material is not accepted by capability audit");
+    }
+    if (!input.grantId && !input.requestId) throw new TypeError("capability decision requires grantId or requestId");
+    if (!/^(allow|deny|revoke)$/.test(input.decision)) throw new TypeError("invalid capability decision");
+    if (!input.reasonCode || input.reasonCode.length > 128) throw new TypeError("invalid capability reason code");
+    if (input.remainingUses !== undefined && (!Number.isSafeInteger(input.remainingUses) || input.remainingUses < 0)) {
+      throw new TypeError("invalid remaining uses");
+    }
+    const tokenDigest = input.tokenDigest === undefined ? null : normalizeDigest(input.tokenDigest, "tokenDigest");
+    const secrets = this.secrets();
+    const binding = safeBinding(input.binding, secrets);
+    const safe = {
+      at: input.at ?? this.clock().toISOString(), grantId: input.grantId === undefined ? null : redactText(input.grantId, secrets),
+      requestId: input.requestId === undefined ? null : redactText(input.requestId, secrets), decision: input.decision, reasonCode: redactText(input.reasonCode, secrets),
+      remainingUses: input.remainingUses ?? null, tokenDigest, binding,
+    };
+    const eventDigest = `sha256:${sha256Hex(JSON.stringify(safe))}`;
+    const result = this.db.prepare(
+      "INSERT INTO capability_decisions (at, grantId, requestId, decision, reasonCode, remainingUses, tokenDigest, bindingJson, eventDigest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(safe.at, safe.grantId, safe.requestId, safe.decision, safe.reasonCode, safe.remainingUses, safe.tokenDigest, JSON.stringify(binding), eventDigest);
+    return { id: Number(result.lastInsertRowid), ...safe, decision: safe.decision as CapabilityDecision, eventDigest };
+  }
+
+  /**
    * Close a run: record its terminal state, end time, and final digest.
    * (Run metadata transitions; the event ledger itself is append-only.)
    */
@@ -294,6 +394,15 @@ export class AuditStore {
       relativePath: asString(row.relativePath),
       sha256: asString(row.sha256),
       bytes: asNumber(row.bytes),
+    }));
+  }
+
+  listCapabilityDecisions(): AuditCapabilityDecisionRecord[] {
+    const rows = this.db.prepare("SELECT id, at, grantId, requestId, decision, reasonCode, remainingUses, tokenDigest, bindingJson, eventDigest FROM capability_decisions ORDER BY id ASC").all() as unknown as Record<string, unknown>[];
+    return rows.map((row) => ({
+      id: asNumber(row.id), at: asString(row.at), grantId: asStringOrNull(row.grantId), requestId: asStringOrNull(row.requestId),
+      decision: asString(row.decision) as CapabilityDecision, reasonCode: asString(row.reasonCode), remainingUses: row.remainingUses === null ? null : asNumber(row.remainingUses),
+      tokenDigest: asStringOrNull(row.tokenDigest), binding: JSON.parse(asString(row.bindingJson)) as CapabilityDecisionBinding, eventDigest: asString(row.eventDigest),
     }));
   }
 

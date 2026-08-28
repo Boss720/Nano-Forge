@@ -77,6 +77,74 @@ export interface TestWsClient {
   close: () => Promise<{ code: number; reason: string }>;
 }
 
+export type CapabilityScope = "write" | "execute" | "schedule";
+
+export interface ExactCapabilityApproval {
+  requestId: string;
+  toolId: string;
+  scope: CapabilityScope;
+}
+
+/**
+ * Validate that a capability prompt describes exactly the mutation a test
+ * initiated. Tests must never treat host-wide write enablement as approval.
+ */
+export function assertExactCapabilityApproval(
+  message: Record<string, unknown>,
+  expected: ExactCapabilityApproval,
+): Record<string, unknown> {
+  if (message.type !== "capability.approval_required") {
+    throw new Error(`Expected capability.approval_required, received ${String(message.type)}`);
+  }
+  if (message.requestId !== expected.requestId) {
+    throw new Error(`Capability approval requestId did not match ${expected.requestId}`);
+  }
+  if (message.toolId !== expected.toolId) {
+    throw new Error(`Capability approval toolId did not match ${expected.toolId}`);
+  }
+  if (message.scope !== expected.scope) {
+    throw new Error(`Capability approval scope did not match ${expected.scope}`);
+  }
+  if (message.uses !== "single") {
+    throw new Error("Capability approval must be single-use");
+  }
+  if (typeof message.argumentsDigest !== "string" || !/^sha256:[a-f0-9]{64}$/i.test(message.argumentsDigest)) {
+    throw new Error("Capability approval must include an exact arguments digest");
+  }
+  return message;
+}
+
+/**
+ * Approve one host-issued capability prompt only after checking its immutable
+ * request binding. The subsequent capability.result proves the decision was
+ * accepted before the test waits for the deferred operation result.
+ */
+export async function approveExactCapability(
+  client: TestWsClient,
+  expected: ExactCapabilityApproval,
+): Promise<Record<string, unknown>> {
+  const approval = assertExactCapabilityApproval(
+    await client.findMessage((message) =>
+      message.type === "capability.approval_required" && message.requestId === expected.requestId,
+    ),
+    expected,
+  );
+
+  client.sendJson({
+    type: "capability.approval",
+    requestId: expected.requestId,
+    approved: true,
+  });
+
+  const result = await client.findMessage((message) =>
+    message.type === "capability.result" && message.requestId === expected.requestId,
+  );
+  if (result.ok !== true) {
+    throw new Error(`Capability approval was not accepted for ${expected.requestId}`);
+  }
+  return approval;
+}
+
 export async function launchE2ETestHost(options: { port?: number; allowWorkspaceWrites?: boolean } = {}): Promise<E2ETestHost> {
   const workspace = await createTestWorkspace();
   const daemonManager = new DaemonManager();

@@ -14,8 +14,32 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawn, exec } = require('node:child_process');
-const { createWindowsFolderPicker } = require('./workspace-picker.cjs');
-const { createWorkspaceRegistry } = require('./workspace-registry.cjs');
+
+function isSeaRuntime() {
+  try {
+    return require('node:sea').isSea();
+  } catch {
+    return false;
+  }
+}
+
+function resolveLauncherSidecar(name, options = {}) {
+  const isSea = options.isSea ?? isSeaRuntime();
+  const executablePath = options.execPath || process.execPath;
+  // SEA embeds this launcher, but the native picker and registry deliberately
+  // remain bundle sidecars. Resolve them from the executable at runtime rather
+  // than from SEA's virtual source directory.
+  return path.join(isSea ? path.dirname(executablePath) : __dirname, name);
+}
+
+// `require` in a SEA entry script only resolves built-in modules. Recreate a
+// file-backed loader from the executable path before loading the packaged
+// sidecars. In normal Node development, retain the ordinary module loader.
+const sidecarRequire = isSeaRuntime()
+  ? require('node:module').createRequire(__filename)
+  : require;
+const { createWindowsFolderPicker } = sidecarRequire(resolveLauncherSidecar('workspace-picker.cjs'));
+const { createWorkspaceRegistry } = sidecarRequire(resolveLauncherSidecar('workspace-registry.cjs'));
 
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -193,6 +217,10 @@ function resolveHostEntry() {
 }
 
 function resolveNodeExecutable() {
+  // Electron can run a child entry point in Node mode when the child receives
+  // ELECTRON_RUN_AS_NODE=1. Keep the desktop shell out of the browser-launch
+  // path while reusing this audited host bootstrap.
+  if (process.versions && process.versions.electron) return process.execPath;
   const isSEA = require('node:module').isBuiltin && process.execPath.toLowerCase().includes('nanoforge');
   if (!isSEA && !process.pkg) return process.execPath;
   try {
@@ -236,6 +264,18 @@ function brokerError(requestId, code, message, recoverable = true) {
   };
 }
 
+function isOpaqueWorkspaceId(value) {
+  return typeof value === 'string' && /^ws_[A-Za-z0-9-]+$/.test(value);
+}
+
+function isSafeWorkspaceRelativePath(value) {
+  if (typeof value !== 'string' || !value || value === '.' || value === '..' || value.includes('\0')) return false;
+  if (path.posix.isAbsolute(value) || path.win32.isAbsolute(value)) return false;
+  if (/^[A-Za-z]:|^[\\/]{1,2}/.test(value)) return false;
+  const segments = value.split(/[\\/]+/);
+  return segments.every((segment) => segment && segment !== '.' && segment !== '..' && !segment.includes(':'));
+}
+
 /**
  * Owns the browser-safe workspace control-plane state. Registry entries retain
  * canonical paths, while this broker deliberately returns opaque descriptors.
@@ -253,12 +293,13 @@ function createWorkspaceBroker(options = {}) {
   let switchState = activeEntry ? 'active' : 'idle';
   let switchMessage;
   const completed = new Map();
+  const inFlight = new Map();
 
   const descriptor = (entry, descriptorGeneration = generation) => ({
     workspaceId: entry.id,
     label: workspaceLabel(entry),
     generation: Math.max(1, descriptorGeneration),
-    capabilities,
+    capabilities: { ...capabilities },
   });
   const connection = () => ({
     websocketUrl: `ws://127.0.0.1:${hostPort}/agent?token=${encodeURIComponent(token)}`,
@@ -278,7 +319,7 @@ function createWorkspaceBroker(options = {}) {
     }
     return null;
   };
-  const complete = async (request, requestId) => {
+  const execute = async (request, requestId) => {
     const expectedByType = {
       'workspace.choose': 'workspace.choose',
       'workspace.activate': 'workspace.activate',
@@ -306,7 +347,7 @@ function createWorkspaceBroker(options = {}) {
         switchState = 'idle';
         payload = { type: 'workspace.choose.result', requestId, workspace: descriptor(entry) };
       } else if (request.type === 'workspace.activate') {
-        if (typeof request.workspaceId !== 'string' || !request.workspaceId || typeof idempotencyKey !== 'string' || !idempotencyKey) return { status: 400, payload: brokerError(requestId, 'invalid_request', 'The workspace request is invalid.', true) };
+        if (!isOpaqueWorkspaceId(request.workspaceId) || typeof idempotencyKey !== 'string' || !idempotencyKey) return { status: 400, payload: brokerError(requestId, 'invalid_request', 'The workspace request is invalid.', true) };
         switchState = 'validating';
         const entry = registry.resolve(request.workspaceId);
         if (!entry) {
@@ -323,17 +364,17 @@ function createWorkspaceBroker(options = {}) {
         switchMessage = undefined;
         payload = { type: 'workspace.activate.result', requestId, workspace: descriptor(entry), connection: connection() };
       } else if (request.type === 'workspace.recent.remove') {
-        if (typeof request.workspaceId !== 'string' || !request.workspaceId || typeof idempotencyKey !== 'string' || !idempotencyKey) return { status: 400, payload: brokerError(requestId, 'invalid_request', 'The workspace request is invalid.', true) };
+        if (!isOpaqueWorkspaceId(request.workspaceId) || typeof idempotencyKey !== 'string' || !idempotencyKey) return { status: 400, payload: brokerError(requestId, 'invalid_request', 'The workspace request is invalid.', true) };
         if (!registry.remove(request.workspaceId)) return { status: 404, payload: brokerError(requestId, 'unknown_workspace', 'The selected workspace is no longer available.', true) };
         if (activeEntry && activeEntry.id === request.workspaceId) activeEntry = null;
         payload = { type: 'workspace.recent.remove.result', requestId, workspaceId: request.workspaceId, removed: true };
       } else if (request.type === 'workspace.recent.pin') {
-        if (typeof request.workspaceId !== 'string' || typeof request.pinned !== 'boolean' || typeof idempotencyKey !== 'string' || !idempotencyKey) return { status: 400, payload: brokerError(requestId, 'invalid_request', 'The workspace request is invalid.', true) };
+        if (!isOpaqueWorkspaceId(request.workspaceId) || typeof request.pinned !== 'boolean' || typeof idempotencyKey !== 'string' || !idempotencyKey) return { status: 400, payload: brokerError(requestId, 'invalid_request', 'The workspace request is invalid.', true) };
         const entry = registry.pin(request.workspaceId, request.pinned);
         if (!entry) return { status: 404, payload: brokerError(requestId, 'unknown_workspace', 'The selected workspace is no longer available.', true) };
         payload = { type: 'workspace.recent.pin.result', requestId, workspace: descriptor(entry), pinned: entry.pinned === true };
       } else if (request.type === 'workspace.reveal') {
-        if (typeof request.workspaceId !== 'string' || typeof request.relativePath !== 'string' || !request.relativePath) return { status: 400, payload: brokerError(requestId, 'invalid_request', 'The workspace request is invalid.', true) };
+        if (!isOpaqueWorkspaceId(request.workspaceId) || !isSafeWorkspaceRelativePath(request.relativePath)) return { status: 400, payload: brokerError(requestId, 'invalid_request', 'The workspace request is invalid.', true) };
         const entry = registry.resolve(request.workspaceId);
         if (!entry) return { status: 404, payload: brokerError(requestId, 'unknown_workspace', 'The selected workspace is no longer available.', true) };
         const target = path.resolve(entry.path, request.relativePath);
@@ -348,6 +389,19 @@ function createWorkspaceBroker(options = {}) {
     const result = { status: 200, payload };
     if (idempotencyKey) completed.set(`${request.type}:${idempotencyKey}`, result);
     return result;
+  };
+  const complete = (request, requestId) => {
+    const idempotencyKey = request && request.idempotencyKey;
+    const operationKey = request && request.type && typeof idempotencyKey === 'string' && idempotencyKey
+      ? `${request.type}:${idempotencyKey}`
+      : null;
+    if (operationKey && completed.has(operationKey)) return Promise.resolve(completed.get(operationKey));
+    if (operationKey && inFlight.has(operationKey)) return inFlight.get(operationKey);
+    const operation = execute(request, requestId);
+    if (!operationKey) return operation;
+    const shared = operation.finally(() => inFlight.delete(operationKey));
+    inFlight.set(operationKey, shared);
+    return shared;
   };
   const query = (type, requestId) => {
     if (!requestId || requestId.length > 128) return { status: 400, payload: brokerError(requestId, 'invalid_request', 'The workspace request is invalid.', true) };
@@ -573,6 +627,7 @@ function openBrowser(url) {
 
 async function startLauncher(options = {}) {
   const config = Object.assign({}, parseArgs(), options);
+  const childEnvironment = config.childEnvironment || {};
 
   if (config.help) {
     console.log(`
@@ -638,9 +693,11 @@ Options:
       PORT: String(config.hostPort),
       TOKEN: config.token,
       HOST: '127.0.0.1',
+      NANOFORGE_ALLOWED_ORIGINS: `http://127.0.0.1:${config.uiPort}`,
       NANOFORGE_WORKSPACE: config.workspaceRoot || process.cwd(),
       NANOFORGE_ALLOW_WORKSPACE_WRITES: allowWorkspaceWrites,
       NANOFORGE_WORKSPACE_GENERATION: '1',
+      ...childEnvironment,
     });
 
     if (isTypeScript) {
@@ -657,27 +714,7 @@ Options:
     } else {
       // When running as a Node SEA binary, process.execPath points to NanoForge.exe,
       // NOT to node.exe. We must find the real node.exe to spawn subprocesses.
-      let nodeExe = process.execPath;
-      const isSEA = require('node:module').isBuiltin && process.execPath.toLowerCase().includes('nanoforge');
-      if (isSEA || process.pkg) {
-        // Find system node.exe
-        const { execSync: execSyncLocal } = require('node:child_process');
-        try {
-          nodeExe = execSyncLocal('where node', { encoding: 'utf8' }).trim().split(/\r?\n/)[0];
-        } catch {
-          // Fallback: try common install locations
-          const candidates = [
-            'C:\\Program Files\\nodejs\\node.exe',
-            path.join(process.env.ProgramFiles || '', 'nodejs', 'node.exe'),
-            path.join(process.env.LOCALAPPDATA || '', 'fnm_multishells', 'node.exe'),
-          ];
-          for (const c of candidates) {
-            if (fs.existsSync(c)) { nodeExe = c; break; }
-          }
-        }
-      }
-
-      hostProcess = spawn(nodeExe, [hostEntry], {
+      hostProcess = spawn(resolveNodeExecutable(), [hostEntry], {
         env,
         stdio: ['ignore', 'pipe', 'pipe'],
         shell: false,
@@ -714,9 +751,11 @@ Options:
       PORT: String(config.hostPort),
       TOKEN: config.token,
       HOST: '127.0.0.1',
+      NANOFORGE_ALLOWED_ORIGINS: `http://127.0.0.1:${config.uiPort}`,
       NANOFORGE_WORKSPACE: workspaceRoot,
       NANOFORGE_ALLOW_WORKSPACE_WRITES: allowWorkspaceWrites,
       NANOFORGE_WORKSPACE_GENERATION: String(workspaceGeneration),
+      ...childEnvironment,
     });
     const isTypeScript = hostEntry.endsWith('.ts');
     const isWindows = process.platform === 'win32';
@@ -888,6 +927,9 @@ module.exports = {
   parseArgs,
   createStaticServer,
   createWorkspaceBroker,
+  resolveLauncherSidecar,
+  isOpaqueWorkspaceId,
+  isSafeWorkspaceRelativePath,
   isPathWithinRoot,
   buildChildEnvironment,
   MIME_TYPES,

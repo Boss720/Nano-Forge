@@ -5,6 +5,7 @@ import { useAgentOrchestration } from "@/hooks/useAgentOrchestration";
 import { useArtifacts } from "@/hooks/useArtifacts";
 import { useHostSession, type UseHostSessionOptions } from "@/lib/hostSession";
 import { AppLayout } from "@/components/layout/AppLayout";
+import { CapabilityApprovalDialog } from "@/components/ui/CapabilityApprovalDialog";
 
 export default function App({ hostSession }: { hostSession?: UseHostSessionOptions } = {}) {
   // Agent platform host session hook
@@ -104,8 +105,9 @@ export default function App({ hostSession }: { hostSession?: UseHostSessionOptio
   });
 
   return (
-    <AppLayout
-      host={host}
+    <>
+      <AppLayout
+        host={host}
       artifactsManager={artifactsManager}
       connection={connection}
       models={models}
@@ -148,7 +150,12 @@ export default function App({ hostSession }: { hostSession?: UseHostSessionOptio
       handleStop={handleStop}
       handlePatchDecision={handlePatchDecision}
       allowWorkspaceWrites={allowWorkspaceWrites}
-      onToggleWorkspaceWrites={setAllowWorkspaceWrites}
-    />
+        onToggleWorkspaceWrites={setAllowWorkspaceWrites}
+      />
+      <CapabilityApprovalDialog
+        request={host.capabilityApprovalPending}
+        onDecide={host.decideCapabilityApproval}
+      />
+    </>
   );
 }

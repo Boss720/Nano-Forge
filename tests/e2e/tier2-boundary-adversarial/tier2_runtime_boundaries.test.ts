@@ -229,8 +229,12 @@ describe("Tier 2 - Runtime, Daemons & Lifecycle Stress Boundaries", () => {
         cwd: process.cwd(),
       });
 
-      await new Promise((r) => setTimeout(r, 400));
-      const updated = supervisor.getTask(task.taskId);
+      let updated = supervisor.getTask(task.taskId);
+      const start = Date.now();
+      while (updated?.status === "running" && Date.now() - start < 3000) {
+        await new Promise((r) => setTimeout(r, 50));
+        updated = supervisor.getTask(task.taskId);
+      }
       expect(["completed", "failed"]).toContain(updated?.status);
       expect(updated?.exitCode).toBe(137);
       await supervisor.killAll();

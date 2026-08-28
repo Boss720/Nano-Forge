@@ -17,6 +17,7 @@ function defaultValidatePath(input) {
   const resolved = path.resolve(input.trim());
   const stats = fs.statSync(resolved);
   if (!stats.isDirectory()) throw new Error('workspace is not a directory');
+  if (path.parse(resolved).root === resolved) throw new Error('workspace root is too broad');
   return fs.realpathSync.native ? fs.realpathSync.native(resolved) : fs.realpathSync(resolved);
 }
 

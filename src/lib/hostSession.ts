@@ -54,6 +54,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { ExecutionPlan, PlanStep, PlanStepStatus, ToolRun } from "@/types";
 import {
   HostClient,
+  HostAuthError,
+  HostOriginMismatchError,
+  calculateBackoffDelay,
   type HostMessage,
   type PlanSubmitResultMessage,
   type ApprovalGrantResultMessage,
@@ -62,10 +65,16 @@ import {
   type RunResumeResultMessage,
   type RunCancelResultMessage,
   type ToolResponseResultMessage,
+  type CapabilityApprovalRequiredMessage,
 } from "@/lib/hostClient";
 import type { CommandResultFrame } from "@protocol/commands";
 import type { ExecuteCommandInput, HostWorkspaceDescriptor } from "@/lib/hostClient";
-import type { WorkspaceBrokerConnection, WorkspaceWriteResult } from "@protocol/workspace";
+import {
+  type WorkspaceBrokerConnection,
+  type WorkspaceWriteResult,
+  isNonRetryableError,
+} from "@protocol/workspace";
+import type { RuntimeState } from "@protocol/lifecycle";
 import type { DirEntry, FileStat, SearchMatch, GitFileStatus } from "@/types/workspace";
 import {
   useBrowserPermissions,
@@ -94,6 +103,36 @@ export const HOST_SETTINGS_KEY = "nanoforge.host";
 
 export const DEFAULT_HOST_SETTINGS: HostSettings = { enabled: false };
 
+let inMemoryLauncherSettings: HostSettings | null = null;
+
+export function resetInMemoryLauncherSettings(): void {
+  inMemoryLauncherSettings = null;
+}
+
+export function getInMemoryLauncherSettings(): HostSettings | null {
+  return inMemoryLauncherSettings;
+}
+
+/**
+ * Strips token, hostPort, and bootstrap parameters from the browser address bar
+ * via window.history.replaceState so that secrets never linger in URLs or browser history.
+ */
+export function scrubUrlParameters(): void {
+  if (typeof globalThis.window === "undefined" || !globalThis.window.history?.replaceState) return;
+  try {
+    const url = new URL(globalThis.window.location.href);
+    if (url.searchParams.has("token") || url.searchParams.has("hostPort") || url.searchParams.has("bootstrapToken")) {
+      url.searchParams.delete("token");
+      url.searchParams.delete("hostPort");
+      url.searchParams.delete("bootstrapToken");
+      const cleanUrl = url.pathname + (url.search ? url.search : "") + url.hash;
+      globalThis.window.history.replaceState({}, globalThis.document?.title ?? "", cleanUrl || "/");
+    }
+  } catch {
+    // Ignore in non-browser / mock test environments
+  }
+}
+
 function defaultStorage(): Storage | undefined {
   try {
     return globalThis.localStorage ?? undefined;
@@ -104,15 +143,20 @@ function defaultStorage(): Storage | undefined {
 
 /** Never throws; absent/corrupt payload → the disabled default. */
 export function loadHostSettings(storage: Storage | undefined = defaultStorage()): HostSettings {
+  if (inMemoryLauncherSettings) {
+    return inMemoryLauncherSettings;
+  }
   try {
     // Standalone launcher sessions provide ephemeral host credentials in the
-    // page URL. Consume them at startup, but never write the token to storage.
+    // page URL. Consume them at startup into memory, and immediately strip the URL.
     if (typeof globalThis.location !== "undefined") {
       const query = new URLSearchParams(globalThis.location.search);
       const hostPort = Number(query.get("hostPort"));
-      const launcherToken = query.get("token");
+      const launcherToken = query.get("token") || query.get("bootstrapToken");
       if (Number.isInteger(hostPort) && hostPort > 0 && hostPort <= 65535 && launcherToken) {
-        return { enabled: true, port: hostPort, token: launcherToken };
+        inMemoryLauncherSettings = { enabled: true, port: hostPort, token: launcherToken };
+        scrubUrlParameters();
+        return inMemoryLauncherSettings;
       }
     }
     const raw = storage?.getItem(HOST_SETTINGS_KEY);
@@ -215,6 +259,7 @@ export interface HostClientLike {
   resumeRun?(runId: string): Promise<RunResumeResultMessage | void>;
   cancelRun(runId: string, reason?: string): Promise<RunCancelResultMessage | void>;
   sendToolResponse?(requestId: string, approved: boolean, reason?: string): Promise<ToolResponseResultMessage | void>;
+  respondToCapabilityApproval?(requestId: string, approved: boolean, reason?: string): Promise<void>;
   readDir?(path?: string): Promise<DirEntry[]>;
   readFile?(path: string): Promise<{ path: string; content: string; language: string; size: number; modified?: string; sha256?: string; generation?: number }>;
   writeFile?(path: string, content: string, options?: { expectedSha256?: string; expectedModified?: string }): Promise<WorkspaceWriteResult>;
@@ -261,7 +306,7 @@ export interface HostEvidence {
   diff?: VisualDiffResult | null;
 }
 
-export type HostConnectionStatus = "off" | "connecting" | "connected" | "error";
+export type HostConnectionStatus = "off" | "connecting" | "connected" | "error" | RuntimeState;
 
 interface RouteDecisionState {
   runId: string;
@@ -273,6 +318,8 @@ interface RouteDecisionState {
 export interface HostSession {
   enabled: boolean;
   status: HostConnectionStatus;
+  runtimeState: RuntimeState;
+  isOperational: boolean;
   lastError: string | null;
   plan: ExecutionPlan | null;
   toolRuns: ToolRun[];
@@ -281,6 +328,8 @@ export interface HostSession {
   integrations: HostIntegrationsState;
   evidence: HostEvidence | null;
   permissionPending: BrowserPermissionRequest | null;
+  /** A host-issued, exact capability grant waiting for an operator decision. */
+  capabilityApprovalPending: CapabilityApprovalRequiredMessage | null;
   // Subagent & Daemon Swarm Control Plane State
   subagents: SubagentInfo[];
   activeSubagentId: string | null;
@@ -298,6 +347,7 @@ export interface HostSession {
   cancel(planId: string): void;
   stopToolRun(toolRunId: string): void;
   decidePermission(decision: BrowserPermissionDecision): void;
+  decideCapabilityApproval(requestId: string, approved: boolean): void;
   toggleRulesPack: (id: string, enabled: boolean) => void;
   toggleSkill: (id: string, enabled: boolean) => void;
   toggleMcpServer: (id: string, enabled: boolean) => void;
@@ -463,6 +513,7 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
   const [route, setRoute] = useState<RouteDecisionState | null>(null);
   const [evidence, setEvidence] = useState<HostEvidence | null>(null);
   const [integrations, setIntegrations] = useState<HostIntegrationsState>(EMPTY_INTEGRATIONS);
+  const [capabilityApprovalPending, setCapabilityApprovalPending] = useState<CapabilityApprovalRequiredMessage | null>(null);
 
   // Subagents & Tasks Control Plane State
   const [subagents, setSubagents] = useState<SubagentInfo[]>([]);
@@ -472,19 +523,23 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
   const [schedules, setSchedules] = useState<ScheduleResult[]>([]);
   const [sharedMemory, setSharedMemoryState] = useState<MemoryEntry[]>([]);
 
-  // Connect lifecycle: the connection effect below writes this ONLY from
-  // async promise callbacks (react-hooks/set-state-in-effect); `status` is
-  // derived rather than stored.
+  const [runtimeState, setRuntimeState] = useState<RuntimeState>(!connKey ? "unavailable" : "starting");
   const [connectOutcome, setConnectOutcome] = useState<{ key: string; error: string | null } | null>(null);
   const [lastError, setLastError] = useState<string | null>(null);
 
   const status: HostConnectionStatus = !connKey
     ? "off"
-    : !connectOutcome || connectOutcome.key !== connKey
+    : runtimeState === "reconnecting" || runtimeState === "starting" || runtimeState === "switching"
       ? "connecting"
-      : connectOutcome.error
-        ? "error"
-        : "connected";
+      : runtimeState === "healthy" || runtimeState === "ready"
+        ? "connected"
+        : runtimeState === "needs_attention" || runtimeState === "unavailable"
+          ? (connectOutcome?.error ? "error" : "off")
+          : !connectOutcome || connectOutcome.key !== connKey
+            ? "connecting"
+            : connectOutcome.error
+              ? "error"
+              : "connected";
 
   const perms = useBrowserPermissions();
 
@@ -631,6 +686,13 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
               policyReason: msg.policyReason,
             }),
           );
+          break;
+        case "capability.approval_required":
+          setCapabilityApprovalPending(msg);
+          break;
+        case "capability.result":
+          setCapabilityApprovalPending((prev) => prev?.requestId === msg.requestId ? null : prev);
+          if (!msg.ok) setLastError(`${msg.errorCode ?? "denied"}: ${msg.errorMessage ?? "Capability denied"}`);
           break;
         case "tool.output":
           toolRunOwners.current.set(msg.toolId, msg.runId);
@@ -956,6 +1018,11 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
 
   /* ------------------------- connection ------------------------------- */
 
+  const createClientRef = useRef(createClient);
+  useEffect(() => {
+    createClientRef.current = createClient;
+  });
+
   const closeActiveClient = useCallback(() => {
     clientUnsubscribeRef.current?.();
     clientUnsubscribeRef.current = null;
@@ -968,7 +1035,8 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
     if (!connKey) return; // host disabled — nothing to connect, status derives to "off"
     const port = settings.port as number;
     const token = settings.token as string;
-    const client = (createClient ?? ((o: { port?: number; token?: string; websocketUrl?: string }) => new HostClient(o)))({
+    const clientFactory = createClientRef.current ?? ((o: { port?: number; token?: string; websocketUrl?: string }) => new HostClient(o));
+    const client = clientFactory({
       port,
       token,
     });
@@ -978,36 +1046,70 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
       // Only the currently adopted client is allowed to mutate session state.
       if (clientRef.current === client) handleHostMessage(message);
     });
+
     let cancelled = false;
-    // setState only inside these async callbacks — never synchronously in the
-    // effect body (react-hooks/set-state-in-effect).
-    client.connect().then(
-      () => {
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    const maxAttempts = 5;
+    const initialBackoffMs = 500;
+    const maxBackoffMs = 10_000;
+
+    const attemptConnect = async (attempt = 0) => {
+      if (cancelled) return;
+      if (attempt > 0) {
+        setRuntimeState("reconnecting");
+      }
+      try {
+        await client.connect();
         if (cancelled) return;
         setConnectOutcome({ key: connKey, error: null });
         setLastError(null);
-      },
-      (err: unknown) => {
+        setRuntimeState("healthy");
+      } catch (err: unknown) {
         if (cancelled) return;
         const message = err instanceof Error ? err.message : String(err);
-        setConnectOutcome({ key: connKey, error: message });
-        setLastError(message);
-      },
-    );
+        const isOrigin =
+          err instanceof HostOriginMismatchError ||
+          (typeof message === "string" && message.toLowerCase().includes("origin"));
+        const isAuth =
+          (err instanceof HostAuthError && !isOrigin) ||
+          (typeof message === "string" && message.includes("4401"));
+        const isNonRetryable = isNonRetryableError(err);
+
+        if (isOrigin || isAuth || isNonRetryable) {
+          setConnectOutcome({ key: connKey, error: message });
+          setLastError(message);
+          setRuntimeState("needs_attention");
+          return;
+        }
+
+        if (attempt < maxAttempts - 1) {
+          const delay = calculateBackoffDelay(attempt, initialBackoffMs, maxBackoffMs);
+          setRuntimeState("reconnecting");
+          retryTimer = setTimeout(() => {
+            void attemptConnect(attempt + 1);
+          }, delay);
+        } else {
+          setConnectOutcome({ key: connKey, error: message });
+          setLastError(message);
+          setRuntimeState("unavailable");
+        }
+      }
+    };
+
+    void attemptConnect(0);
+
     return () => {
       cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
       closeActiveClient();
     };
     // settings primitives only — a new settings object with the same values
     // must NOT reconnect.
-  }, [connKey, settings.port, settings.token, createClient, handleHostMessage, closeActiveClient]);
+  }, [connKey, settings.port, settings.token, handleHostMessage, closeActiveClient]);
 
   const reconnectToWorkspace = useCallback(async (connection: WorkspaceBrokerConnection): Promise<HostWorkspaceDescriptor | null> => {
     const current = clientRef.current;
-    if (!current) {
-      setLastError("Cannot reconnect workspace while the local host is unavailable");
-      return null;
-    }
+    setRuntimeState("switching");
 
     let candidate: HostClientLike | null = null;
     try {
@@ -1031,7 +1133,7 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
       clientUnsubscribeRef.current = candidate.onEvent((message) => {
         if (clientRef.current === candidate) handleHostMessage(message);
       });
-      current.close();
+      current?.close();
 
       // Workspace-scoped transient UI cannot cross a host generation.
       toolRunOwners.current.clear();
@@ -1040,11 +1142,18 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
       setRoute(null);
       setEvidence(null);
       setLastError(null);
+      setConnectOutcome({ key: `${connection.port ?? "url"}:${connection.token ?? ""}`, error: null });
+      setRuntimeState("ready");
       return descriptor;
     } catch (error) {
       candidate?.close();
       const message = error instanceof Error ? error.message : String(error);
       setLastError(message);
+      if (current) {
+        setRuntimeState("healthy");
+      } else {
+        setRuntimeState(isNonRetryableError(error) ? "needs_attention" : "unavailable");
+      }
       return null;
     }
   }, [createClient, handleHostMessage]);
@@ -1129,6 +1238,22 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
     },
     [perms, sendGrant],
   );
+
+  const decideCapabilityApproval = useCallback((requestId: string, approved: boolean) => {
+    const pending = capabilityApprovalPending;
+    if (!pending || pending.requestId !== requestId) return;
+    const client = clientRef.current;
+    if (!client?.respondToCapabilityApproval) {
+      setLastError("This local host cannot accept capability approvals. Reconnect and try again.");
+      return;
+    }
+    setCapabilityApprovalPending(null);
+    void client.respondToCapabilityApproval(requestId, approved).catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      setLastError(message);
+      setCapabilityApprovalPending(pending);
+    });
+  }, [capabilityApprovalPending]);
 
   const toggleIntegration = useCallback((kind: "rules" | "skill" | "mcp", id: string, enabled: boolean) => {
     setIntegrations((prev) => ({
@@ -1317,11 +1442,18 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
 
   const withWorkspaceClient = useCallback(async <T,>(operation: (client: HostClientLike) => Promise<T>): Promise<T | null> => {
     const client = clientRef.current;
-    if (!client) return null;
+    if (!client) {
+      setLastError("Cannot perform workspace operation while the local host is unavailable");
+      return null;
+    }
     try {
       return await operation(client);
     } catch (err) {
-      setLastError(err instanceof Error ? err.message : String(err));
+      const message = err instanceof Error ? err.message : String(err);
+      setLastError(message);
+      if (isNonRetryableError(err)) {
+        setRuntimeState("needs_attention");
+      }
       return null;
     }
   }, []);
@@ -1362,12 +1494,42 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
   const unwatchWorkspace = useCallback(async () => (await withWorkspaceClient((client) =>
     client.unwatch ? client.unwatch() : Promise.reject(new Error("Host does not support workspace watching")),
   )) !== null, [withWorkspaceClient]);
-  const selectWorkspace = useCallback((selectionToken: string) => withWorkspaceClient((client) =>
-    client.selectWorkspace ? client.selectWorkspace(selectionToken) : Promise.reject(new Error("This local host cannot open folders yet")),
-  ), [withWorkspaceClient]);
-  const openWorkspace = useCallback((path: string) => withWorkspaceClient((client) =>
-    client.openWorkspace ? client.openWorkspace(path) : client.selectWorkspace ? client.selectWorkspace(path) : Promise.reject(new Error("This local host cannot open folders yet")),
-  ), [withWorkspaceClient]);
+  const selectWorkspace = useCallback((selectionToken: string) => withWorkspaceClient(async (client) => {
+    if (!client.selectWorkspace && !client.openWorkspace) {
+      throw new Error("This local host cannot open folders yet");
+    }
+    setRuntimeState("switching");
+    try {
+      const desc = client.selectWorkspace
+        ? await client.selectWorkspace(selectionToken)
+        : await client.openWorkspace!(selectionToken);
+      setRuntimeState("ready");
+      return desc;
+    } catch (err) {
+      if (isNonRetryableError(err)) {
+        setRuntimeState("needs_attention");
+      }
+      throw err;
+    }
+  }), [withWorkspaceClient]);
+  const openWorkspace = useCallback((path: string) => withWorkspaceClient(async (client) => {
+    if (!client.openWorkspace && !client.selectWorkspace) {
+      throw new Error("This local host cannot open folders yet");
+    }
+    setRuntimeState("switching");
+    try {
+      const desc = client.openWorkspace
+        ? await client.openWorkspace(path)
+        : await client.selectWorkspace!(path);
+      setRuntimeState("ready");
+      return desc;
+    } catch (err) {
+      if (isNonRetryableError(err)) {
+        setRuntimeState("needs_attention");
+      }
+      throw err;
+    }
+  }), [withWorkspaceClient]);
 
   const manageTask = useCallback(
     async (params: ManageTaskParams): Promise<ManageTaskResult | null> => {
@@ -1591,6 +1753,8 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
   const api: HostSession = {
     enabled,
     status,
+    runtimeState,
+    isOperational: runtimeState === "ready" || runtimeState === "healthy",
     // a stale error from a previous connection must not surface once disabled
     lastError: connKey ? lastError : null,
     plan,
@@ -1599,6 +1763,7 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
     integrations,
     evidence,
     permissionPending: perms.pending,
+    capabilityApprovalPending,
     subagents,
     activeSubagentId,
     interAgentMessages,
@@ -1612,6 +1777,7 @@ export function useHostSession(options?: UseHostSessionOptions): HostSession {
     cancel,
     stopToolRun,
     decidePermission,
+    decideCapabilityApproval,
     toggleRulesPack: (id, enabled) => toggleIntegration("rules", id, enabled),
     toggleSkill: (id, enabled) => toggleIntegration("skill", id, enabled),
     toggleMcpServer: (id, enabled) => toggleIntegration("mcp", id, enabled),

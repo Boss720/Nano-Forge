@@ -1,8 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { SubagentSupervisor } from "./supervisor.js";
+import * as gitWorktree from "../workspace/gitWorktree.js";
 import {
   executeInvokeSubagentTool,
   executeManageSubagentsTool,
@@ -57,6 +58,95 @@ describe("SubagentSupervisor & Lifecycle Management", () => {
 
     expect(events).toContain("subagent.spawned");
     expect(events).toContain("subagent.tree_updated");
+  });
+
+  it("inherits the active host workspace without publishing its canonical path", async () => {
+    const result = await supervisor.spawnSubagent({
+      archetype: "implementer",
+      name: "active_workspace_worker",
+      prompt: "Work in the folder selected by the host",
+      workspaceIsolation: "inherit",
+    });
+    const node = supervisor.registry.get(result.subagentId)!;
+    const summary = supervisor.registry.getSummary(result.subagentId)!;
+
+    expect(node.assignedWorkspaceRoot).toBe(tmpRoot);
+    expect(node.workingDirectory).toBe(".");
+    expect(result.workingDirectory).toBe(".");
+    expect(JSON.stringify(summary)).not.toContain(tmpRoot);
+  });
+
+  it("gives branch-isolated agents their own internal worktree and only exposes a relative path", async () => {
+    const worktreeSpy = vi.spyOn(gitWorktree, "createWorktree").mockImplementation(
+      async (workspaceRoot, relativeWorktreePath, branchName) => ({
+        success: true,
+        worktreePath: path.resolve(workspaceRoot, relativeWorktreePath),
+        branch: branchName,
+      }),
+    );
+
+    try {
+      const result = await supervisor.spawnSubagent({
+        archetype: "implementer",
+        name: "branch_workspace_worker",
+        prompt: "Work in an isolated branch",
+        workspaceIsolation: "branch",
+      });
+      const node = supervisor.registry.get(result.subagentId)!;
+      const summary = supervisor.registry.getSummary(result.subagentId)!;
+
+      expect(node.assignedWorkspaceRoot).not.toBe(tmpRoot);
+      expect(node.assignedWorkspaceRoot).toBe(path.resolve(tmpRoot, node.worktreePath!));
+      expect(node.workingDirectory).toBe(node.worktreePath);
+      expect(result.workingDirectory).toBe(node.worktreePath);
+      expect(JSON.stringify(summary)).not.toContain(tmpRoot);
+    } finally {
+      worktreeSpy.mockRestore();
+    }
+  });
+
+  it("denies mutation before any subagent state or files are created when enforcement is enabled", async () => {
+    const guarded = new SubagentSupervisor({
+      workspaceRoot: tmpRoot,
+      enforceMutationAuthorization: true,
+      authorizeMutation: () => false,
+    });
+
+    await expect(guarded.spawnSubagent({
+      archetype: "implementer",
+      prompt: "sensitive task text",
+    })).rejects.toThrow("Subagent mutation denied");
+    expect(guarded.registry.getAll()).toHaveLength(0);
+    const listing = await guarded.manageSubagents({ action: "list" });
+    expect(listing.success).toBe(true);
+    await expect(fs.access(path.join(tmpRoot, ".agents"))).rejects.toThrow();
+    await guarded.dispose();
+  });
+
+  it("passes a redacted authorization context for a valid spawn", async () => {
+    const contexts: unknown[] = [];
+    const guarded = new SubagentSupervisor({
+      workspaceRoot: tmpRoot,
+      enforceMutationAuthorization: true,
+      authorizeMutation: (context) => {
+        contexts.push(context);
+        return true;
+      },
+    });
+
+    const spawned = await guarded.spawnSubagent({
+      archetype: "implementer",
+      name: "safe_name",
+      prompt: "do not expose this prompt",
+    });
+    expect(spawned.subagentId).toBeDefined();
+    expect(contexts).toHaveLength(1);
+    const context = contexts[0] as { operation: string; metadata: Record<string, unknown> };
+    expect(context.operation).toBe("spawn");
+    expect(context.metadata).not.toHaveProperty("prompt");
+    expect(JSON.stringify(context)).not.toContain("do not expose this prompt");
+    expect(guarded.registry.getAll()).toHaveLength(1);
+    await guarded.dispose();
   });
 
   it("enforces token budget limits and triggers escalation on breach (SEC-SUB-04)", async () => {

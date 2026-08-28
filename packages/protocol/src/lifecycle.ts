@@ -268,3 +268,55 @@ export const toolResponseResultSchema = z.object({
   at: z.string().min(1),
 });
 export type ToolResponseResult = z.infer<typeof toolResponseResultSchema>;
+
+/* ------------------------------------------------------------------ */
+/* 6. Runtime State Machine (7-State Machine)                         */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Canonical 7-state runtime state machine across protocol, host daemon, and UI:
+ * - "starting": Host or connection is bootstrapping.
+ * - "healthy": Connection established and host daemon is responsive.
+ * - "reconnecting": Connection dropped; attempting bounded exponential backoff.
+ * - "switching": Workspace transition or descriptor activation in progress.
+ * - "ready": Workspace descriptor verified and runtime is ready for turns/tasks.
+ * - "needs_attention": Recoverable error, permission gate, or non-retryable rejection.
+ * - "unavailable": Terminal failure, host unreachable, or disabled.
+ */
+export const runtimeStateSchema = z.enum([
+  "starting",
+  "healthy",
+  "reconnecting",
+  "switching",
+  "ready",
+  "needs_attention",
+  "unavailable",
+]);
+export type RuntimeState = z.infer<typeof runtimeStateSchema>;
+
+export const VALID_RUNTIME_TRANSITIONS: Readonly<Record<RuntimeState, ReadonlySet<RuntimeState>>> = {
+  starting: new Set(["healthy", "ready", "reconnecting", "needs_attention", "unavailable"]),
+  healthy: new Set(["ready", "switching", "reconnecting", "needs_attention", "unavailable", "starting"]),
+  ready: new Set(["healthy", "switching", "reconnecting", "needs_attention", "unavailable", "starting"]),
+  reconnecting: new Set(["healthy", "ready", "starting", "needs_attention", "unavailable"]),
+  switching: new Set(["healthy", "ready", "reconnecting", "needs_attention", "unavailable"]),
+  needs_attention: new Set(["starting", "healthy", "ready", "reconnecting", "switching", "unavailable"]),
+  unavailable: new Set(["starting", "healthy", "ready", "reconnecting", "switching", "needs_attention"]),
+};
+
+export function isValidRuntimeTransition(
+  current: RuntimeState,
+  next: RuntimeState
+): boolean {
+  if (current === next) return true;
+  const allowed = VALID_RUNTIME_TRANSITIONS[current];
+  return allowed ? allowed.has(next) : false;
+}
+
+export function isRuntimeOperational(state: RuntimeState): boolean {
+  return state === "healthy" || state === "ready";
+}
+
+export function isRuntimeTransitioning(state: RuntimeState): boolean {
+  return state === "starting" || state === "reconnecting" || state === "switching";
+}

@@ -98,6 +98,46 @@ describe("redactText / redactObject", () => {
 /* ------------------------------------------------------------------------ */
 
 describe("AuditStore persistence", () => {
+  it("records capability decisions as safe append-only rows", () => {
+    const token = "grant-token-raw-must-never-persist";
+    const rec = store.recordCapabilityDecision({
+      at: T0,
+      grantId: "grant-01",
+      requestId: "request-01",
+      decision: "allow",
+      reasonCode: "approved",
+      remainingUses: 2,
+      tokenDigest: sha256Hex(token),
+      binding: {
+        sessionId: "session-01",
+        workspaceId: "workspace-01",
+        runId: "run-01",
+        stepId: "step-01",
+        toolId: "tool-01",
+        argumentsDigest: `sha256:${"ab".repeat(32)}`,
+      },
+    });
+    expect(rec).toMatchObject({ grantId: "grant-01", requestId: "request-01", decision: "allow", remainingUses: 2 });
+    expect(rec.eventDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(JSON.stringify(store.listCapabilityDecisions())).not.toContain(token);
+    expect(() => store.recordCapabilityDecision({ decision: "deny", reasonCode: "x", token } as never)).toThrow(/raw token/i);
+  });
+
+  it("persists capability decisions across reopen in insertion order", () => {
+    store.recordCapabilityDecision({ at: T2, grantId: "g-2", decision: "deny", reasonCode: "expired" });
+    store.recordCapabilityDecision({ at: T1, requestId: "q-1", decision: "revoke", reasonCode: "revoked" });
+    store.close();
+    store = new AuditStore({ rootDir: dir, clock });
+    expect(store.listCapabilityDecisions().map((row) => row.decision)).toEqual(["deny", "revoke"]);
+    expect(store.listCapabilityDecisions().map((row) => row.at)).toEqual([T2, T1]);
+    const raw = new DatabaseSync(path.join(dir, "audit.db"));
+    const rows = raw.prepare("SELECT * FROM capability_decisions ORDER BY id").all() as Record<string, unknown>[];
+    raw.close();
+    expect(rows).toHaveLength(2);
+    expect(JSON.stringify(rows)).not.toContain("grant-token-raw-must-never-persist");
+    expect(rows[0].eventDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
+  });
+
   it("round-trips events with correct per-event digests and run digest chain", () => {
     store.startRun({ id: "r1", goal: "fix the bug", startedAt: T0 });
     store.recordEvent("r1", submitted("r1", 1));

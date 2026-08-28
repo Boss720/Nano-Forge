@@ -177,6 +177,8 @@ interface RunContext {
   status: RunStatus;
   terminalState?: RunTerminalState;
   terminalReason?: string;
+  /** Once durable audit persistence fails, no further work may be dispatched. */
+  auditFailed?: boolean;
   cancelRequested: boolean;
   paused: boolean;
   /** True once at least one step entered the pipeline (not validation-only). */
@@ -325,27 +327,36 @@ export class RunCoordinator {
       resolveDone,
       done,
     };
+    try {
+      this.config.auditStore.startRun({
+        id: runId,
+        goal: plan.goal ?? plan.title ?? "",
+        startedAt: this.clock().toISOString(),
+      });
+    } catch {
+      this.failAudit(ctx);
+      return this.handleFor(ctx);
+    }
     this.runs.set(runId, ctx);
 
-    this.config.auditStore.startRun({
-      id: runId,
-      goal: plan.goal ?? plan.title ?? "",
-      startedAt: this.clock().toISOString(),
-    });
-    this.emit(ctx, {
-      type: "plan.submitted",
-      planId: plan.id,
-      goal: plan.goal ?? plan.title ?? "",
-      stepCount: plan.steps.length,
-      steps: plan.steps.map((s) => ({
-        id: s.id,
-        title: s.title,
-        dependsOn: s.dependsOn,
-        ...(s.approval !== undefined ? { approval: s.approval } : {}),
-        ...(s.sideEffecting !== undefined ? { sideEffecting: s.sideEffecting } : {}),
-        ...(s.affectedScopes !== undefined ? { affectedScopes: s.affectedScopes } : {}),
-      })),
-    });
+    try {
+      this.emit(ctx, {
+        type: "plan.submitted",
+        planId: plan.id,
+        goal: plan.goal ?? plan.title ?? "",
+        stepCount: plan.steps.length,
+        steps: plan.steps.map((s) => ({
+          id: s.id,
+          title: s.title,
+          dependsOn: s.dependsOn,
+          ...(s.approval !== undefined ? { approval: s.approval } : {}),
+          ...(s.sideEffecting !== undefined ? { sideEffecting: s.sideEffecting } : {}),
+          ...(s.affectedScopes !== undefined ? { affectedScopes: s.affectedScopes } : {}),
+        })),
+      });
+    } catch {
+      return this.handleFor(ctx);
+    }
 
     const validation = validatePlan(plan);
     if (!validation.ok) {
@@ -365,9 +376,13 @@ export class RunCoordinator {
       void this.drive(ctx);
     }
 
+    return this.handleFor(ctx);
+  }
+
+  private handleFor(ctx: RunContext): RunHandle {
     return {
-      runId,
-      done,
+      runId: ctx.runId,
+      done: ctx.done,
       pause: () => this.pause(ctx),
       resume: () => this.resume(ctx),
       cancel: () => this.cancel(ctx),
@@ -414,8 +429,44 @@ export class RunCoordinator {
 
   private emit(ctx: RunContext, input: RunEventInputFor): RunEvent {
     const event = this.config.eventLog.append({ ...input, runId: ctx.runId } as RunEventInput);
-    this.config.auditStore.recordEvent(ctx.runId, event);
+    try {
+      this.config.auditStore.recordEvent(ctx.runId, event);
+    } catch {
+      this.failAudit(ctx);
+      throw new Error("audit unavailable");
+    }
     return event;
+  }
+
+  /**
+   * Durable audit storage is a precondition for privileged execution. Once it
+   * fails, stop the current job, prevent future steps, and settle the handle
+   * without attempting another audit event that could recurse on the failure.
+   */
+  private failAudit(ctx: RunContext): void {
+    if (ctx.auditFailed) return;
+    ctx.auditFailed = true;
+    ctx.terminalState = "failed";
+    ctx.terminalReason = "audit unavailable";
+    ctx.status = "failed";
+    ctx.cancelRequested = true;
+    ctx.abort.abort();
+    try {
+      ctx.currentJob?.cancel();
+    } catch {
+      /* best effort */
+    }
+    try {
+      this.config.auditStore.endRun({
+        runId: ctx.runId,
+        state: "failed",
+        endedAt: this.clock().toISOString(),
+      });
+    } catch {
+      // The store is unavailable. The in-memory run must still be terminal.
+    }
+    this.releaseWaiters(ctx);
+    ctx.resolveDone({ runId: ctx.runId, status: "failed", reason: "audit unavailable" });
   }
 
   /** Emit the terminal event (exactly once), close the ledger, resolve done. */
@@ -458,11 +509,16 @@ export class RunCoordinator {
         break;
     }
 
-    this.config.auditStore.endRun({
-      runId: ctx.runId,
-      state,
-      endedAt: this.clock().toISOString(),
-    });
+    try {
+      this.config.auditStore.endRun({
+        runId: ctx.runId,
+        state,
+        endedAt: this.clock().toISOString(),
+      });
+    } catch {
+      this.failAudit(ctx);
+      return;
+    }
     this.releaseWaiters(ctx);
     ctx.resolveDone({ runId: ctx.runId, status: state, ...(reason ? { reason } : {}) });
   }

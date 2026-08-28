@@ -13,7 +13,7 @@
 import { describe, it, expect, afterEach } from "vitest";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { launchE2ETestHost, type E2ETestHost } from "./helpers/testHost.js";
+import { approveExactCapability, launchE2ETestHost, type E2ETestHost } from "./helpers/testHost.js";
 import { CLOSE_UNAUTHORIZED } from "../../apps/agent-host/src/server.js";
 import type { ExecutionPlan } from "@protocol/plan";
 
@@ -107,6 +107,11 @@ describe("Phase 7 End-to-End Smoke Test", () => {
       content: "approved edit",
       expectedSha256: sha2,
     });
+    await approveExactCapability(client2, {
+      requestId: "req-write-ok",
+      toolId: "workspace.writeFile",
+      scope: "write",
+    });
     const writeSuccess = await client2.findMessage((m) => m.type === "workspace.writeFile.result");
     expect(writeSuccess.type).toBe("workspace.writeFile.result");
     expect(writeSuccess.success).toBe(true);
@@ -121,6 +126,11 @@ describe("Phase 7 End-to-End Smoke Test", () => {
       path: "example.txt",
       content: "conflicting edit",
       expectedSha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    });
+    await approveExactCapability(client2, {
+      requestId: "req-write-conflict",
+      toolId: "workspace.writeFile",
+      scope: "write",
     });
     const conflictResult = await client2.findMessage((m) => m.type === "workspace.error");
     expect(conflictResult.type).toBe("workspace.error");

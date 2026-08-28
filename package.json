@@ -34,8 +34,35 @@
     "turbo:lint": "turbo run lint",
     "start:host": "tsx apps/agent-host/src/server.ts",
     "start:launcher": "node scripts/nanoforge-launcher.cjs",
+    "desktop:dev": "pnpm package && electron desktop/main.cjs",
+    "desktop:build": "pnpm build && pnpm package && electron-builder --win nsis --x64",
     "package": "node scripts/package-release.js",
     "build:exe": "node scripts/build-exe.js"
+  },
+  "main": "desktop/main.cjs",
+  "build": {
+    "appId": "com.nanoforge.desktop",
+    "productName": "NanoForge",
+    "directories": {
+      "output": "release/desktop-app"
+    },
+    "asar": false,
+    "files": [
+      "desktop/**",
+      "dist/**",
+      "scripts/**",
+      "apps/agent-host/dist/**",
+      "apps/agent-host/src/policy/default-policy.json",
+      "package.json"
+    ],
+    "win": {
+      "target": ["nsis"],
+      "artifactName": "NanoForge-Desktop-${version}-Setup.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
   },
   "dependencies": {
     "@hookform/resolvers": "^5.2.2",
@@ -93,9 +120,12 @@
     "@types/node": "^24.10.1",
     "@types/react": "^19.2.5",
     "@types/react-dom": "^19.2.3",
+    "@types/ws": "^8.5.14",
     "@vitejs/plugin-react": "^5.1.1",
     "@vitest/coverage-v8": "^4.1.10",
     "autoprefixer": "^10.4.23",
+    "electron": "^44.0.0",
+    "electron-builder": "^26.15.3",
     "esbuild": "^0.25.0",
     "eslint": "^9.39.1",
     "eslint-plugin-react-hooks": "^7.0.1",
@@ -112,7 +142,6 @@
     "typescript-eslint": "^8.46.4",
     "vite": "^7.2.4",
     "vitest": "^4.1.10",
-    "ws": "^8.18.0",
-    "@types/ws": "^8.5.14"
+    "ws": "^8.18.0"
   }
 }

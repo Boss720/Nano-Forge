@@ -53,6 +53,25 @@ import { TaskScheduler } from "../daemons/scheduler.js";
 import { SharedMemoryEngine } from "./memory.js";
 import { TelemetryTracker, type TurnMetricsInput } from "./telemetry.js";
 import type { EscalationDecision, EscalationRung, SubagentNode } from "./types.js";
+import { digestArguments } from "../capabilities/broker.js";
+
+export type SubagentMutationOperation = "spawn" | "kill" | "pause" | "resume" | "send_message" | "define";
+
+export interface SubagentMutationAuthorizationContext {
+  readonly operation: SubagentMutationOperation;
+  readonly actorId?: string;
+  readonly targetId?: string;
+  /** Digest only; request values (including prompts and message bodies) are never retained. */
+  readonly requestDigest: string;
+  readonly metadata: Readonly<Record<string, string | number | boolean>>;
+}
+
+export type AuthorizeSubagentMutation = (
+  context: SubagentMutationAuthorizationContext,
+) => boolean | Promise<boolean>;
+
+const safeSubagentId = (value: string | undefined): string | undefined =>
+  value && /^[A-Za-z0-9_-]{1,128}$/.test(value) ? value : undefined;
 
 export interface SubagentSupervisorOptions {
   workspaceRoot?: string;
@@ -64,6 +83,9 @@ export interface SubagentSupervisorOptions {
   scheduler?: TaskScheduler;
   memoryEngine?: SharedMemoryEngine;
   telemetryTracker?: TelemetryTracker;
+  /** When enabled, every side-effectful subagent operation requires this callback to grant it. */
+  enforceMutationAuthorization?: boolean;
+  authorizeMutation?: AuthorizeSubagentMutation;
 }
 
 export class SubagentSupervisor extends EventEmitter {
@@ -78,6 +100,8 @@ export class SubagentSupervisor extends EventEmitter {
   readonly telemetry: TelemetryTracker;
   private readonly unsubDaemons?: () => void;
   private readonly unsubScheduler?: () => void;
+  private readonly enforceMutationAuthorization: boolean;
+  private readonly authorizeMutation?: AuthorizeSubagentMutation;
 
   constructor(options: SubagentSupervisorOptions = {}) {
     super();
@@ -91,6 +115,8 @@ export class SubagentSupervisor extends EventEmitter {
     this.scheduler = options.scheduler ?? new TaskScheduler();
     this.memory = options.memoryEngine ?? new SharedMemoryEngine({ workspaceRoot: this.workspaceRoot });
     this.telemetry = options.telemetryTracker ?? new TelemetryTracker();
+    this.enforceMutationAuthorization = options.enforceMutationAuthorization ?? false;
+    this.authorizeMutation = options.authorizeMutation;
 
     // Forward daemon output/completion to wakeups
     this.unsubDaemons = this.daemons.subscribe((event) => {
@@ -119,6 +145,14 @@ export class SubagentSupervisor extends EventEmitter {
     parentId?: string
   ): Promise<InvokeSubagentResult> {
     const params = invokeSubagentParamsSchema.parse(rawParams);
+    await this.requireMutationAuthorization("spawn", {
+      actorId: parentId,
+      request: params,
+      metadata: {
+        archetype: params.archetype,
+        isolation: params.workspaceIsolation ?? "inherit",
+      },
+    });
 
     // 1. Validate hierarchy constraints (Depth <= 3, Active <= 8)
     this.hierarchy.validateSpawn(parentId, this.registry);
@@ -185,7 +219,8 @@ export class SubagentSupervisor extends EventEmitter {
     // 4. Handle workspace isolation modes
     let worktreePath: string | undefined;
     let scratchDir: string | undefined;
-    let effectiveWorkingDir = this.workspaceRoot;
+    let assignedWorkspaceRoot = this.workspaceRoot;
+    let publicWorkingDirectory = ".";
 
     if (isolationMode === "branch") {
       const relWorktree = `.agents/worktrees/${shortId}`;
@@ -194,8 +229,12 @@ export class SubagentSupervisor extends EventEmitter {
       if (!worktreeResult.success) {
         throw new Error(`Failed to initialize git worktree for subagent: ${worktreeResult.error}`);
       }
+      if (!isWithinWorkspace(worktreeResult.worktreePath, this.workspaceRoot)) {
+        throw new Error(`${SUBAGENT_ERROR_CODES.ERR_SUBAGENT_INVALID_CONFIG}: Subagent worktree escapes workspace root.`);
+      }
       worktreePath = relWorktree;
-      effectiveWorkingDir = worktreeResult.worktreePath;
+      assignedWorkspaceRoot = worktreeResult.worktreePath;
+      publicWorkingDirectory = relWorktree;
     } else if (isolationMode === "share") {
       scratchDir = `.agents/scratch_${shortId}`;
       await fs.mkdir(path.resolve(this.workspaceRoot, scratchDir), { recursive: true });
@@ -214,7 +253,8 @@ export class SubagentSupervisor extends EventEmitter {
       roles: params.roles ?? [],
       systemPrompt: params.prompt,
       model: params.model,
-      workingDirectory: effectiveWorkingDir,
+      assignedWorkspaceRoot,
+      workingDirectory: publicWorkingDirectory,
       metadataDir: metadataDirName,
       worktreePath,
       scratchDir,
@@ -248,7 +288,7 @@ export class SubagentSupervisor extends EventEmitter {
       subagentId,
       name,
       archetype,
-      workingDirectory: effectiveWorkingDir,
+      workingDirectory: publicWorkingDirectory,
       state: "running",
       startedAt,
     };
@@ -295,6 +335,9 @@ export class SubagentSupervisor extends EventEmitter {
         if (!params.subagentId) {
           return { action: "kill", success: false, message: "Missing subagentId" };
         }
+        if (!(await this.isMutationAuthorized("kill", { actorId: callerId, targetId: params.subagentId, request: params }))) {
+          return { action: "kill", success: false, message: "Subagent mutation denied" };
+        }
         const killed = await this.hierarchy.killTree(params.subagentId, this.registry, {
           workspaceRoot: this.workspaceRoot,
           daemonSupervisor: this.daemons,
@@ -320,6 +363,9 @@ export class SubagentSupervisor extends EventEmitter {
         if (!params.subagentId) {
           return { action: "pause", success: false, message: "Missing subagentId" };
         }
+        if (!(await this.isMutationAuthorized("pause", { actorId: callerId, targetId: params.subagentId, request: params }))) {
+          return { action: "pause", success: false, message: "Subagent mutation denied" };
+        }
         const node = this.registry.get(params.subagentId);
         if (!node) {
           return { action: "pause", success: false, message: `Subagent not found: ${params.subagentId}` };
@@ -339,6 +385,9 @@ export class SubagentSupervisor extends EventEmitter {
       case "resume": {
         if (!params.subagentId) {
           return { action: "resume", success: false, message: "Missing subagentId" };
+        }
+        if (!(await this.isMutationAuthorized("resume", { actorId: callerId, targetId: params.subagentId, request: params }))) {
+          return { action: "resume", success: false, message: "Subagent mutation denied" };
         }
         const node = this.registry.get(params.subagentId);
         if (!node) {
@@ -452,6 +501,11 @@ export class SubagentSupervisor extends EventEmitter {
    */
   async sendMessage(rawParams: SendMessageInput, senderId: string): Promise<SendMessageResult> {
     const params = sendMessageParamsSchema.parse(rawParams);
+    await this.requireMutationAuthorization("send_message", {
+      actorId: senderId,
+      targetId: params.recipientId,
+      request: params,
+    });
     const sender = this.registry.get(senderId);
     const recipient = this.registry.get(params.recipientId);
 
@@ -499,7 +553,36 @@ export class SubagentSupervisor extends EventEmitter {
    * Registers a dynamic custom subagent template.
    */
   async defineSubagent(params: DefineSubagentParams): Promise<DefineSubagentResult> {
+    await this.requireMutationAuthorization("define", { request: params, metadata: { name: params.name } });
     return this.registry.registerTemplate(params);
+  }
+
+  private async requireMutationAuthorization(
+    operation: SubagentMutationOperation,
+    input: { actorId?: string; targetId?: string; request: unknown; metadata?: Record<string, string | number | boolean> },
+  ): Promise<void> {
+    if (!(await this.isMutationAuthorized(operation, input))) {
+      throw new Error("Subagent mutation denied");
+    }
+  }
+
+  private async isMutationAuthorized(
+    operation: SubagentMutationOperation,
+    input: { actorId?: string; targetId?: string; request: unknown; metadata?: Record<string, string | number | boolean> },
+  ): Promise<boolean> {
+    if (!this.enforceMutationAuthorization) return true;
+    const context: SubagentMutationAuthorizationContext = Object.freeze({
+      operation,
+      ...(safeSubagentId(input.actorId) ? { actorId: safeSubagentId(input.actorId) } : {}),
+      ...(safeSubagentId(input.targetId) ? { targetId: safeSubagentId(input.targetId) } : {}),
+      requestDigest: digestArguments(input.request),
+      metadata: Object.freeze(input.metadata ?? {}),
+    });
+    try {
+      return this.authorizeMutation ? Boolean(await this.authorizeMutation(context)) : false;
+    } catch {
+      return false;
+    }
   }
 
   /**

@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   NanoForgeClient,
   AgentSession,
+  ApprovalDeniedError,
   SDK_VERSION,
   AuthenticationError,
   ProtocolError,
@@ -280,6 +281,85 @@ describe("@nanoforge/sdk", () => {
       });
     });
 
+    it("surfaces a capability approval without automatically approving a gated mutation", async () => {
+      await client.connect();
+      const approvalListener = vi.fn();
+      client.on("capability_approval_required", approvalListener);
+
+      const writePromise = client.writeFile("note.txt", "after");
+      await new Promise((r) => setTimeout(r, 10));
+      const writeRequest = JSON.parse(mockWs.sent.at(-1)!);
+
+      mockWs.simulateMessage(capabilityApprovalFor(writeRequest.requestId));
+
+      const [request] = client.getPendingCapabilityApprovals();
+      expect(request).toMatchObject({
+        requestId: writeRequest.requestId,
+        toolId: "workspace.writeFile",
+        scope: "write",
+      });
+      expect(client.getPendingCapabilityApproval(writeRequest.requestId)).toBe(request);
+      expect(approvalListener).toHaveBeenCalledWith(request);
+      expect(mockWs.sent).toHaveLength(1);
+
+      await client.approveCapability(request, "Reviewed exact write");
+      expect(JSON.parse(mockWs.sent.at(-1)!)).toEqual({
+        type: "capability.approval",
+        requestId: writeRequest.requestId,
+        approved: true,
+        reason: "Reviewed exact write",
+      });
+      await expect(client.approveCapability(request)).rejects.toBeInstanceOf(ProtocolError);
+      expect(mockWs.sent).toHaveLength(2);
+
+      mockWs.simulateMessage({
+        type: "capability.result",
+        requestId: writeRequest.requestId,
+        ok: true,
+        at: new Date().toISOString(),
+      });
+      expect(client.getPendingCapabilityApproval(writeRequest.requestId)).toBeUndefined();
+
+      mockWs.simulateMessage({
+        type: "workspace.writeFile.result",
+        requestId: writeRequest.requestId,
+        success: true,
+      });
+      await expect(writePromise).resolves.toBe(true);
+    });
+
+    it("refuses altered or denied capability approvals without resolving the mutation", async () => {
+      await client.connect();
+      const writePromise = client.writeFile("note.txt", "denied");
+      await new Promise((r) => setTimeout(r, 10));
+      const writeRequest = JSON.parse(mockWs.sent.at(-1)!);
+
+      mockWs.simulateMessage(capabilityApprovalFor(writeRequest.requestId));
+      const request = client.getPendingCapabilityApproval(writeRequest.requestId)!;
+
+      await expect(client.approveCapability({ ...request, argumentsDigest: "sha256:altered" }))
+        .rejects.toBeInstanceOf(ProtocolError);
+      expect(mockWs.sent).toHaveLength(1);
+
+      await client.denyCapability(request, "User rejected this exact mutation");
+      expect(JSON.parse(mockWs.sent.at(-1)!)).toEqual({
+        type: "capability.approval",
+        requestId: writeRequest.requestId,
+        approved: false,
+        reason: "User rejected this exact mutation",
+      });
+
+      mockWs.simulateMessage({
+        type: "capability.result",
+        requestId: writeRequest.requestId,
+        ok: false,
+        errorCode: "denied",
+        errorMessage: "Capability approval denied",
+        at: new Date().toISOString(),
+      });
+      await expect(writePromise).rejects.toBeInstanceOf(ApprovalDeniedError);
+    });
+
     it("handles workspace readDir and readFile RPC queries", async () => {
       await client.connect();
 
@@ -328,3 +408,23 @@ describe("@nanoforge/sdk", () => {
     });
   });
 });
+
+function capabilityApprovalFor(requestId: string) {
+  return {
+    type: "capability.approval_required",
+    requestId,
+    hostId: "host-test",
+    sessionId: "session-test",
+    workspaceId: "workspace-test",
+    generation: 1,
+    runId: "run-test",
+    stepId: "step-test",
+    toolId: "workspace.writeFile",
+    argumentsDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    scope: "write",
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    uses: "single",
+    reason: "Approval required for workspace.writeFile",
+    at: new Date().toISOString(),
+  };
+}

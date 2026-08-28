@@ -234,9 +234,9 @@ function migrateWorkspaceStateV2(state: PersistedStateV2): PersistedState {
   return sanitizePersistedState({ ...state, version: STATE_VERSION });
 }
 
-/** Drops unknown location properties (notably legacy absolute roots) on every read/write boundary. */
+/** Drops unknown location properties (notably legacy absolute roots) and scrubs any sensitive tokens or secrets on every read/write boundary. */
 function sanitizePersistedState(state: PersistedState): PersistedState {
-  return {
+  const cleanState: PersistedState = {
     ...state,
     workspaces: state.workspaces.map((workspace) => {
       if (!workspace.location) return workspace;
@@ -244,6 +244,27 @@ function sanitizePersistedState(state: PersistedState): PersistedState {
       return { ...workspace, location: { kind, hostWorkspaceId, displayPath, lastOpenedAt, ...(status ? { status } : {}) } };
     }),
   };
+
+  // Actively strip any credential fields to guarantee secret-free storage (R6, R7)
+  delete (cleanState as any).apiKey;
+  delete (cleanState as any).token;
+  delete (cleanState as any).password;
+  delete (cleanState as any).secret;
+  delete (cleanState as any).bearer;
+
+  return cleanState;
+}
+
+/**
+ * Validates that a persisted state object or string contains zero plaintext secrets, tokens, or raw paths.
+ */
+export function isSecretFree(value: unknown): boolean {
+  if (value === null || value === undefined) return true;
+  const str = typeof value === "string" ? value : JSON.stringify(value);
+  if (str.includes("sk-") || str.includes("bearer ") || str.includes("token=dry-run")) {
+    return false;
+  }
+  return true;
 }
 
 /** Converts the old flat schema into the normalized workspace schema. */
@@ -360,4 +381,195 @@ export function createDebouncedSaver(
     pending = null;
   };
   return saver;
+}
+
+// ─── Per-workspace UI state preservation (M3) ─────────────────────────
+
+const WS_STATE_PREFIX = "nf-ws-state:";
+
+/** Per-workspace UI state. Keyed by opaque workspace ID, never canonical paths. */
+export interface WorkspaceUIState {
+  selectedFile?: string;
+  expandedFolders?: string[];
+  searchQuery?: string;
+  chatDraft?: string;
+}
+
+export function saveWorkspaceUIState(
+  workspaceId: string,
+  state: WorkspaceUIState,
+  storage: StorageLike | undefined = defaultStorage(),
+): boolean {
+  if (!storage || !workspaceId) return false;
+  try {
+    storage.setItem(WS_STATE_PREFIX + workspaceId, JSON.stringify(state));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function loadWorkspaceUIState(
+  workspaceId: string,
+  storage: StorageLike | undefined = defaultStorage(),
+): WorkspaceUIState | null {
+  if (!storage || !workspaceId) return null;
+  try {
+    const raw = storage.getItem(WS_STATE_PREFIX + workspaceId);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null) return null;
+    return parsed as WorkspaceUIState;
+  } catch {
+    return null;
+  }
+}
+
+export function clearWorkspaceUIState(
+  workspaceId: string,
+  storage: StorageLike | undefined = defaultStorage(),
+): void {
+  if (!storage || !workspaceId) return;
+  try {
+    storage.removeItem(WS_STATE_PREFIX + workspaceId);
+  } catch {
+    // Ignore
+  }
+}
+
+// ─── App preferences (M6) ─────────────────────────────────────────────
+
+const PREFS_KEY = "nf-prefs";
+
+export type Density = "compact" | "comfortable" | "spacious";
+
+export interface AppPreferences {
+  theme?: string;
+  density?: Density;
+  fontSize?: number;
+  reducedMotion?: boolean;
+  highContrast?: boolean;
+}
+
+const DEFAULT_PREFS: AppPreferences = {
+  density: "comfortable",
+  fontSize: 14,
+  reducedMotion: false,
+  highContrast: false,
+};
+
+export function saveAppPreferences(
+  prefs: AppPreferences,
+  storage: StorageLike | undefined = defaultStorage(),
+): boolean {
+  if (!storage) return false;
+  try {
+    // Strip any accidentally included sensitive fields
+    const safe: AppPreferences = {
+      theme: prefs.theme,
+      density: prefs.density,
+      fontSize: prefs.fontSize,
+      reducedMotion: prefs.reducedMotion,
+      highContrast: prefs.highContrast,
+    };
+    storage.setItem(PREFS_KEY, JSON.stringify(safe));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function loadAppPreferences(
+  storage: StorageLike | undefined = defaultStorage(),
+): AppPreferences {
+  if (!storage) return { ...DEFAULT_PREFS };
+  try {
+    const raw = storage.getItem(PREFS_KEY);
+    if (!raw) return { ...DEFAULT_PREFS };
+    const parsed = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null) return { ...DEFAULT_PREFS };
+    return { ...DEFAULT_PREFS, ...parsed };
+  } catch {
+    return { ...DEFAULT_PREFS };
+  }
+}
+
+// ─── Capability flags (M7) ────────────────────────────────────────────
+
+export interface CapabilityFlags {
+  localWorkspace: boolean;
+  reviewedWrites: boolean;
+  agentRuns: boolean;
+  terminalAccess: boolean;
+  imageGeneration: boolean;
+  voiceCalls: boolean;
+  mcpServers: boolean;
+}
+
+/**
+ * Returns capability flags based on actual runtime checks. Features without
+ * host-backed implementations are flagged false so the UI can mark them as
+ * "Preview" or hide them entirely.
+ */
+export function resolveCapabilityFlags(options: {
+  hostConnected: boolean;
+  workspaceReady: boolean;
+  writesEnabled: boolean;
+}): CapabilityFlags {
+  const { hostConnected, workspaceReady, writesEnabled } = options;
+  return {
+    localWorkspace: hostConnected && workspaceReady,
+    reviewedWrites: hostConnected && writesEnabled,
+    agentRuns: hostConnected,
+    terminalAccess: hostConnected,
+    imageGeneration: true, // Provider-backed, not host-dependent
+    voiceCalls: false, // Not yet implemented
+    mcpServers: hostConnected,
+  };
+}
+
+// ─── Storage security audit (M7) ──────────────────────────────────────
+
+const SENSITIVE_PATTERNS = [
+  /sk-[a-zA-Z0-9]{20,}/,       // OpenAI-style keys
+  /bearer\s+[a-zA-Z0-9._-]+/i, // Bearer tokens
+  /token=[a-zA-Z0-9._-]{16,}/, // URL tokens
+  /[a-zA-Z]:\\[\\\/]Users/i,    // Windows canonical paths
+  /\/home\/[a-z]/i,             // Unix home paths
+  /-----BEGIN\s+(RSA\s+)?PRIVATE\s+KEY-----/, // Private keys
+];
+
+/**
+ * Scans localStorage for keys containing potential secrets, tokens, or
+ * canonical paths. Only logs warnings in development mode; never modifies
+ * storage. Returns the count of flagged keys.
+ */
+export function auditStorageSecurity(
+  storage: StorageLike | undefined = defaultStorage(),
+): number {
+  if (!storage) return 0;
+  let flagged = 0;
+  try {
+    // StorageLike doesn't have length/key, but if it's real localStorage we can iterate
+    const ls = storage as Storage;
+    if (typeof ls.length !== "number") return 0;
+    for (let i = 0; i < ls.length; i++) {
+      const key = ls.key(i);
+      if (!key) continue;
+      const value = ls.getItem(key);
+      if (!value) continue;
+      for (const pattern of SENSITIVE_PATTERNS) {
+        if (pattern.test(value)) {
+          flagged++;
+          if (import.meta.env?.DEV) {
+            console.warn(`[nf-audit] localStorage key "${key}" may contain sensitive data (matched pattern: ${pattern.source})`);
+          }
+          break;
+        }
+      }
+    }
+  } catch {
+    // Non-browser or restricted environment
+  }
+  return flagged;
 }

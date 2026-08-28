@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { execa } from 'execa';
-import { resolveWithinWorkspace } from '../policy/policy.js';
+import { isWithinWorkspace, resolveWithinWorkspace } from '../policy/policy.js';
 import type { DirEntry, FileStat, SearchMatch, GitFileStatus } from '../protocol.js';
 import { isSensitiveWorkspacePath, SENSITIVE_WORKSPACE_GLOB_PATTERNS } from './sensitivePath.js';
 
@@ -26,6 +26,7 @@ export class WorkspaceFileError extends Error {
       | 'file_too_large'
       | 'binary_file'
       | 'write_conflict'
+      | 'write_not_approved'
       | 'invalid_search'
       | 'io_error',
     message: string,
@@ -38,6 +39,36 @@ export class WorkspaceFileError extends Error {
 const sha256 = (content: string | Buffer): string =>
   createHash('sha256').update(content).digest('hex');
 
+type WorkspaceFilesystemOperation =
+  | 'readDir'
+  | 'realpath'
+  | 'stat'
+  | 'readFile'
+  | 'mkdir'
+  | 'writeFile'
+  | 'rename'
+  | 'unlink'
+  | 'search'
+  | 'gitStatus';
+
+let beforeWorkspaceFilesystemOperationForTest:
+  | ((operation: WorkspaceFilesystemOperation, fullPath: string) => void | Promise<void>)
+  | undefined;
+
+/** Deterministic operation-boundary seam for confinement regression tests. */
+export function setWorkspaceFilesystemOperationHookForTest(
+  hook?: (operation: WorkspaceFilesystemOperation, fullPath: string) => void | Promise<void>,
+): void {
+  beforeWorkspaceFilesystemOperationForTest = hook;
+}
+
+const beforeWorkspaceFilesystemOperation = async (
+  operation: WorkspaceFilesystemOperation,
+  fullPath: string,
+): Promise<void> => {
+  await beforeWorkspaceFilesystemOperationForTest?.(operation, fullPath);
+};
+
 const confinedPath = (workspaceRoot: string, relativePath: string): string => {
   const fullPath = resolveWithinWorkspace(workspaceRoot, relativePath);
   if (!fullPath) {
@@ -49,8 +80,20 @@ const confinedPath = (workspaceRoot: string, relativePath: string): string => {
   return fullPath;
 };
 
+const revalidateConfinedPath = async (
+  workspaceRoot: string,
+  fullPath: string,
+  operation: WorkspaceFilesystemOperation,
+): Promise<void> => {
+  await beforeWorkspaceFilesystemOperation(operation, fullPath);
+  if (!isWithinWorkspace(fullPath, workspaceRoot)) {
+    throw new WorkspaceFileError('path_outside_workspace', 'Path is outside workspace');
+  }
+};
+
 export async function handleReadDir(workspaceRoot: string, relativePath: string): Promise<DirEntry[]> {
   const fullPath = confinedPath(workspaceRoot, relativePath);
+  await revalidateConfinedPath(workspaceRoot, fullPath, 'readDir');
   const entries = await fs.readdir(fullPath, { withFileTypes: true });
   
   const result: DirEntry[] = [];
@@ -63,8 +106,10 @@ export async function handleReadDir(workspaceRoot: string, relativePath: string)
     const entryPath = path.join(fullPath, entry.name);
     let inspectedPath = entryPath;
     try {
+      await revalidateConfinedPath(workspaceRoot, entryPath, 'realpath');
       inspectedPath = await fs.realpath(entryPath);
-    } catch {
+    } catch (error) {
+      if (error instanceof WorkspaceFileError) throw error;
       // A concurrently removed entry is still filtered by its lexical path.
     }
     if (isSensitiveWorkspacePath(path.relative(path.resolve(workspaceRoot), inspectedPath))) {
@@ -74,12 +119,14 @@ export async function handleReadDir(workspaceRoot: string, relativePath: string)
     let modified: string | undefined;
 
     try {
+      await revalidateConfinedPath(workspaceRoot, entryPath, 'stat');
       const stat = await fs.stat(entryPath);
       if (entry.isFile()) {
         size = stat.size;
       }
       modified = stat.mtime.toISOString();
-    } catch {
+    } catch (error) {
+      if (error instanceof WorkspaceFileError) throw error;
       // Ignore stat errors for unreadable files
     }
 
@@ -100,6 +147,7 @@ export async function handleReadDir(workspaceRoot: string, relativePath: string)
 
 export async function handleReadFile(workspaceRoot: string, relativePath: string): Promise<{ content: string; language: string; size: number; modified: string; sha256: string }> {
   const fullPath = confinedPath(workspaceRoot, relativePath);
+  await revalidateConfinedPath(workspaceRoot, fullPath, 'stat');
   const stat = await fs.stat(fullPath);
   
   if (stat.size > MAX_WORKSPACE_FILE_BYTES) {
@@ -109,6 +157,7 @@ export async function handleReadFile(workspaceRoot: string, relativePath: string
     throw new WorkspaceFileError('io_error', 'Path is not a file');
   }
 
+  await revalidateConfinedPath(workspaceRoot, fullPath, 'readFile');
   const content = await fs.readFile(fullPath, 'utf8');
   const ext = path.extname(fullPath).toLowerCase();
   const language = EXT_LANG_MAP[ext] || 'plaintext';
@@ -131,7 +180,24 @@ export interface ReviewedWriteOptions {
   expectedSha256?: string;
   expectedModified?: string;
   maxBytes?: number;
+  /** Require a host-owned capability decision before writing. */
+  authorizationRequired?: boolean;
+  /** Receives only non-secret, workspace-relative write metadata. */
+  authorize?: ReviewedWriteAuthorizer;
 }
+
+export interface ReviewedWriteAuthorizationContext {
+  operation: 'workspace.write';
+  workspaceRelativePath: string;
+  contentSha256: string;
+  contentSize: number;
+  expectedSha256?: string;
+  expectedModified?: string;
+}
+
+export type ReviewedWriteAuthorizer = (
+  context: ReviewedWriteAuthorizationContext,
+) => boolean | Promise<boolean>;
 
 export async function handleWriteFile(
   workspaceRoot: string,
@@ -145,10 +211,38 @@ export async function handleWriteFile(
     throw new WorkspaceFileError('file_too_large', 'File too large (exceeds 1MB write limit)');
   }
 
+  if (options.authorizationRequired && !options.authorize) {
+    throw new WorkspaceFileError('write_not_approved', 'Write authorization is required');
+  }
+  if (options.authorize) {
+    const workspaceRelativePath = path
+      .relative(path.resolve(workspaceRoot), fullPath)
+      .split(path.sep)
+      .join('/');
+    let authorized = false;
+    try {
+      authorized = await options.authorize({
+        operation: 'workspace.write',
+        workspaceRelativePath,
+        contentSha256: sha256(content),
+        contentSize: byteSize,
+        expectedSha256: options.expectedSha256,
+        expectedModified: options.expectedModified,
+      });
+    } catch {
+      authorized = false;
+    }
+    if (!authorized) {
+      throw new WorkspaceFileError('write_not_approved', 'Write authorization denied');
+    }
+  }
+
   let existing: { content: Buffer; modified: string; mode: number } | undefined;
   try {
+    await revalidateConfinedPath(workspaceRoot, fullPath, 'stat');
     const stat = await fs.stat(fullPath);
     if (!stat.isFile()) throw new WorkspaceFileError('io_error', 'Write target is not a file');
+    await revalidateConfinedPath(workspaceRoot, fullPath, 'readFile');
     existing = {
       content: await fs.readFile(fullPath),
       modified: stat.mtime.toISOString(),
@@ -170,16 +264,27 @@ export async function handleWriteFile(
     }
   }
 
-  await fs.mkdir(path.dirname(fullPath), { recursive: true });
-  const tempPath = path.join(path.dirname(fullPath), `.${path.basename(fullPath)}.${randomUUID()}.tmp`);
+  const parentPath = path.dirname(fullPath);
+  await revalidateConfinedPath(workspaceRoot, parentPath, 'mkdir');
+  await fs.mkdir(parentPath, { recursive: true });
+  const tempPath = path.join(parentPath, `.${path.basename(fullPath)}.${randomUUID()}.tmp`);
   try {
+    await revalidateConfinedPath(workspaceRoot, tempPath, 'writeFile');
     await fs.writeFile(tempPath, content, { encoding: 'utf8', flag: 'wx', mode: existing?.mode });
+    await revalidateConfinedPath(workspaceRoot, tempPath, 'rename');
+    await revalidateConfinedPath(workspaceRoot, fullPath, 'rename');
     await fs.rename(tempPath, fullPath);
   } catch (error) {
-    await fs.unlink(tempPath).catch(() => undefined);
+    try {
+      await revalidateConfinedPath(workspaceRoot, tempPath, 'unlink');
+      await fs.unlink(tempPath);
+    } catch {
+      // A concurrently swapped path is never cleaned up outside the workspace.
+    }
     if (error instanceof WorkspaceFileError) throw error;
     throw new WorkspaceFileError('io_error', error instanceof Error ? error.message : String(error));
   }
+  await revalidateConfinedPath(workspaceRoot, fullPath, 'stat');
   const stat = await fs.stat(fullPath);
   return {
     success: true,
@@ -191,6 +296,7 @@ export async function handleWriteFile(
 
 export async function handleStat(workspaceRoot: string, relativePath: string): Promise<FileStat> {
   const fullPath = confinedPath(workspaceRoot, relativePath);
+  await revalidateConfinedPath(workspaceRoot, fullPath, 'stat');
   const stat = await fs.stat(fullPath);
   return {
     size: stat.size,
@@ -240,8 +346,10 @@ export async function handleSearch(workspaceRoot: string, query: string, options
 
   let result;
   try {
+    await revalidateConfinedPath(workspaceRoot, workspaceRoot, 'search');
     result = await execa("rg", args, { reject: false });
   } catch (err) {
+    if (err instanceof WorkspaceFileError) throw err;
     throw new WorkspaceFileError("io_error", `Search failed to execute: ${err instanceof Error ? err.message : String(err)}`);
   }
 
@@ -289,6 +397,7 @@ export async function handleSearch(workspaceRoot: string, query: string, options
 
 export async function handleGitStatus(workspaceRoot: string): Promise<GitFileStatus[]> {
   try {
+    await revalidateConfinedPath(workspaceRoot, workspaceRoot, 'gitStatus');
     const { stdout } = await execa('git', ['-C', workspaceRoot, 'status', '--porcelain'], { reject: false });
     if (!stdout) return [];
 
@@ -312,7 +421,8 @@ export async function handleGitStatus(workspaceRoot: string): Promise<GitFileSta
     }
 
     return statuses;
-  } catch {
+  } catch (error) {
+    if (error instanceof WorkspaceFileError) throw error;
     return [];
   }
 }

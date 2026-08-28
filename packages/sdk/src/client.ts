@@ -10,6 +10,8 @@ import {
 import { EventStreamQueue, TypedEventEmitter } from "./events";
 import { AgentSession } from "./session";
 import type {
+  CapabilityApprovalRequest,
+  CapabilityApprovalResolution,
   GitFileStatus,
   NanoForgeClientOptions,
   RunEvent,
@@ -36,6 +38,8 @@ export class NanoForgeClient extends TypedEventEmitter {
   private _connected = false;
   private _sessions = new Map<string, AgentSession>();
   private _pendingRpcs = new Map<string, PendingRpc>();
+  private _pendingCapabilityApprovals = new Map<string, CapabilityApprovalRequest>();
+  private _resolvingCapabilityApprovals = new Set<string>();
   private _activeStreams = new Map<string, EventStreamQueue<RunEvent>>();
   private _pendingStreamPlans: Array<{ planId: string; queue: EventStreamQueue<RunEvent> }> = [];
   private _reconnectAttempts = 0;
@@ -148,6 +152,8 @@ export class NanoForgeClient extends TypedEventEmitter {
             rpc.reject(new ConnectionError("Connection closed while waiting for RPC response"));
           }
           this._pendingRpcs.clear();
+          this._pendingCapabilityApprovals.clear();
+          this._resolvingCapabilityApprovals.clear();
 
           for (const [runId, stream] of this._activeStreams.entries()) {
             stream.fail(new ConnectionError("Connection closed during run stream"));
@@ -286,6 +292,72 @@ export class NanoForgeClient extends TypedEventEmitter {
       requestId,
       reason,
     });
+  }
+
+  /**
+   * Returns a snapshot of capability approvals that the host is currently
+   * waiting for this client to resolve. Inspect one of these requests before
+   * making an explicit approval decision.
+   */
+  public getPendingCapabilityApprovals(): readonly CapabilityApprovalRequest[] {
+    return Array.from(this._pendingCapabilityApprovals.values());
+  }
+
+  /**
+   * Retrieves one observed, still-pending capability approval by request ID.
+   */
+  public getPendingCapabilityApproval(requestId: string): CapabilityApprovalRequest | undefined {
+    return this._pendingCapabilityApprovals.get(requestId);
+  }
+
+  /**
+   * Resolves an exact capability approval request observed from the host.
+   *
+   * This method never grants implicitly: callers must pass the complete
+   * request they inspected and an explicit decision. A stale or altered
+   * request is rejected locally and no frame is sent to the host.
+   */
+  public async resolveCapabilityApproval(
+    request: CapabilityApprovalRequest,
+    resolution: CapabilityApprovalResolution,
+  ): Promise<void> {
+    const pending = this._pendingCapabilityApprovals.get(request.requestId);
+    if (
+      !pending ||
+      this._resolvingCapabilityApprovals.has(request.requestId) ||
+      !sameCapabilityApprovalRequest(pending, request)
+    ) {
+      throw new ProtocolError("Capability approval request is unknown, expired, or no longer exact-bound");
+    }
+
+    this._resolvingCapabilityApprovals.add(request.requestId);
+    try {
+      await this._sendRaw({
+        type: "capability.approval",
+        requestId: request.requestId,
+        approved: resolution.approved,
+        ...(resolution.reason === undefined ? {} : { reason: resolution.reason }),
+      });
+    } catch (error) {
+      this._resolvingCapabilityApprovals.delete(request.requestId);
+      throw error;
+    }
+  }
+
+  /** Explicit convenience wrapper for approving an observed request. */
+  public async approveCapability(
+    request: CapabilityApprovalRequest,
+    reason?: string,
+  ): Promise<void> {
+    await this.resolveCapabilityApproval(request, { approved: true, reason });
+  }
+
+  /** Explicit convenience wrapper for denying an observed request. */
+  public async denyCapability(
+    request: CapabilityApprovalRequest,
+    reason?: string,
+  ): Promise<void> {
+    await this.resolveCapabilityApproval(request, { approved: false, reason });
   }
 
   /**
@@ -488,6 +560,31 @@ export class NanoForgeClient extends TypedEventEmitter {
 
     if (!msg || typeof msg !== "object") return;
 
+    // Capability approvals are not RPC results. A mutating RPC stays pending
+    // until its operation result arrives after the caller resolves this exact
+    // request through resolveCapabilityApproval().
+    if (msg.type === "capability.approval_required" && isCapabilityApprovalRequest(msg)) {
+      this._pendingCapabilityApprovals.set(msg.requestId, msg);
+      this.emit("capability.approval_required", msg);
+      this.emit("capability_approval_required", msg);
+      this.emit("message", msg);
+      return;
+    }
+
+    if (msg.type === "capability.result") {
+      this._pendingCapabilityApprovals.delete(msg.requestId);
+      this._resolvingCapabilityApprovals.delete(msg.requestId);
+      const rpc = msg.requestId ? this._pendingRpcs.get(msg.requestId) : undefined;
+      if (rpc && msg.ok === false) {
+        clearTimeout(rpc.timer);
+        this._pendingRpcs.delete(msg.requestId);
+        rpc.reject(new ApprovalDeniedError(msg.errorMessage || "Capability approval was denied", msg.errorCode));
+      }
+      this.emit("capability.result", msg);
+      this.emit("message", msg);
+      return;
+    }
+
     // Handle RPC response frames
     if (msg.requestId && this._pendingRpcs.has(msg.requestId)) {
       const rpc = this._pendingRpcs.get(msg.requestId)!;
@@ -579,4 +676,46 @@ export class NanoForgeClient extends TypedEventEmitter {
       } as ToolCallRequest);
     }
   }
+}
+
+function isCapabilityApprovalRequest(value: any): value is CapabilityApprovalRequest {
+  return (
+    value &&
+    typeof value.requestId === "string" &&
+    typeof value.hostId === "string" &&
+    typeof value.sessionId === "string" &&
+    typeof value.workspaceId === "string" &&
+    typeof value.generation === "number" &&
+    typeof value.runId === "string" &&
+    typeof value.stepId === "string" &&
+    typeof value.toolId === "string" &&
+    typeof value.argumentsDigest === "string" &&
+    typeof value.scope === "string" &&
+    typeof value.expiresAt === "string" &&
+    typeof value.uses === "string" &&
+    typeof value.reason === "string" &&
+    typeof value.at === "string"
+  );
+}
+
+function sameCapabilityApprovalRequest(
+  expected: CapabilityApprovalRequest,
+  actual: CapabilityApprovalRequest,
+): boolean {
+  return (
+    expected.requestId === actual.requestId &&
+    expected.hostId === actual.hostId &&
+    expected.sessionId === actual.sessionId &&
+    expected.workspaceId === actual.workspaceId &&
+    expected.generation === actual.generation &&
+    expected.runId === actual.runId &&
+    expected.stepId === actual.stepId &&
+    expected.toolId === actual.toolId &&
+    expected.argumentsDigest === actual.argumentsDigest &&
+    expected.scope === actual.scope &&
+    expected.expiresAt === actual.expiresAt &&
+    expected.uses === actual.uses &&
+    expected.reason === actual.reason &&
+    expected.at === actual.at
+  );
 }

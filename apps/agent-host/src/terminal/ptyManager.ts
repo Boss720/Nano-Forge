@@ -48,6 +48,13 @@ export interface PtySessionInfo {
   signal?: string | null;
 }
 
+/**
+ * Opaque host-issued identity for the socket/session that created a terminal.
+ * This never comes from a terminal wire frame and is intentionally omitted
+ * from public terminal metadata.
+ */
+export type PtySessionOwner = string;
+
 export interface PtyManagerOptions {
   workspaceRoot?: string;
   envAllowlist?: readonly string[];
@@ -121,6 +128,7 @@ export class CircularScrollbackBuffer {
 class InternalPtySession {
   readonly id: string;
   readonly sessionId?: string;
+  readonly ownerId?: PtySessionOwner;
   title: string;
   pid: number;
   cols: number;
@@ -145,6 +153,7 @@ class InternalPtySession {
   constructor(opts: {
     id: string;
     sessionId?: string;
+    ownerId?: PtySessionOwner;
     title: string;
     pid: number;
     cols: number;
@@ -155,6 +164,7 @@ class InternalPtySession {
   }) {
     this.id = opts.id;
     this.sessionId = opts.sessionId;
+    this.ownerId = opts.ownerId;
     this.title = opts.title;
     this.pid = opts.pid;
     this.cols = opts.cols;
@@ -393,12 +403,16 @@ export class PtyManager extends EventEmitter {
    */
   async createSession(
     spec: Partial<TerminalCreateMessage> = {},
+    ownerId?: PtySessionOwner,
   ): Promise<PtySessionInfo> {
     if (this.disposed) {
       throw new Error("PtyManager is disposed");
     }
 
     const id = spec.id ?? randomUUID();
+    if (ownerId !== undefined && (ownerId.length === 0 || ownerId.length > 256)) {
+      throw new TypeError("terminal owner must be a non-empty opaque identifier up to 256 characters");
+    }
     const cols = spec.cols ?? this.defaultCols;
     const rows = spec.rows ?? this.defaultRows;
     const title = spec.title ?? `terminal-${this.sessions.size + 1}`;
@@ -424,6 +438,7 @@ export class PtyManager extends EventEmitter {
     const session = new InternalPtySession({
       id,
       sessionId: spec.sessionId,
+      ownerId,
       title,
       pid: 0,
       cols,
@@ -551,8 +566,8 @@ export class PtyManager extends EventEmitter {
   /**
    * Write keystroke or raw input data to a terminal's stdin stream.
    */
-  writeInput(id: string, data: string): boolean {
-    const session = this.sessions.get(id);
+  writeInput(id: string, data: string, ownerId?: PtySessionOwner): boolean {
+    const session = this.getOwnedSession(id, ownerId);
     if (!session) return false;
     return session.write(data);
   }
@@ -560,8 +575,8 @@ export class PtyManager extends EventEmitter {
   /**
    * Resize terminal viewport dimensions.
    */
-  resize(id: string, cols: number, rows: number): boolean {
-    const session = this.sessions.get(id);
+  resize(id: string, cols: number, rows: number, ownerId?: PtySessionOwner): boolean {
+    const session = this.getOwnedSession(id, ownerId);
     if (!session) return false;
     return session.resize(cols, rows);
   }
@@ -569,8 +584,8 @@ export class PtyManager extends EventEmitter {
   /**
    * Terminate a terminal process and its whole process tree.
    */
-  async kill(id: string, signal?: string): Promise<boolean> {
-    const session = this.sessions.get(id);
+  async kill(id: string, signal?: string, ownerId?: PtySessionOwner): Promise<boolean> {
+    const session = this.getOwnedSession(id, ownerId);
     if (!session) return false;
     await session.kill(signal);
     return true;
@@ -579,33 +594,59 @@ export class PtyManager extends EventEmitter {
   /**
    * Retrieve retained scrollback buffer for a session.
    */
-  getScrollback(id: string): string | undefined {
-    return this.sessions.get(id)?.buffer.toString();
+  getScrollback(id: string, ownerId?: PtySessionOwner): string | undefined {
+    return this.getOwnedSession(id, ownerId)?.buffer.toString();
   }
 
   /**
    * Get metadata info for an active or exited session.
    */
-  getSession(id: string): PtySessionInfo | undefined {
-    return this.sessions.get(id)?.getInfo();
+  getSession(id: string, ownerId?: PtySessionOwner): PtySessionInfo | undefined {
+    return this.getOwnedSession(id, ownerId)?.getInfo();
   }
 
-  /**
-   * List all terminal sessions.
-   */
-  listSessions(): PtySessionInfo[] {
-    return Array.from(this.sessions.values()).map((s) => s.getInfo());
+  /** List terminal sessions owned by one owner (or legacy unowned sessions). */
+  listSessions(ownerId?: PtySessionOwner): PtySessionInfo[] {
+    return Array.from(this.sessions.values())
+      .filter((session) => session.ownerId === ownerId)
+      .map((session) => session.getInfo());
   }
 
   /**
    * Remove and terminate a specific session.
    */
-  async closeSession(id: string): Promise<void> {
-    const session = this.sessions.get(id);
+  async closeSession(id: string, ownerId?: PtySessionOwner): Promise<void> {
+    const session = this.getOwnedSession(id, ownerId);
     if (session) {
       await session.kill();
       this.sessions.delete(id);
     }
+  }
+
+  /**
+   * Close only sessions created by one owner without disposing the shared manager.
+   * A host session's disconnect handler can call this safely while terminals from
+   * other authenticated sessions remain active.
+   */
+  async closeSessionsForOwner(ownerId: PtySessionOwner): Promise<number> {
+    if (ownerId.length === 0 || ownerId.length > 256) {
+      throw new TypeError("terminal owner must be a non-empty opaque identifier up to 256 characters");
+    }
+    const ownedIds = Array.from(this.sessions.values())
+      .filter((session) => session.ownerId === ownerId)
+      .map((session) => session.id);
+    for (const id of ownedIds) {
+      await this.closeSession(id, ownerId);
+    }
+    return ownedIds.length;
+  }
+
+  private getOwnedSession(
+    id: string,
+    ownerId?: PtySessionOwner,
+  ): InternalPtySession | undefined {
+    const session = this.sessions.get(id);
+    return session?.ownerId === ownerId ? session : undefined;
   }
 
   /**

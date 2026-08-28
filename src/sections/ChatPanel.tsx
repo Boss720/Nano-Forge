@@ -1,14 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import {
-  Ban, Bot, Brain, Check, ChevronDown, ChevronRight, CircleDollarSign, Clock, FileEdit, FileSearch,
-  SendHorizonal, ShieldAlert, Square, TerminalSquare, X,
+  Bot, Brain, Check, ChevronDown, ChevronRight, CircleDollarSign, FileEdit, FileSearch,
+  FolderOpen, Play, SendHorizonal, ShieldAlert, ShieldCheck, Square, TerminalSquare, X,
 } from "lucide-react";
-import type { ChatSendInput, GenerationPrefs, Message, NanoModel, Patch, ToolCall, ToolRun, ToolRunState, VirtualFile, WorkspaceAttachmentResolver } from "@/types";
+import type { ChatSendInput, GenerationPrefs, Message, NanoModel, Patch, ToolCall, ToolRun, VirtualFile, WorkspaceAttachmentResolver } from "@/types";
 import type { CommandResultFrame, SlashCommandWire } from "@protocol/commands";
 import { AGENT_SYSTEM_PROMPT } from "@/lib/catalog";
 import { estimateTokens } from "@/lib/context";
 import { RichText } from "@/components/RichText";
 import { ChatComposer } from "@/sections/ChatComposer";
+import { formatErrorMessage, getToolRunStatusMeta } from "@/lib/statusFormatter";
 
 export interface ChatPanelProps {
   messages: Message[];
@@ -20,6 +21,7 @@ export interface ChatPanelProps {
   onPatchDecision: (messageId: string, decision: "applied" | "rejected") => void;
   genPrefs: GenerationPrefs;
   onGenPrefsChange: (prefs: GenerationPrefs) => void;
+  onOpenFolder?: () => void;
   /**
    * Module 2 Task 7 (optional): supervised terminal jobs reported by the
    * local agent host. Absent/empty when no host session exists — the panel
@@ -57,6 +59,7 @@ export function ChatPanel({
   onPatchDecision,
   genPrefs,
   onGenPrefsChange,
+  onOpenFolder,
   toolRuns,
   onToolStop,
   onTriggerPlan,
@@ -94,10 +97,15 @@ export function ChatPanel({
     try {
       const result = await onExecuteCommand(wire);
       if (result) {
-        setCommandStatus({ text: result.success ? result.output ?? `${result.command} completed.` : result.error ?? `${result.command} failed.`, success: result.success });
+        setCommandStatus({
+          text: result.success
+            ? result.output ?? `${result.command} completed.`
+            : formatErrorMessage(result.error ?? `${result.command} failed.`),
+          success: result.success,
+        });
       }
     } catch (error) {
-      setCommandStatus({ text: error instanceof Error ? error.message : String(error), success: false });
+      setCommandStatus({ text: formatErrorMessage(error), success: false });
     }
   };
 
@@ -105,7 +113,13 @@ export function ChatPanel({
     <section className="flex min-w-0 flex-1 flex-col bg-background">
       {/* transcript */}
       <div ref={scrollRef} className="scrollbar-thin flex-1 space-y-5 overflow-y-auto px-5 py-5">
-        {messages.length === 0 && <EmptyState onPick={(t) => onSend(t)} connected={connected} />}
+        {messages.length === 0 && (
+          <EmptyState
+            onPick={(t) => onSend(t)}
+            connected={connected}
+            onOpenFolder={onOpenFolder}
+          />
+        )}
         {messages.map((m) => (
           <MessageView key={m.id} m={m} onPatchDecision={onPatchDecision} />
         ))}
@@ -121,7 +135,11 @@ export function ChatPanel({
       {/* composer with floating caret popover slash engine & @file autocomplete */}
       {commandStatus && (
         <div
-          className={`mx-4 mb-2 rounded border px-3 py-2 font-mono text-[11px] ${commandStatus.success ? "border-primary/30 bg-primary/5 text-primary" : "border-red-500/30 bg-red-500/5 text-red-300"}`}
+          className={`mx-4 mb-2 rounded border px-3 py-2 font-mono text-[11px] ${
+            commandStatus.success
+              ? "border-primary/30 bg-primary/5 text-primary"
+              : "border-red-500/30 bg-red-500/5 text-red-300"
+          }`}
           role="status"
           data-testid="command-status"
         >
@@ -156,28 +174,92 @@ export function ChatPanel({
   );
 }
 
-function EmptyState({ onPick, connected }: { onPick: (t: string) => void; connected: boolean }) {
+function EmptyState({
+  onPick,
+  connected,
+  onOpenFolder,
+}: {
+  onPick: (t: string) => void;
+  connected: boolean;
+  onOpenFolder?: () => void;
+}) {
   const starters = [
     { title: "Add rate limiting to the server", desc: "Watch the full plan → read → edit → verify loop with a reviewable diff." },
     { title: "Document the API in README.md", desc: "Smaller change — the agent scopes it to one file." },
     { title: "Refactor server.ts to use routes", desc: "Live mode: streamed from your nano-gpt key." },
   ];
+
   return (
-    <div className="mx-auto max-w-lg pt-14 text-center">
-      <svg width="40" height="40" viewBox="0 0 24 24" fill="none" className="mx-auto ember-glow rounded-lg" aria-hidden>
-        <path d="M13 2 4.5 13.5H11L9.5 22 19 9.5h-6.5L13 2Z" fill="hsl(32 100% 55%)" stroke="hsl(22 100% 50%)" strokeWidth="1" strokeLinejoin="round" />
-      </svg>
-      <h1 className="mt-4 font-mono text-[15px] font-bold tracking-[0.2em] text-foreground">FORGE A CHANGE</h1>
-      <p className="mt-2 text-[13px] leading-relaxed text-muted-foreground">
-        An agent console that can connect to <span className="text-foreground">NanoGPT's OpenAI-compatible API</span>.
-        {connected ? " Your key is live." : " No key yet — the demo script runs the loop for free."}
-      </p>
-      <div className="mt-6 space-y-2 text-left">
+    <div className="mx-auto max-w-xl pt-8 pb-4 text-center space-y-6 animate-in fade-in duration-200" data-testid="onboarding-hero-card">
+      {/* Brand Icon & Heading */}
+      <div>
+        <svg width="44" height="44" viewBox="0 0 24 24" fill="none" className="mx-auto ember-glow rounded-lg" aria-hidden>
+          <path d="M13 2 4.5 13.5H11L9.5 22 19 9.5h-6.5L13 2Z" fill="hsl(32 100% 55%)" stroke="hsl(22 100% 50%)" strokeWidth="1" strokeLinejoin="round" />
+        </svg>
+        <h1 className="mt-3.5 font-mono text-[16px] font-bold tracking-[0.2em] text-foreground">
+          FORGE A CHANGE
+        </h1>
+        <p className="mt-1.5 text-[13px] leading-relaxed text-muted-foreground">
+          A high-performance local AI agent workbench connected to{" "}
+          <span className="text-foreground font-medium">NanoGPT's OpenAI-compatible API</span>.
+          {connected ? " Your API key is live." : " No key yet — free guided demo scripts run out-of-the-box."}
+        </p>
+      </div>
+
+      {/* Primary Action Buttons: Open Local Folder & Guided Demo */}
+      <div className="flex flex-wrap items-center justify-center gap-3">
+        {onOpenFolder && (
+          <button
+            type="button"
+            onClick={onOpenFolder}
+            className="flex items-center gap-2 rounded-lg bg-primary px-4 py-2.5 font-mono text-xs font-semibold text-primary-foreground shadow-sm transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+            aria-label="Open local folder"
+          >
+            <FolderOpen className="h-4 w-4" />
+            Open local folder
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={() => onPick("Add rate limiting to the server")}
+          className="flex items-center gap-2 rounded-lg border border-border bg-card px-4 py-2.5 font-mono text-xs font-medium text-foreground transition-colors hover:border-primary/60 hover:bg-secondary/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+          aria-label="Use a guided demo"
+        >
+          <Play className="h-4 w-4 text-primary" />
+          Use a guided demo
+        </button>
+      </div>
+
+      {/* Plain-Language Security & Privacy Boundaries (R1, R7) */}
+      <div className="rounded-xl border border-border/80 bg-secondary/20 p-4 text-left space-y-2.5 shadow-inner">
+        <div className="flex items-center gap-2 font-mono text-xs font-semibold text-foreground">
+          <ShieldCheck className="h-4 w-4 text-emerald-400" />
+          <span>Local Security &amp; Privacy Guarantees</span>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 text-[11px] text-muted-foreground">
+          <div className="rounded-md border border-border/40 bg-card/60 p-2.5 space-y-1">
+            <span className="font-semibold font-mono text-foreground block">1. Local-First</span>
+            <p>Execution stays on your machine. No source code leaves your local environment.</p>
+          </div>
+          <div className="rounded-md border border-border/40 bg-card/60 p-2.5 space-y-1">
+            <span className="font-semibold font-mono text-foreground block">2. Reviewed Writes</span>
+            <p>Read-only by default. Any file write requires your explicit review and approval.</p>
+          </div>
+          <div className="rounded-md border border-border/40 bg-card/60 p-2.5 space-y-1">
+            <span className="font-semibold font-mono text-foreground block">3. Secret Protection</span>
+            <p>API keys and tokens stay in-memory. Zero telemetry or plaintext secret storage.</p>
+          </div>
+        </div>
+      </div>
+
+      {/* Starter Prompts */}
+      <div className="space-y-2 text-left">
+        <div className="micro-label px-1">Quick Starters</div>
         {starters.map((s) => (
           <button
             key={s.title}
             onClick={() => onPick(s.title)}
-            className="group w-full rounded-lg border border-border bg-card px-3.5 py-3 transition-colors hover:border-primary/50"
+            className="group w-full rounded-lg border border-border bg-card px-3.5 py-3 transition-colors hover:border-primary/50 text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary"
           >
             <div className="flex items-center gap-2 font-mono text-[12px] text-foreground">
               <SendHorizonal className="h-3 w-3 text-primary" />
@@ -235,7 +317,7 @@ function MessageAttachmentChips({ attachments }: { attachments: NonNullable<Mess
           <span className="truncate">{attachment.relativePath ?? attachment.name}</span>
           <span className="text-primary/65">{attachment.source} · {attachment.status}{attachment.truncated ? " · truncated" : ""}</span>
           {attachment.status === "missing" && <span className="text-amber-300">snapshot unavailable</span>}
-          {attachment.status === "error" && attachment.error && <span className="truncate text-red-300">{attachment.error}</span>}
+          {attachment.status === "error" && attachment.error && <span className="truncate text-red-300">{formatErrorMessage(attachment.error)}</span>}
         </span>
       ))}
     </div>
@@ -291,52 +373,35 @@ function ToolCard({ t }: { t: ToolCall }) {
         <div className="flex-1" />
         {t.durationMs != null && <span className="font-mono text-[10px] text-muted-foreground">{t.durationMs}ms</span>}
         {t.status === "done" ? (
-          <Check className="h-3 w-3 text-emerald-400" />
+          <span className="flex items-center gap-1 text-emerald-400 font-mono text-[10.5px]">
+            <Check className="h-3 w-3" /> done
+          </span>
         ) : t.status === "error" ? (
-          <X className="h-3 w-3 text-red-400" />
+          <span className="flex items-center gap-1 text-red-400 font-mono text-[10.5px]">
+            <X className="h-3 w-3" /> error
+          </span>
         ) : (
-          <span className="h-2 w-2 rounded-full bg-primary pulse-dot" />
+          <span className="flex items-center gap-1 text-primary font-mono text-[10.5px]">
+            <span className="h-2 w-2 rounded-full bg-primary pulse-dot" /> running
+          </span>
         )}
         {open ? <ChevronDown className="h-3 w-3 text-muted-foreground" /> : <ChevronRight className="h-3 w-3 text-muted-foreground" />}
       </button>
-      {open && <div className="border-t border-border px-3 py-2 font-mono text-[11px] leading-relaxed text-muted-foreground">{t.detail}</div>}
+      {open && <div className="border-t border-border px-3 py-2 font-mono text-[11px] leading-relaxed text-muted-foreground">{formatErrorMessage(t.detail)}</div>}
     </div>
   );
 }
 
 /* ------------------------------------------------------------------ */
-/* Module 2 Task 7: supervised terminal tool cards (host-driven)      */
+/* Supervised terminal tool cards (host-driven, multi-modal status)    */
 /* ------------------------------------------------------------------ */
-
-const TOOL_RUN_LABEL: Record<ToolRunState, string> = {
-  queued: "queued",
-  approval_required: "approval required",
-  running: "running",
-  done: "done",
-  error: "error",
-  cancelled: "cancelled",
-};
-
-function ToolRunStatusIcon({ state }: { state: ToolRunState }) {
-  switch (state) {
-    case "queued":
-      return <Clock className="h-3 w-3 text-muted-foreground" />;
-    case "approval_required":
-      return <ShieldAlert className="h-3 w-3 text-amber-400" />;
-    case "running":
-      return <span className="h-2 w-2 rounded-full bg-primary pulse-dot" />;
-    case "done":
-      return <Check className="h-3 w-3 text-emerald-400" />;
-    case "error":
-      return <X className="h-3 w-3 text-red-400" />;
-    case "cancelled":
-      return <Ban className="h-3 w-3 text-muted-foreground" />;
-  }
-}
 
 function ToolRunCard({ t, onStop }: { t: ToolRun; onStop?: (toolRunId: string) => void }) {
   const [open, setOpen] = useState(t.state === "running" || t.state === "error");
   const stoppable = t.state === "queued" || t.state === "running" || t.state === "approval_required";
+  const meta = getToolRunStatusMeta(t.state);
+  const StatusIcon = meta.icon;
+
   return (
     <div className="rounded-md border border-border bg-card/70" data-testid={`tool-run-${t.id}`} data-state={t.state}>
       <div className="flex items-center gap-2 px-2.5 py-1.5">
@@ -346,8 +411,9 @@ function ToolRunCard({ t, onStop }: { t: ToolRun; onStop?: (toolRunId: string) =
           <span className="min-w-0 truncate font-mono text-[10.5px] text-muted-foreground">
             {t.args.join(" ")}
           </span>
-          <span className={`micro-label shrink-0 ${t.state === "approval_required" ? "text-amber-400" : ""}`}>
-            {TOOL_RUN_LABEL[t.state]}
+          <span className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 font-mono text-[10px] shrink-0 border ${meta.colorClass}`}>
+            <StatusIcon className="h-2.5 w-2.5 shrink-0" />
+            <span>{meta.label}</span>
           </span>
         </button>
         {stoppable && onStop && (
@@ -364,7 +430,6 @@ function ToolRunCard({ t, onStop }: { t: ToolRun; onStop?: (toolRunId: string) =
             exit {t.exitCode}
           </span>
         )}
-        <ToolRunStatusIcon state={t.state} />
         <button onClick={() => setOpen(!open)} aria-label="Toggle details" className="shrink-0">
           {open ? <ChevronDown className="h-3 w-3 text-muted-foreground" /> : <ChevronRight className="h-3 w-3 text-muted-foreground" />}
         </button>
@@ -373,7 +438,7 @@ function ToolRunCard({ t, onStop }: { t: ToolRun; onStop?: (toolRunId: string) =
         <div className="space-y-1 border-t border-border px-3 py-2 font-mono text-[11px] leading-relaxed text-muted-foreground">
           <div>
             <span className="micro-label normal-case tracking-normal">cwd </span>
-            {t.cwd}
+            {formatErrorMessage(t.cwd)}
           </div>
           {t.policyReason && (
             <div className="flex items-center gap-1 text-amber-400/90">
@@ -423,7 +488,14 @@ function PatchCard({ p, onDecision }: { p: Patch; onDecision: (d: "applied" | "r
             </button>
           </div>
         ) : (
-          <span className={`font-mono text-[10.5px] uppercase tracking-wider ${p.status === "applied" ? "text-emerald-400" : "text-red-400"}`}>
+          <span
+            className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 font-mono text-[10.5px] uppercase tracking-wider border ${
+              p.status === "applied"
+                ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-400"
+                : "border-red-500/40 bg-red-500/10 text-red-400"
+            }`}
+          >
+            {p.status === "applied" ? <Check className="h-3 w-3" /> : <X className="h-3 w-3" />}
             {p.status}
           </span>
         )}

@@ -167,6 +167,32 @@ describe("PtyManager", () => {
     expect(killed).toBe(true);
   });
 
+  it("denies terminal control and inspection to a different session owner", async () => {
+    const terminal = await manager.createSession({ title: "owned-terminal" }, "socket-owner-a");
+
+    expect(manager.writeInput(terminal.id, "echo should-not-run\n", "socket-owner-b")).toBe(false);
+    expect(manager.resize(terminal.id, 120, 40, "socket-owner-b")).toBe(false);
+    await expect(manager.kill(terminal.id, undefined, "socket-owner-b")).resolves.toBe(false);
+    expect(manager.getSession(terminal.id, "socket-owner-b")).toBeUndefined();
+    expect(manager.getScrollback(terminal.id, "socket-owner-b")).toBeUndefined();
+    expect(manager.listSessions("socket-owner-b")).toEqual([]);
+
+    const ownerAInfo = manager.getSession(terminal.id, "socket-owner-a");
+    expect(ownerAInfo).toBeDefined();
+    expect(ownerAInfo).not.toHaveProperty("ownerId");
+    expect(manager.listSessions("socket-owner-a")).toHaveLength(1);
+    expect(manager.writeInput(terminal.id, "echo owner-a\n", "socket-owner-a")).toBe(true);
+  });
+
+  it("cleans up only terminals owned by the disconnected session", async () => {
+    const ownerATerminal = await manager.createSession({ title: "owner-a" }, "socket-owner-a");
+    const ownerBTerminal = await manager.createSession({ title: "owner-b" }, "socket-owner-b");
+
+    await expect(manager.closeSessionsForOwner("socket-owner-a")).resolves.toBe(1);
+    expect(manager.getSession(ownerATerminal.id, "socket-owner-a")).toBeUndefined();
+    expect(manager.getSession(ownerBTerminal.id, "socket-owner-b")).toBeDefined();
+  });
+
   it("manages multiple concurrent sessions independently", async () => {
     const s1 = await manager.createSession({ title: "term-1" });
     const s2 = await manager.createSession({ title: "term-2" });
