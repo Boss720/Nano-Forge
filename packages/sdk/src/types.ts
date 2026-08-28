@@ -119,6 +119,37 @@ export interface ToolResponse {
 }
 
 /**
+ * A host-issued, exact-bound approval request for a capability-gated
+ * operation. The SDK deliberately exposes bindings and a digest rather than
+ * raw operation arguments, paths, or credentials.
+ */
+export interface CapabilityApprovalRequest {
+  requestId: string;
+  hostId: string;
+  sessionId: string;
+  workspaceId: string;
+  generation: number;
+  runId: string;
+  stepId: string;
+  toolId: string;
+  argumentsDigest: string;
+  scope: "read" | "write" | "execute" | "network" | "browser" | "mcp" | "schedule";
+  expiresAt: string;
+  uses: "single" | "multi";
+  reason: string;
+  at: string;
+}
+
+/**
+ * Caller-supplied decision for one observed capability approval request.
+ * Decisions are never inferred or sent automatically by the SDK.
+ */
+export interface CapabilityApprovalResolution {
+  approved: boolean;
+  reason?: string;
+}
+
+/**
  * Directory entry metadata returned by workspace operations.
  */
 export interface WorkspaceDirEntry {

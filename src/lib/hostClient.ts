@@ -12,8 +12,10 @@
  *
  * Wire protocol (all frames are JSON text):
  *   client -> host: plan.submit | approval.grant | approval.deny |
+ *                   capability.approval |
  *                   run.pause | run.resume | run.cancel (each carries a requestId)
- *   host -> client: run.state | tool.approval_required | tool.output |
+ *   host -> client: run.state | tool.approval_required |
+ *                   capability.approval_required | capability.result | tool.output |
  *                   run.event | error | <rpcName>.result
  * A request resolves on the first host frame echoing its requestId
  * (typed `.result`/`workspace.ready`/etc. = success, `error`/`workspace.error` = rejection).
@@ -68,6 +70,7 @@ export type HostClientRequestType =
   | "plan.submit"
   | "approval.grant"
   | "approval.deny"
+  | "capability.approval"
   | "run.pause"
   | "run.resume"
   | "run.cancel"
@@ -141,6 +144,36 @@ export interface ToolApprovalRequiredMessage {
   args: string[];
   cwd: string;
   policyReason: string;
+}
+
+/** Host-issued, opaque, single-use approval request for a privileged action. */
+export interface CapabilityApprovalRequiredMessage {
+  type: "capability.approval_required";
+  requestId: string;
+  hostId: string;
+  sessionId: string;
+  workspaceId: string;
+  generation: number;
+  runId: string;
+  stepId: string;
+  toolId: string;
+  argumentsDigest: string;
+  scope: "read" | "write" | "execute" | "network" | "browser" | "mcp" | "schedule";
+  expiresAt: string;
+  uses: "single" | "multi";
+  reason: string;
+  at: string;
+}
+
+/** Result of deciding a capability request. A successful result is followed by
+ * the original operation result; a rejected one terminates that operation. */
+export interface CapabilityResultMessage {
+  type: "capability.result";
+  requestId: string;
+  ok: boolean;
+  errorCode?: "invalid_request" | "denied" | "expired" | "stale_binding" | "already_used";
+  errorMessage?: string;
+  at: string;
 }
 
 export interface ToolOutputMessage {
@@ -517,6 +550,8 @@ export interface PlaygroundInjectFailureResultMessage {
 export type HostMessage =
   | RunStateMessage
   | ToolApprovalRequiredMessage
+  | CapabilityApprovalRequiredMessage
+  | CapabilityResultMessage
   | ToolOutputMessage
   | RunEventMessage
   | HostErrorMessage
@@ -593,6 +628,16 @@ export class HostAuthError extends Error {
   }
 }
 
+/** Socket closed with 4401 due to origin mismatch against host allowedOrigins. */
+export class HostOriginMismatchError extends HostAuthError {
+  constructor(reason?: string) {
+    super(reason ?? "origin not permitted by host");
+    this.name = "HostOriginMismatchError";
+    this.message =
+      "Origin mismatch: The UI origin is not permitted by the local agent host. Please launch NanoForge from the authorized launcher origin (e.g. http://127.0.0.1:4183) or configure allowedOrigins on the host.";
+  }
+}
+
 /** Socket closed for a non-auth reason before/between requests. */
 export class HostConnectionError extends Error {
   readonly code?: number;
@@ -601,6 +646,23 @@ export class HostConnectionError extends Error {
     this.name = "HostConnectionError";
     this.code = code;
   }
+}
+
+/**
+ * Calculates a bounded exponential backoff delay with jitter.
+ * Defaults: 500ms -> 1000ms -> 2000ms -> 4000ms -> up to 10000ms max with 25% jitter.
+ */
+export function calculateBackoffDelay(
+  attempt: number,
+  baseMs = 500,
+  maxMs = 10000,
+  jitterFactor = 0.25,
+  randomFn: () => number = Math.random
+): number {
+  const boundedAttempt = Math.max(0, Math.min(attempt, 30));
+  const exponential = Math.min(maxMs, baseMs * Math.pow(2, boundedAttempt));
+  const jitter = exponential * jitterFactor * (typeof randomFn === "function" ? randomFn() : Math.random());
+  return Math.min(maxMs, Math.round(exponential + jitter));
 }
 
 /* ------------------------------------------------------------------ */
@@ -631,6 +693,12 @@ export interface HostClientOptions {
   WebSocketImpl?: WebSocketFactory;
   /** Bounds failed workspace requests so a missing host reply cannot hang the UI. */
   requestTimeoutMs?: number;
+  /** Maximum reconnect attempts when using backoff (default: 5). */
+  maxReconnectAttempts?: number;
+  /** Initial backoff delay in ms (default: 500ms). */
+  initialBackoffMs?: number;
+  /** Maximum backoff delay in ms (default: 10000ms). */
+  maxBackoffMs?: number;
 }
 
 /** Safe browser-facing result of a future host workspace picker/select flow. */
@@ -658,6 +726,8 @@ const AUTH_CLOSE_CODE = 4401;
 const HOST_MESSAGE_TYPES = new Set([
   "run.state",
   "tool.approval_required",
+  "capability.approval_required",
+  "capability.result",
   "tool.output",
   "run.event",
   "error",
@@ -759,6 +829,31 @@ export function parseHostMessage(raw: unknown): (HostMessage & WithRequestId) | 
       )
         return null;
       return { ...(data as unknown as ToolApprovalRequiredMessage), requestId };
+    case "capability.approval_required":
+      if (
+        !isString(data.requestId) ||
+        !isString(data.hostId) ||
+        !isString(data.sessionId) ||
+        !isString(data.workspaceId) ||
+        typeof data.generation !== "number" ||
+        !isString(data.runId) ||
+        !isString(data.stepId) ||
+        !isString(data.toolId) ||
+        !isString(data.argumentsDigest) ||
+        !isString(data.scope) ||
+        !isString(data.expiresAt) ||
+        !isString(data.uses) ||
+        !isString(data.reason) ||
+        !isString(data.at)
+      ) return null;
+      if (!/^(read|write|execute|network|browser|mcp|schedule)$/.test(data.scope)) return null;
+      if (!/^(single|multi)$/.test(data.uses)) return null;
+      return data as unknown as CapabilityApprovalRequiredMessage;
+    case "capability.result":
+      if (!isString(data.requestId) || typeof data.ok !== "boolean" || !isString(data.at)) return null;
+      if (data.errorCode !== undefined && !isString(data.errorCode)) return null;
+      if (data.errorMessage !== undefined && !isString(data.errorMessage)) return null;
+      return data as unknown as CapabilityResultMessage;
     case "tool.output":
       if (!isString(data.runId) || !isString(data.toolId) || !isString(data.chunk)) return null;
       return { ...(data as unknown as ToolOutputMessage), requestId };
@@ -941,6 +1036,9 @@ export class HostClient {
   private closed = false;
   private readonly requestTimeoutMs: number;
   private workspaceGeneration: number | null = null;
+  public readonly maxReconnectAttempts: number;
+  public readonly initialBackoffMs: number;
+  public readonly maxBackoffMs: number;
 
   constructor(opts: HostClientOptions) {
     if (opts.websocketUrl) {
@@ -954,6 +1052,49 @@ export class HostClient {
       opts.WebSocketImpl ??
       ((url: string) => new WebSocket(url) as unknown as WebSocketLike);
     this.requestTimeoutMs = opts.requestTimeoutMs ?? 15_000;
+    this.maxReconnectAttempts = opts.maxReconnectAttempts ?? 5;
+    this.initialBackoffMs = opts.initialBackoffMs ?? 500;
+    this.maxBackoffMs = opts.maxBackoffMs ?? 10_000;
+  }
+
+  /** Calculate backoff delay with jitter for a given attempt index */
+  calculateBackoff(attempt: number, randomFn?: () => number): number {
+    return calculateBackoffDelay(attempt, this.initialBackoffMs, this.maxBackoffMs, 0.25, randomFn);
+  }
+
+  /** Connect with bounded exponential backoff with jitter on transient failures */
+  async connectWithRetry(options?: {
+    maxAttempts?: number;
+    initialDelayMs?: number;
+    maxDelayMs?: number;
+    onRetry?: (attempt: number, delayMs: number) => void;
+  }): Promise<void> {
+    const maxAttempts = options?.maxAttempts ?? this.maxReconnectAttempts;
+    const initialDelayMs = options?.initialDelayMs ?? this.initialBackoffMs;
+    const maxDelayMs = options?.maxDelayMs ?? this.maxBackoffMs;
+
+    let lastError: Error | null = null;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        await this.connect();
+        return;
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        if (
+          err instanceof HostOriginMismatchError ||
+          (err instanceof HostAuthError && !(err instanceof HostOriginMismatchError)) ||
+          this.closed
+        ) {
+          throw err;
+        }
+        if (attempt < maxAttempts - 1) {
+          const delay = calculateBackoffDelay(attempt, initialDelayMs, maxDelayMs);
+          options?.onRetry?.(attempt + 1, delay);
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        }
+      }
+    }
+    throw lastError ?? new HostConnectionError("Failed to connect to host after retries");
   }
 
   /** Open the socket. Resolves on `open`; rejects HostAuthError on a 4401 close. */
@@ -1035,12 +1176,35 @@ export class HostClient {
     }).then((m) => m as ToolResponseResultMessage);
   }
 
+  /** Answer an existing host-issued capability prompt. The original request
+   * keeps its correlation id and resolves only when the operation finishes. */
+  respondToCapabilityApproval(requestId: string, approved: boolean, reason?: string): Promise<void> {
+    return this.sendOneWay({
+      type: "capability.approval",
+      requestId,
+      approved,
+      ...(reason ? { reason } : {}),
+    });
+  }
+
   /** Read the active host workspace after a fresh broker handoff. */
   describeWorkspace(): Promise<HostWorkspaceDescriptor> {
     return this.requestResult({ type: "workspace.describe" }).then((m) => {
       const workspace = (m as WorkspaceReadyMessage).workspace;
       this.workspaceGeneration = workspace.generation;
       return workspace;
+    });
+  }
+
+  /** Generation-verified workspace check */
+  verifyWorkspaceGeneration(expectedGeneration: number): Promise<HostWorkspaceDescriptor> {
+    return this.describeWorkspace().then((descriptor) => {
+      if (descriptor.generation !== expectedGeneration) {
+        throw new HostConnectionError(
+          `Workspace generation mismatch: expected generation ${expectedGeneration}, got ${descriptor.generation}`
+        );
+      }
+      return descriptor;
     });
   }
 
@@ -1248,13 +1412,18 @@ export class HostClient {
     if (!msg) return; // untrusted/malformed frame: drop silently
 
     // request/response correlation
-    if (msg.requestId) {
+    const isCapabilityIntermediate =
+      msg.type === "capability.approval_required" ||
+      (msg.type === "capability.result" && msg.ok);
+    if (msg.requestId && !isCapabilityIntermediate) {
       const p = this.pending.get(msg.requestId);
       if (p) {
         this.pending.delete(msg.requestId);
         clearTimeout(p.timeout);
         if (msg.type === "error" || msg.type === "workspace.error") {
           p.reject(new HostConnectionError(`${msg.code}: ${msg.message}`));
+        } else if (msg.type === "capability.result") {
+          p.reject(new HostConnectionError(`${msg.errorCode ?? "denied"}: ${msg.errorMessage ?? "Capability denied"}`));
         } else {
           p.resolve(msg);
         }
@@ -1265,8 +1434,14 @@ export class HostClient {
   }
 
   private handleClose(code: number, reason?: string): void {
-    const err =
-      code === AUTH_CLOSE_CODE
+    const isOriginMismatch =
+      code === AUTH_CLOSE_CODE &&
+      typeof reason === "string" &&
+      reason.toLowerCase().includes("origin");
+
+    const err = isOriginMismatch
+      ? new HostOriginMismatchError(reason)
+      : code === AUTH_CLOSE_CODE
         ? new HostAuthError(reason)
         : new HostConnectionError(
             `agent host socket closed (${code}${reason ? `: ${reason}` : ""})`,
@@ -1279,7 +1454,11 @@ export class HostClient {
     this.failPending(err);
     if (code === AUTH_CLOSE_CODE) {
       for (const handler of this.subscribers) {
-        handler({ type: "error", code: "unauthorized", message: err.message });
+        handler({
+          type: "error",
+          code: isOriginMismatch ? "origin_mismatch" : "unauthorized",
+          message: err.message,
+        });
       }
     }
   }

@@ -49,6 +49,7 @@ describe("Milestone 6 Challenger: Launcher Deep Security Boundary Checks", () =>
       expect(environment.TOKEN).toBe("session-token");
       expect(environment[secretName]).toBeUndefined();
       expect(environment.PATH || environment.Path).toBeDefined();
+      expect(buildChildEnvironment({ ELECTRON_RUN_AS_NODE: "1" }).ELECTRON_RUN_AS_NODE).toBe("1");
     } finally {
       if (previousSecret === undefined) delete process.env[secretName];
       else process.env[secretName] = previousSecret;

@@ -150,6 +150,111 @@ export const toolRequestSchema = z.object({
 });
 export type ToolRequestMessage = z.infer<typeof toolRequestSchema>;
 
+/* ------------------------------------------------------------------------ */
+/* Capability approval protocol                                             */
+/* ------------------------------------------------------------------------ */
+
+/** Opaque wire identifiers must never be used to smuggle paths or payloads. */
+const capabilityIdSchema = z
+  .string()
+  .regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
+const capabilityDigestSchema = z.string().regex(/^sha256:[a-f0-9]{64}$/i);
+const capabilityTimestampSchema = z.string().datetime({ offset: true });
+export const capabilityScopeSchema = z.enum([
+  "read",
+  "write",
+  "execute",
+  "network",
+  "browser",
+  "mcp",
+  "schedule",
+]);
+export type CapabilityScope = z.infer<typeof capabilityScopeSchema>;
+export const capabilityUsesSchema = z.enum(["single", "multi"]);
+export type CapabilityUses = z.infer<typeof capabilityUsesSchema>;
+
+/**
+ * Host-issued authority. It is deliberately only a binding and digest: raw
+ * arguments, executable payloads, secrets, and canonical paths do not cross
+ * this protocol in a grant.
+ */
+export const capabilityGrantSchema = z
+  .object({
+    grantId: capabilityIdSchema,
+    hostId: capabilityIdSchema,
+    sessionId: capabilityIdSchema,
+    workspaceId: capabilityIdSchema,
+    generation: z.number().int().positive(),
+    runId: capabilityIdSchema,
+    stepId: capabilityIdSchema,
+    toolId: capabilityIdSchema,
+    argumentsDigest: capabilityDigestSchema,
+    scope: capabilityScopeSchema,
+    issuedAt: capabilityTimestampSchema,
+    expiresAt: capabilityTimestampSchema,
+    uses: capabilityUsesSchema,
+  })
+  .strict();
+export type CapabilityGrant = z.infer<typeof capabilityGrantSchema>;
+
+export const capabilityApprovalRequestSchema = z
+  .object({
+    type: z.literal("capability.approval_required"),
+    requestId: capabilityIdSchema,
+    hostId: capabilityIdSchema,
+    sessionId: capabilityIdSchema,
+    workspaceId: capabilityIdSchema,
+    generation: z.number().int().positive(),
+    runId: capabilityIdSchema,
+    stepId: capabilityIdSchema,
+    toolId: capabilityIdSchema,
+    argumentsDigest: capabilityDigestSchema,
+    scope: capabilityScopeSchema,
+    expiresAt: capabilityTimestampSchema,
+    uses: capabilityUsesSchema,
+    reason: z.string().min(1).max(4096),
+    at: capabilityTimestampSchema,
+  })
+  .strict();
+export type CapabilityApprovalRequest = z.infer<
+  typeof capabilityApprovalRequestSchema
+>;
+
+export const capabilityApprovalDecisionSchema = z
+  .object({
+    type: z.literal("capability.approval"),
+    requestId: capabilityIdSchema,
+    approved: z.boolean(),
+    reason: z.string().max(4096).optional(),
+  })
+  .strict();
+export type CapabilityApprovalDecision = z.infer<
+  typeof capabilityApprovalDecisionSchema
+>;
+
+export const capabilityResultSchema = z
+  .object({
+    type: z.literal("capability.result"),
+    requestId: capabilityIdSchema,
+    ok: z.boolean(),
+    grant: capabilityGrantSchema.optional(),
+    errorCode: z
+      .enum(["invalid_request", "denied", "expired", "stale_binding", "already_used"])
+      .optional(),
+    errorMessage: z.string().max(4096).optional(),
+    at: capabilityTimestampSchema,
+  })
+  .strict()
+  .superRefine((value, ctx) => {
+    if (value.ok && (!value.grant || value.errorCode || value.errorMessage)) {
+      ctx.addIssue({ code: "custom", path: ["grant"], message: "Successful results require only a grant" });
+    }
+    if (!value.ok && (!value.errorCode || value.grant)) {
+      ctx.addIssue({ code: "custom", path: ["errorCode"], message: "Failed results require an error code" });
+    }
+  });
+export type CapabilityResult = z.infer<typeof capabilityResultSchema>;
+
 /**
  * Plan payload for `plan.submit`. Structurally tolerant (unknown step fields
  * pass through) so the wire protocol stays compatible with
@@ -270,6 +375,7 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
     stepId: idSchema.optional(),
     reason: z.string().max(4096).optional(),
   }),
+  capabilityApprovalDecisionSchema,
   z.object({
     type: z.literal("run.pause"),
     runId: idSchema,
@@ -472,6 +578,7 @@ export const hostMessageSchema = z.discriminatedUnion("type", [
     reason: z.string().max(4096),
     at: atSchema,
   }),
+  capabilityApprovalRequestSchema,
   /** Incremental terminal output. */
   z.object({
     type: z.literal("tool.output"),
@@ -506,6 +613,7 @@ export const hostMessageSchema = z.discriminatedUnion("type", [
   approvalGrantResultSchema,
   approvalDenyResultSchema,
   toolResponseResultSchema,
+  capabilityResultSchema,
   // Workspace RPC Results
   workspaceReadySchema,
   workspaceErrorSchema,

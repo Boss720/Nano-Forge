@@ -9,7 +9,7 @@
  * 5. Invariant 5: 100% E2E Acceptance Suite
  */
 import { describe, it, expect, afterEach } from "vitest";
-import { launchE2ETestHost, type E2ETestHost } from "./helpers/testHost.js";
+import { assertExactCapabilityApproval, launchE2ETestHost, type E2ETestHost } from "./helpers/testHost.js";
 import { DaemonSupervisor, CircularRingBuffer } from "../../apps/agent-host/src/daemons/supervisor.js";
 import { NanoForgeClient, EventStreamQueue } from "@nanoforge/sdk";
 import type { ExecutionPlan } from "@nanoforge/protocol";
@@ -509,7 +509,7 @@ describe("Challenger 2 Empirical Verification: Runtime Stability, Lifecycle, SDK
       expect(client.isConnected()).toBe(false);
     });
 
-    it("performs typed RPC queries (workspace, memory, tasks) through SDK client", async () => {
+    it("performs typed RPC queries with an observable, exact SDK memory approval", async () => {
       testHost = await launchE2ETestHost();
       const token = testHost.host.tokenStore.issue();
 
@@ -524,14 +524,30 @@ describe("Challenger 2 Empirical Verification: Runtime Stability, Lifecycle, SDK
       const entries = await client.readDir(".");
       expect(Array.isArray(entries)).toBe(true);
 
-      // Test memory operations
-      const setResult = await client.setMemory({
+      // The host must surface a request-bound prompt before this memory mutation
+      // can run. The test explicitly inspects that host-issued request before
+      // asking the SDK to resolve it; no approval is inferred or automatic.
+      const approvalRequired = new Promise<any>((resolve) => {
+        client.on("capability.approval_required", resolve);
+      });
+      const setResultPromise = client.setMemory({
         action: "set",
         key: "test_key",
         namespace: "global",
         value: "test_val",
         valueType: "string",
       });
+      const approvalFrame = await approvalRequired;
+      const approval = assertExactCapabilityApproval(approvalFrame, {
+        requestId: String(approvalFrame.requestId),
+        toolId: "memory.set",
+        scope: "write",
+      });
+      expect(approval.requestId).toEqual(expect.any(String));
+      expect(client.getPendingCapabilityApproval(approvalFrame.requestId)).toEqual(approvalFrame);
+      await client.approveCapability(approvalFrame);
+
+      const setResult = await setResultPromise;
       expect(setResult.success).toBe(true);
 
       const getResult = await client.getMemory({

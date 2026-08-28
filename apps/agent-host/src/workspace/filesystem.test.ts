@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createHash } from 'node:crypto';
-import { handleReadDir, handleReadFile, handleWriteFile, handleStat, handleSearch, handleGitStatus } from './filesystem.js';
+import { handleReadDir, handleReadFile, handleWriteFile, handleStat, handleSearch, handleGitStatus, setWorkspaceFilesystemOperationHookForTest } from './filesystem.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
@@ -26,7 +26,8 @@ describe('workspace filesystem', () => {
   afterEach(async () => {
     await fs.rm(tmpDir, { recursive: true, force: true });
     for (const target of extraTmpDirs) await fs.rm(target, { recursive: true, force: true });
-    vi.clearAllMocks();
+    setWorkspaceFilesystemOperationHookForTest();
+    vi.restoreAllMocks();
   });
 
   describe('handleReadDir', () => {
@@ -78,6 +79,30 @@ describe('workspace filesystem', () => {
         .rejects.toMatchObject({ code: 'path_outside_workspace' });
     });
 
+    it('fails closed when a checked parent is swapped for an escaping symlink before read', async () => {
+      const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'nanoforge-outside-'));
+      extraTmpDirs.push(outside);
+      await fs.writeFile(path.join(outside, 'note.txt'), 'outside');
+
+      const swapDir = path.join(tmpDir, 'swap');
+      const target = path.join(swapDir, 'note.txt');
+      await fs.mkdir(swapDir);
+      await fs.writeFile(target, 'inside');
+
+      let swapped = false;
+      setWorkspaceFilesystemOperationHookForTest(async (operation) => {
+        if (operation === 'readFile' && !swapped) {
+          swapped = true;
+          await fs.rename(swapDir, path.join(tmpDir, 'swap-before-link'));
+          await fs.symlink(outside, swapDir, process.platform === 'win32' ? 'junction' : 'dir');
+        }
+      });
+
+      await expect(handleReadFile(tmpDir, 'swap/note.txt'))
+        .rejects.toMatchObject({ code: 'path_outside_workspace' });
+      expect(swapped).toBe(true);
+    });
+
     it('rejects files over 1MB', async () => {
       const _largeFile = path.join(tmpDir, 'large.txt');
       // Mock stat for this file to avoid actually creating a 1MB+ file
@@ -101,6 +126,49 @@ describe('workspace filesystem', () => {
   });
 
   describe('handleWriteFile', () => {
+    it('denies capability-enabled writes without authorization', async () => {
+      await expect(handleWriteFile(tmpDir, 'README.md', '# Unauthorized', {
+        authorizationRequired: true,
+      })).rejects.toMatchObject({ code: 'write_not_approved' });
+      expect(await fs.readFile(path.join(tmpDir, 'README.md'), 'utf8')).toBe('# Hello');
+    });
+
+    it('rejects a denied authorizer without mutating the target', async () => {
+      const authorize = vi.fn(() => false);
+      await expect(handleWriteFile(tmpDir, 'README.md', '# Denied', {
+        authorizationRequired: true,
+        authorize,
+      })).rejects.toMatchObject({ code: 'write_not_approved' });
+      expect(authorize).toHaveBeenCalledWith({
+        operation: 'workspace.write',
+        workspaceRelativePath: 'README.md',
+        contentSha256: createHash('sha256').update('# Denied').digest('hex'),
+        contentSize: Buffer.byteLength('# Denied'),
+        expectedSha256: undefined,
+        expectedModified: undefined,
+      });
+      expect(await fs.readFile(path.join(tmpDir, 'README.md'), 'utf8')).toBe('# Hello');
+    });
+
+    it('passes non-secret write metadata to a granted authorizer and preserves conflict safety', async () => {
+      const previous = createHash('sha256').update('# Hello').digest('hex');
+      const authorize = vi.fn(({ workspaceRelativePath, contentSha256, contentSize, expectedSha256, expectedModified }) => {
+        expect(workspaceRelativePath).toBe('README.md');
+        expect(contentSha256).toBe(createHash('sha256').update('# Authorized').digest('hex'));
+        expect(contentSize).toBe(Buffer.byteLength('# Authorized'));
+        expect(expectedSha256).toBe(previous);
+        expect(expectedModified).toBeUndefined();
+        return true;
+      });
+      const result = await handleWriteFile(tmpDir, 'README.md', '# Authorized', {
+        authorizationRequired: true,
+        authorize,
+        expectedSha256: previous,
+      });
+      expect(result.success).toBe(true);
+      expect(await fs.readFile(path.join(tmpDir, 'README.md'), 'utf8')).toBe('# Authorized');
+    });
+
     it('creates parent directories and writes file', async () => {
       const result = await handleWriteFile(tmpDir, 'nested/dir/new.js', 'const x = 1;');
       expect(result.success).toBe(true);

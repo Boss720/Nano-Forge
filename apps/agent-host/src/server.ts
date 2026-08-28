@@ -66,6 +66,25 @@ export const DEFAULT_ALLOWED_ORIGINS: readonly string[] = [
   "https://nano-gpt.com",
 ];
 
+/**
+ * Accept launcher-provided browser origins only when they are explicit local
+ * loopback HTTP origins. This keeps custom launcher ports usable without
+ * turning an environment variable into a remote-origin bypass.
+ */
+export function parseLauncherAllowedOrigins(raw?: string): string[] {
+  if (!raw) return [];
+  return raw.split(",").flatMap((candidate) => {
+    try {
+      const url = new URL(candidate.trim());
+      if (url.protocol !== "http:" || (url.hostname !== "127.0.0.1" && url.hostname !== "localhost")) return [];
+      if (!url.port || url.pathname !== "/" || url.search || url.hash || url.username || url.password) return [];
+      return [url.origin];
+    } catch {
+      return [];
+    }
+  });
+}
+
 export function isAllowedOrigin(
   origin?: string,
   allowedOrigins?: (string | RegExp)[],
@@ -346,7 +365,10 @@ export async function createHost(options: HostOptions = {}): Promise<HostHandle>
     }
     const origin = req.headers.origin;
     if (!isAllowedOrigin(origin, options.allowedOrigins, options.allowNonBrowserClients)) {
-      socket.close(CLOSE_UNAUTHORIZED, "unauthorized origin");
+      logger.warn("host.origin_unauthorized", "Rejected WebSocket connection due to origin mismatch", {
+        origin: typeof origin === "string" ? origin.slice(0, 128) : "missing",
+      });
+      socket.close(CLOSE_UNAUTHORIZED, "unauthorized origin: origin mismatch");
       return;
     }
     const queryToken = new URL(req.url ?? "/agent", "http://127.0.0.1")
@@ -577,11 +599,13 @@ const invokedDirectly =
   import.meta.url === pathToFileURL(process.argv[1]).href;
 
 if (invokedDirectly) {
+  const launcherOrigins = parseLauncherAllowedOrigins(process.env.NANOFORGE_ALLOWED_ORIGINS);
   const host = await createHost({
     host: process.env.BIND_ADDRESS ?? process.env.HOST ?? "127.0.0.1",
     port: process.env.PORT ? Number(process.env.PORT) : 0,
     token: process.env.TOKEN,
     logger: true,
+    ...(launcherOrigins.length > 0 ? { allowedOrigins: launcherOrigins } : {}),
     session: {
       workspaceRoot: process.env.NANOFORGE_WORKSPACE,
       allowWorkspaceWrites: process.env.NANOFORGE_ALLOW_WORKSPACE_WRITES === "1",

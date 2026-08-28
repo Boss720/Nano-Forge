@@ -14,6 +14,7 @@ import {
   createHost,
   createTokenStore,
   HOST_VERSION,
+  parseLauncherAllowedOrigins,
   type HostHandle,
   type HostOptions,
 } from "./server";
@@ -101,6 +102,48 @@ function nextMessage(ws: WsLike): Promise<Record<string, unknown>> {
   });
 }
 
+interface MessageInbox {
+  next(): Promise<Record<string, unknown>>;
+}
+
+function createMessageInbox(ws: WsLike): MessageInbox {
+  const received: Record<string, unknown>[] = [];
+  const waiters: ((message: Record<string, unknown>) => void)[] = [];
+  ws.addEventListener("message", (event) => {
+    const message = JSON.parse(String(event.data)) as Record<string, unknown>;
+    const waiter = waiters.shift();
+    if (waiter) waiter(message);
+    else received.push(message);
+  });
+  return {
+    next: () => {
+      const message = received.shift();
+      return message ? Promise.resolve(message) : new Promise((resolve) => waiters.push(resolve));
+    },
+  };
+}
+
+async function approveExactRequest(
+  ws: WsLike,
+  inbox: MessageInbox,
+  requestId: string,
+): Promise<void> {
+  expect(await inbox.next()).toMatchObject({
+    type: "capability.approval_required",
+    requestId,
+    scope: "write",
+    uses: "single",
+  });
+  const result = inbox.next();
+  ws.send(JSON.stringify({ type: "capability.approval", requestId, approved: true }));
+  expect(await result).toMatchObject({
+    type: "capability.result",
+    requestId,
+    ok: true,
+    grant: { scope: "write", uses: "single" },
+  });
+}
+
 describe("token store", () => {
   it("issues well-formed tokens consumable exactly once", () => {
     const store = createTokenStore();
@@ -119,6 +162,15 @@ describe("token store", () => {
     expect(store.consume("not a token at all !!!")).toBe(false);
     // Well-formed but never registered.
     expect(store.consume("a".repeat(32))).toBe(false);
+  });
+});
+
+describe("launcher origin handoff", () => {
+  it("accepts only explicit loopback HTTP origins from the launcher", () => {
+    expect(parseLauncherAllowedOrigins("http://127.0.0.1:4193,http://localhost:5173"))
+      .toEqual(["http://127.0.0.1:4193", "http://localhost:5173"]);
+    expect(parseLauncherAllowedOrigins("https://example.com,http://127.0.0.1:4193/path,http://127.0.0.1"))
+      .toEqual([]);
   });
 });
 
@@ -160,14 +212,14 @@ describe("authenticated local host", () => {
     await fs.writeFile(path.join(root, "note.txt"), "original", "utf8");
     host = await createNodeWsHost({ session: { workspaceRoot: root, allowWorkspaceWrites: true } });
     const ws = new NativeWebSocket(agentUrl(host, host.token));
+    const inbox = createMessageInbox(ws);
     await waitForOpen(ws);
-    await nextMessage(ws);
+    await inbox.next();
 
-    let reply = nextMessage(ws);
+    let reply = inbox.next();
     ws.send(JSON.stringify({ type: "workspace.watch", requestId: "watch-1", enabled: true, generation: 1 }));
     expect(await reply).toMatchObject({ type: "workspace.watch.result", requestId: "watch-1", enabled: true, generation: 1 });
 
-    reply = nextMessage(ws);
     ws.send(JSON.stringify({
       type: "workspace.writeFile",
       requestId: "write-1",
@@ -176,10 +228,11 @@ describe("authenticated local host", () => {
       generation: 1,
       expectedSha256: "0".repeat(64),
     }));
-    expect(await reply).toMatchObject({ type: "workspace.error", requestId: "write-1", code: "write_conflict" });
+    await approveExactRequest(ws, inbox, "write-1");
+    expect(await inbox.next()).toMatchObject({ type: "workspace.error", requestId: "write-1", code: "write_conflict" });
     expect(await fs.readFile(path.join(root, "note.txt"), "utf8")).toBe("original");
 
-    reply = nextMessage(ws);
+    reply = inbox.next();
     ws.send(JSON.stringify({ type: "workspace.unwatch", requestId: "watch-2", generation: 1 }));
     expect(await reply).toMatchObject({ type: "workspace.watch.result", requestId: "watch-2", enabled: false, generation: 1 });
     ws.close();
@@ -299,28 +352,10 @@ describe("authenticated local host", () => {
   it("handles memory RPCs (set, get, query, delete) and broadcasts memory events", async () => {
     host = await createNodeWsHost();
     const ws = new NativeWebSocket(agentUrl(host, host.token));
-    const received: Record<string, unknown>[] = [];
-    const waiters: ((msg: Record<string, unknown>) => void)[] = [];
-
-    ws.addEventListener("message", (event) => {
-      const parsed = JSON.parse(String(event.data));
-      if (waiters.length > 0) {
-        const resolve = waiters.shift()!;
-        resolve(parsed);
-      } else {
-        received.push(parsed);
-      }
-    });
-
-    const getNext = (): Promise<Record<string, unknown>> => {
-      if (received.length > 0) {
-        return Promise.resolve(received.shift()!);
-      }
-      return new Promise((resolve) => waiters.push(resolve));
-    };
+    const inbox = createMessageInbox(ws);
 
     await waitForOpen(ws);
-    const ready = await getNext();
+    const ready = await inbox.next();
     expect(ready.type).toBe("host.ready");
 
     // 1. memory.set
@@ -337,9 +372,11 @@ describe("authenticated local host", () => {
       })
     );
 
-    // Expect to receive both memory.event and memory.set.result
-    const msg1 = await getNext();
-    const msg2 = await getNext();
+    await approveExactRequest(ws, inbox, "req-mem-1");
+
+    // Expect to receive both memory.event and memory.set.result after approval.
+    const msg1 = await inbox.next();
+    const msg2 = await inbox.next();
     const receivedTypes = [msg1.type, msg2.type];
     expect(receivedTypes).toContain("memory.set.result");
     expect(receivedTypes).toContain("memory.event");
@@ -362,7 +399,7 @@ describe("authenticated local host", () => {
       })
     );
 
-    const getResultMsg = (await getNext()) as any;
+    const getResultMsg = (await inbox.next()) as any;
     expect(getResultMsg.type).toBe("memory.get.result");
     expect(getResultMsg.requestId).toBe("req-mem-2");
     expect(getResultMsg.result.found).toBe(true);
@@ -380,7 +417,7 @@ describe("authenticated local host", () => {
       })
     );
 
-    const queryResultMsg = (await getNext()) as any;
+    const queryResultMsg = (await inbox.next()) as any;
     expect(queryResultMsg.type).toBe("memory.query.result");
     expect(queryResultMsg.requestId).toBe("req-mem-3");
     expect(queryResultMsg.result.total).toBe(1);
@@ -398,8 +435,10 @@ describe("authenticated local host", () => {
       })
     );
 
-    const msg3 = await getNext();
-    const msg4 = await getNext();
+    await approveExactRequest(ws, inbox, "req-mem-4");
+
+    const msg3 = await inbox.next();
+    const msg4 = await inbox.next();
     const delTypes = [msg3.type, msg4.type];
     expect(delTypes).toContain("memory.delete.result");
     expect(delTypes).toContain("memory.event");

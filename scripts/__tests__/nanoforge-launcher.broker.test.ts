@@ -4,7 +4,7 @@ import path from "node:path";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
-const { createStaticServer, createWorkspaceBroker } = require("../nanoforge-launcher.cjs");
+const { createStaticServer, createWorkspaceBroker, resolveLauncherSidecar } = require("../nanoforge-launcher.cjs");
 const servers: http.Server[] = [];
 
 afterEach(async () => {
@@ -12,6 +12,17 @@ afterEach(async () => {
 });
 
 describe("launcher workspace broker protocol", () => {
+  it("loads picker and registry sidecars from the executable bundle in SEA", () => {
+    expect(resolveLauncherSidecar("workspace-picker.cjs", {
+      isSea: true,
+      execPath: "C:\\Program Files\\NanoForge\\NanoForge.exe",
+    })).toBe("C:\\Program Files\\NanoForge\\workspace-picker.cjs");
+    expect(resolveLauncherSidecar("workspace-registry.cjs", {
+      isSea: true,
+      execPath: "C:\\Program Files\\NanoForge\\NanoForge.exe",
+    })).toBe("C:\\Program Files\\NanoForge\\workspace-registry.cjs");
+  });
+
   it("requires auth and returns a path-free protocol choose result", async () => {
     const registry = {
       open: (workspacePath: string) => ({ id: "ws_demo", path: workspacePath, pinned: false }),
@@ -81,6 +92,71 @@ describe("launcher workspace broker protocol", () => {
     expect(second.text).toBe(first.text);
     expect(activations).toBe(1);
     expect(first.text).not.toContain("C:\\Private\\Demo");
+  });
+
+  it("coalesces concurrent activation requests with the same idempotency key", async () => {
+    let activations = 0;
+    let releaseActivation: (() => void) | undefined;
+    const activationStarted = new Promise<void>((resolve) => {
+      releaseActivation = resolve;
+    });
+    const broker = createWorkspaceBroker({
+      registry: {
+        resolve: (id: string) => id === "ws_demo" ? { id, path: "C:\\Private\\Demo", pinned: false } : null,
+        list: () => [],
+      },
+      activateWorkspace: async () => {
+        activations += 1;
+        releaseActivation?.();
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      },
+      hostPort: 4174,
+      token: "connection-token",
+    });
+    const request = { type: "workspace.activate", requestId: "activate-concurrent", workspaceId: "ws_demo", idempotencyKey: "same-operation" };
+    const first = broker.complete(request, request.requestId);
+    await activationStarted;
+    const second = broker.complete({ ...request, requestId: "activate-concurrent-2" }, "activate-concurrent-2");
+    const results = await Promise.all([first, second]);
+    expect(results[0]).toEqual(results[1]);
+    expect(activations).toBe(1);
+  });
+
+  it("rejects root, absolute, and traversal reveal paths before launching Explorer", async () => {
+    const revealed: string[] = [];
+    const broker = createWorkspaceBroker({
+      registry: {
+        resolve: (id: string) => id === "ws_demo" ? { id, path: "C:\\Private\\Demo", pinned: false } : null,
+        list: () => [],
+      },
+      revealWorkspace: async (target: string) => { revealed.push(target); },
+    });
+    for (const relativePath of [".", "", "C:\\Windows", "/", "\\\\server\\share", "..\\outside", "src\\..\\..\\outside"]) {
+      const result = await broker.complete({ type: "workspace.reveal", requestId: `reveal-${relativePath || "empty"}`, workspaceId: "ws_demo", relativePath }, `reveal-${relativePath || "empty"}`);
+      expect(result.status).toBe(400);
+    }
+    expect(revealed).toEqual([]);
+  });
+
+  it("accepts only opaque workspace identifiers for broker mutations", async () => {
+    const broker = createWorkspaceBroker({
+      registry: {
+        resolve: () => { throw new Error("must not resolve untrusted id"); },
+        list: () => [],
+        pin: () => { throw new Error("must not pin untrusted id"); },
+        remove: () => { throw new Error("must not remove untrusted id"); },
+      },
+      activateWorkspace: async () => undefined,
+    });
+    for (const request of [
+      { type: "workspace.activate", workspaceId: "C:\\Private\\Demo", idempotencyKey: "activate" },
+      { type: "workspace.recent.pin", workspaceId: "../outside", pinned: true, idempotencyKey: "pin" },
+      { type: "workspace.recent.remove", workspaceId: "", idempotencyKey: "remove" },
+    ]) {
+      const result = await broker.complete({ ...request, requestId: `request-${request.idempotencyKey}` }, `request-${request.idempotencyKey}`);
+      expect(result.status).toBe(400);
+      expect(result.payload.code).toBe("invalid_request");
+    }
   });
 });
 

@@ -137,6 +137,86 @@ describe("HostClient connection", () => {
 });
 
 describe("HostClient requests", () => {
+  it("holds a reviewed write pending through its capability approval, then resolves only on the write result", async () => {
+    const { client } = makeClient();
+    const ws = await connect(client);
+    const events: HostMessage[] = [];
+    client.onEvent((message) => events.push(message));
+
+    let settled = false;
+    const write = client.writeFile("src/main.ts", "export const ready = true;", { expectedSha256: "abc" });
+    void write.then(() => { settled = true; });
+    const writeFrame = ws.sentFrames()[0];
+
+    ws.receive({
+      type: "capability.approval_required",
+      requestId: writeFrame.requestId,
+      hostId: "host-1",
+      sessionId: "session-1",
+      workspaceId: "workspace-1",
+      generation: 1,
+      runId: "run-1",
+      stepId: "step-1",
+      toolId: "workspace.writeFile",
+      argumentsDigest: `sha256:${"a".repeat(64)}`,
+      scope: "write",
+      expiresAt: "2026-08-28T12:00:00.000Z",
+      uses: "single",
+      reason: "Approval required for workspace.writeFile",
+      at: "2026-08-28T11:59:00.000Z",
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(events.at(-1)).toMatchObject({ type: "capability.approval_required", scope: "write" });
+
+    await client.respondToCapabilityApproval(String(writeFrame.requestId), true);
+    expect(ws.sentFrames()[1]).toEqual({
+      type: "capability.approval",
+      requestId: writeFrame.requestId,
+      approved: true,
+    });
+
+    ws.receive({
+      type: "capability.result",
+      requestId: writeFrame.requestId,
+      ok: true,
+      grant: {},
+      at: "2026-08-28T11:59:01.000Z",
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    ws.receive({
+      type: "workspace.writeFile.result",
+      requestId: writeFrame.requestId,
+      path: "src/main.ts",
+      success: true,
+      generation: 1,
+      sha256: "def",
+      size: 26,
+      modified: "2026-08-28T11:59:02.000Z",
+    });
+    await expect(write).resolves.toMatchObject({ success: true, path: "src/main.ts" });
+  });
+
+  it("rejects the original reviewed write when its single-use capability is denied", async () => {
+    const { client } = makeClient();
+    const ws = await connect(client);
+    const write = client.writeFile("src/main.ts", "export {}; ");
+    const writeFrame = ws.sentFrames()[0];
+
+    ws.receive({
+      type: "capability.result",
+      requestId: writeFrame.requestId,
+      ok: false,
+      errorCode: "denied",
+      errorMessage: "Capability denied",
+      at: "2026-08-28T11:59:00.000Z",
+    });
+
+    await expect(write).rejects.toThrow(/denied: Capability denied/);
+  });
+
   it("correlates workspace read results and host errors by request id", async () => {
     const { client } = makeClient();
     const ws = await connect(client);

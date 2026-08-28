@@ -353,3 +353,50 @@ export type WorkspaceReady = z.infer<typeof workspaceReadySchema>;
 export type WorkspaceError = z.infer<typeof workspaceErrorSchema>;
 export type WorkspaceWriteRequest = z.infer<typeof workspaceWriteRequestSchema>;
 export type WorkspaceWriteResult = z.infer<typeof workspaceWriteResultSchema>;
+
+export const NON_RETRYABLE_WORKSPACE_ERROR_CODES: ReadonlySet<string> = new Set([
+  "permission_denied",
+  "access_denied",
+  "root_too_broad",
+  "workspace_missing",
+  "workspace_moved",
+  "not_found",
+  "not_directory",
+  "invalid_path",
+  "binary_file",
+  "file_too_large",
+  "write_not_approved",
+  "unknown_workspace",
+]);
+
+export function isNonRetryableWorkspaceErrorCode(code: string): boolean {
+  return NON_RETRYABLE_WORKSPACE_ERROR_CODES.has(code);
+}
+
+export function isNonRetryableError(error: unknown): boolean {
+  if (typeof error === "string") return isNonRetryableWorkspaceErrorCode(error);
+  if (typeof error === "object" && error !== null) {
+    if ("code" in error && typeof (error as { code: unknown }).code === "string") {
+      if (isNonRetryableWorkspaceErrorCode((error as { code: string }).code)) return true;
+    }
+    if ("message" in error && typeof (error as { message: unknown }).message === "string") {
+      const msg = (error as { message: string }).message.toLowerCase();
+      return (
+        msg.includes("permission denied") ||
+        msg.includes("access denied") ||
+        msg.includes("eacces") ||
+        msg.includes("eperm") ||
+        msg.includes("too broad") ||
+        msg.includes("root_too_broad") ||
+        msg.includes("missing") ||
+        msg.includes("workspace_missing") ||
+        msg.includes("workspace_moved") ||
+        msg.includes("not a directory") ||
+        msg.includes("not found") ||
+        msg.includes("invalid_path") ||
+        msg.includes("unknown_workspace")
+      );
+    }
+  }
+  return false;
+}

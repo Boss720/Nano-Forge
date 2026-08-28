@@ -243,8 +243,9 @@ export function useSessionPersistence(defaultModelId: string = FALLBACK_MODELS[3
     })));
   }, []);
 
-  const createWorkspaceAction = useCallback((name = "New workspace") => {
+  const createWorkspaceAction = useCallback((name = "New workspace", location?: WorkspaceLocation) => {
     const workspace = createWorkspace(name);
+    if (location) workspace.location = location;
     setWorkspaces((current) => [...current, workspace]);
     setActiveWorkspaceIdState(workspace.id);
     setActiveChatIdState("");

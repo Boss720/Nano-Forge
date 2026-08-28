@@ -129,7 +129,7 @@ export interface AppLayoutProps {
   activeChatId: string;
   session?: Session;
   onSelectWorkspace: (id: string) => void;
-  onCreateWorkspace: (name?: string) => void;
+  onCreateWorkspace: (name?: string, location?: WorkspaceLocation) => string | void;
   onRenameWorkspace: (id: string, name: string) => void;
   /** Optional while the app shell migration is in flight. */
   onUpdateWorkspaceLocation?: (id: string, location: WorkspaceLocation | undefined) => void;
@@ -276,18 +276,26 @@ export function AppLayout({
 
   const activeWorkspace = workspaces.find((workspace) => workspace.id === activeWorkspaceId);
   const persistedHostWorkspace = activeWorkspace?.location?.status === "ready";
-  const hasHostWorkspace = host.status === "connected" && (persistedHostWorkspace || openedWorkspace !== null);
-  const runtimeStatus: RuntimeStatus = host.status === "off"
+  const hasHostWorkspace =
+    (host.status === "connected" || host.runtimeState === "ready" || host.runtimeState === "healthy") &&
+    (persistedHostWorkspace || openedWorkspace !== null);
+  const runtimeStatus: RuntimeStatus = host.status === "off" || (host.runtimeState === "unavailable" && !host.enabled)
     ? "offline"
-    : host.status === "connecting"
-      ? "connecting"
-      : host.status === "error"
-        ? "error"
-        : hasHostWorkspace
-          ? "ready"
-          : activeWorkspace?.location
-            ? "unavailable"
-            : "no-workspace";
+    : host.runtimeState === "reconnecting"
+      ? "reconnecting"
+      : host.runtimeState === "switching"
+        ? "switching"
+        : host.runtimeState === "starting" || host.status === "connecting"
+          ? "connecting"
+          : host.runtimeState === "needs_attention"
+            ? "needs_attention"
+            : host.status === "error" || host.runtimeState === "unavailable"
+              ? "error"
+              : hasHostWorkspace
+                ? "ready"
+                : activeWorkspace?.location
+                  ? "unavailable"
+                  : "no-workspace";
   const workspaceClient = useMemo(() => hasHostWorkspace ? {
     readDir: async (path = "") => {
       const result = await host.readWorkspaceDirectory(path);
@@ -345,25 +353,28 @@ export function AppLayout({
       lastOpenedAt: Date.now(),
       status: "ready",
     };
-    const targetWorkspaceId = activeWorkspace?.id ?? activeWorkspaceId;
     if (result.connection) {
       setWorkspaceRecovery({ status: "connecting", message: "Connecting the selected local workspace…" });
       const descriptor = await host.reconnectToWorkspace(result.connection);
       if (!descriptor) {
-        onUpdateWorkspaceLocation?.(targetWorkspaceId, { ...location, status: "unavailable" });
         setWorkspaceRecovery({ status: "unavailable", message: host.lastError ?? "The selected folder could not be connected. Your previous local host remains active." });
         return;
       }
       setOpenedWorkspace(descriptor);
       onConnectionMetadata?.(result.connection);
-      onUpdateWorkspaceLocation?.(targetWorkspaceId, location);
+      const existing = workspaces.find((workspace) => workspace.location?.hostWorkspaceId === location.hostWorkspaceId);
+      const appWorkspaceId = existing?.id ?? onCreateWorkspace(result.workspace.label, location);
+      if (appWorkspaceId) {
+        onUpdateWorkspaceLocation?.(appWorkspaceId, location);
+        onSelectWorkspace(appWorkspaceId);
+      }
       setWorkspaceRecovery({ status: "ready" });
       return;
     }
-    onUpdateWorkspaceLocation?.(targetWorkspaceId, { ...location, status: "unavailable" });
-    setOpenedWorkspace(null);
-    setWorkspaceRecovery({ status: "unavailable", message: "Folder selected. Dynamic host reconnection is not available in this session, so the active host was left unchanged." });
-  }, [activeWorkspace?.id, activeWorkspaceId, host, onConnectionMetadata, onUpdateWorkspaceLocation, running, workspaceBroker]);
+    const appWorkspaceId = onCreateWorkspace(result.workspace.label, { ...location, status: "unavailable" });
+    setWorkspaceRecovery({ status: "unavailable", message: "Folder selected, but this session cannot connect a local host. Your current workspace is unchanged." });
+    if (appWorkspaceId) onUpdateWorkspaceLocation?.(appWorkspaceId, { ...location, status: "unavailable" });
+  }, [host, onConnectionMetadata, onCreateWorkspace, onSelectWorkspace, onUpdateWorkspaceLocation, running, workspaceBroker, workspaces]);
 
   const reconnectWorkspace = useCallback(() => {
     if (activeWorkspace?.location) setWorkspaceRecovery({ status: "unavailable", message: "Reconnect the local host, then reopen this folder from Recent folders." });
@@ -371,8 +382,6 @@ export function AppLayout({
   }, [activeWorkspace?.location, openFolder]);
 
   const openRecentWorkspace = useCallback(async (workspaceId: string) => {
-    const workspace = workspaces.find((candidate) => candidate.location?.hostWorkspaceId === workspaceId);
-    if (!workspace) return;
     if (!workspaceBroker.available) {
       setWorkspaceRecovery({ status: "unsupported", message: "Recent local folders can only be opened from the NanoForge launcher." });
       return;
@@ -394,21 +403,36 @@ export function AppLayout({
       setWorkspaceRecovery({ status: "connecting", message: "Connecting the selected local workspace…" });
       const descriptor = await host.reconnectToWorkspace(result.connection);
       if (!descriptor) {
-        onUpdateWorkspaceLocation?.(workspace.id, { ...location, status: "unavailable" });
         setWorkspaceRecovery({ status: "unavailable", message: host.lastError ?? "The selected folder could not be connected. Your previous local host remains active." });
         return;
       }
       setOpenedWorkspace(descriptor);
       onConnectionMetadata?.(result.connection);
-      onUpdateWorkspaceLocation?.(workspace.id, location);
-      onSelectWorkspace(workspace.id);
+      const existing = workspaces.find((candidate) => candidate.location?.hostWorkspaceId === workspaceId);
+      const appWorkspaceId = existing?.id ?? onCreateWorkspace(result.workspace.label, location);
+      if (appWorkspaceId) {
+        onUpdateWorkspaceLocation?.(appWorkspaceId, location);
+        onSelectWorkspace(appWorkspaceId);
+      }
       setWorkspaceRecovery({ status: "ready" });
       return;
     }
-    onUpdateWorkspaceLocation?.(workspace.id, { ...location, status: "unavailable" });
-    setOpenedWorkspace(null);
-    setWorkspaceRecovery({ status: "unavailable", message: "Folder selected. Dynamic host reconnection is not available in this session, so the active host was left unchanged." });
-  }, [host, onConnectionMetadata, onSelectWorkspace, onUpdateWorkspaceLocation, workspaceBroker, workspaces]);
+    const appWorkspaceId = onCreateWorkspace(result.workspace.label, { ...location, status: "unavailable" });
+    setWorkspaceRecovery({ status: "unavailable", message: "This folder is available in Recents, but this session cannot connect a local host. Your current workspace is unchanged." });
+    if (appWorkspaceId) onUpdateWorkspaceLocation?.(appWorkspaceId, { ...location, status: "unavailable" });
+  }, [host, onConnectionMetadata, onCreateWorkspace, onSelectWorkspace, onUpdateWorkspaceLocation, workspaceBroker, workspaces]);
+
+  const revealWorkspacePath = useCallback(async (path: string) => {
+    const workspaceId = activeWorkspace?.location?.hostWorkspaceId;
+    if (!workspaceId || !workspaceBroker.available) return false;
+    try {
+      await workspaceBroker.reveal(workspaceId, path);
+      return true;
+    } catch {
+      setWorkspaceRecovery({ status: "unavailable", message: "The launcher could not reveal that path." });
+      return false;
+    }
+  }, [activeWorkspace?.location?.hostWorkspaceId, workspaceBroker]);
 
   const openWorkspaceFile = useCallback(async (path: string) => {
     const file = await host.readWorkspaceFile(path);
@@ -452,10 +476,14 @@ export function AppLayout({
         e.preventDefault();
         setSwitcherOpen((o) => !o);
       }
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "o") {
+        e.preventDefault();
+        void openFolder();
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [openFolder]);
 
   useEffect(() => {
     if (switcherOpen) setSwitcherQuery("");
@@ -475,6 +503,7 @@ export function AppLayout({
     tree={workspaceExplorer.tree}
     activeFile={workspaceExplorer.activeFile}
     onFileSelect={openWorkspaceFile}
+    onRevealPath={workspaceBroker.available && activeWorkspace?.location?.status === "ready" ? revealWorkspacePath : undefined}
     onRefresh={() => { void workspaceExplorer.refreshTree(); void workspaceExplorer.refreshGitStatus(); }}
     onSearch={(query) => { void workspaceExplorer.searchFiles(query); }}
     onLoadDirectory={workspaceExplorer.loadDirectory}
@@ -560,6 +589,7 @@ export function AppLayout({
             onOpenFolder={() => { void openFolder(); }}
             onReconnectWorkspace={reconnectWorkspace}
             onOpenRecentWorkspace={openRecentWorkspace}
+            recents={workspaceBroker.recents}
             workspaceRecovery={effectiveRecovery}
             onRenameWorkspace={onRenameWorkspace}
             onPinWorkspace={onPinWorkspace}
@@ -592,6 +622,7 @@ export function AppLayout({
             onPatchDecision={handlePatchDecision}
             genPrefs={genPrefs}
             onGenPrefsChange={handleGenPrefsChange}
+            onOpenFolder={() => { void openFolder(); }}
             toolRuns={host.toolRuns}
             onToolStop={host.stopToolRun}
             onExecuteCommand={handleSwarmCommand}

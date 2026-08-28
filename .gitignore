@@ -25,6 +25,8 @@ release/README.txt
 release/bundle/
 release/dist/
 release/.test-temp/
+release/desktop*/
+release/_quarantine/
 !release/install-nanoforge.ps1
 !release/install-nanoforge.bat
 !release/uninstall-nanoforge.ps1

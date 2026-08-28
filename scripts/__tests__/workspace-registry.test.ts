@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createWorkspaceRegistry } from "../workspace-registry.cjs";
+import { createWorkspaceRegistry, defaultValidatePath } from "../workspace-registry.cjs";
 
 function temporaryRegistryPath() {
   return path.join(fs.mkdtempSync(path.join(os.tmpdir(), "nanoforge-registry-")), "workspaces.json");
@@ -31,6 +31,11 @@ describe("workspace registry", () => {
   it("surfaces path validation errors before persistence", () => {
     const registry = createWorkspaceRegistry({ registryPath: temporaryRegistryPath(), validatePath: () => { throw new Error("not a directory"); } });
     expect(() => registry.open("/not-a-directory")).toThrow("not a directory");
+  });
+
+  it("rejects a filesystem root as a workspace", () => {
+    const root = path.parse(process.cwd()).root;
+    expect(() => defaultValidatePath(root)).toThrow("workspace root is too broad");
   });
 
   it("writes atomically and quarantines corrupt registry content", () => {

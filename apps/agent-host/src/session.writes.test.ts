@@ -68,6 +68,48 @@ function nextMessage(ws: WsLike): Promise<Record<string, unknown>> {
   });
 }
 
+interface MessageInbox {
+  next(): Promise<Record<string, unknown>>;
+}
+
+function createMessageInbox(ws: WsLike): MessageInbox {
+  const received: Record<string, unknown>[] = [];
+  const waiters: ((message: Record<string, unknown>) => void)[] = [];
+  ws.addEventListener("message", (event) => {
+    const message = JSON.parse(String(event.data)) as Record<string, unknown>;
+    const waiter = waiters.shift();
+    if (waiter) waiter(message);
+    else received.push(message);
+  });
+  return {
+    next: () => {
+      const message = received.shift();
+      return message ? Promise.resolve(message) : new Promise((resolve) => waiters.push(resolve));
+    },
+  };
+}
+
+async function approveExactRequest(
+  ws: WsLike,
+  inbox: MessageInbox,
+  requestId: string,
+): Promise<void> {
+  expect(await inbox.next()).toMatchObject({
+    type: "capability.approval_required",
+    requestId,
+    scope: "write",
+    uses: "single",
+  });
+  const result = inbox.next();
+  ws.send(JSON.stringify({ type: "capability.approval", requestId, approved: true }));
+  expect(await result).toMatchObject({
+    type: "capability.result",
+    requestId,
+    ok: true,
+    grant: { scope: "write", uses: "single" },
+  });
+}
+
 describe("Host session reviewed local writes safety & opt-in", () => {
   it("rejects writes with write_not_approved when allowWorkspaceWrites is false (default)", async () => {
     const root = await tempWorkspace("writes-disabled");
@@ -117,10 +159,10 @@ describe("Host session reviewed local writes safety & opt-in", () => {
     });
 
     const ws = new NativeWebSocket(agentUrl(host, host.token));
+    const inbox = createMessageInbox(ws);
     await waitForOpen(ws);
-    await nextMessage(ws); // host.ready
+    await inbox.next(); // host.ready
 
-    const reply = nextMessage(ws);
     const updatedContent = "hello world updated";
     ws.send(
       JSON.stringify({
@@ -133,7 +175,8 @@ describe("Host session reviewed local writes safety & opt-in", () => {
       }),
     );
 
-    const res = await reply;
+    await approveExactRequest(ws, inbox, "write-2");
+    const res = await inbox.next();
     expect(res).toMatchObject({
       type: "workspace.writeFile.result",
       requestId: "write-2",
@@ -158,12 +201,12 @@ describe("Host session reviewed local writes safety & opt-in", () => {
     });
 
     const ws = new NativeWebSocket(agentUrl(host, host.token));
+    const inbox = createMessageInbox(ws);
     await waitForOpen(ws);
-    await nextMessage(ws); // host.ready
+    await inbox.next(); // host.ready
 
     const staleHash = crypto.createHash("sha256").update("stale content from review").digest("hex");
 
-    const reply = nextMessage(ws);
     ws.send(
       JSON.stringify({
         type: "workspace.writeFile",
@@ -175,7 +218,8 @@ describe("Host session reviewed local writes safety & opt-in", () => {
       }),
     );
 
-    const res = await reply;
+    await approveExactRequest(ws, inbox, "write-conflict-1");
+    const res = await inbox.next();
     expect(res).toMatchObject({
       type: "workspace.error",
       requestId: "write-conflict-1",
@@ -195,11 +239,11 @@ describe("Host session reviewed local writes safety & opt-in", () => {
     });
 
     const ws = new NativeWebSocket(agentUrl(host, host.token));
+    const inbox = createMessageInbox(ws);
     await waitForOpen(ws);
-    await nextMessage(ws); // host.ready
+    await inbox.next(); // host.ready
 
     const newContent = "brand new file content";
-    const reply = nextMessage(ws);
     ws.send(
       JSON.stringify({
         type: "workspace.writeFile",
@@ -210,7 +254,8 @@ describe("Host session reviewed local writes safety & opt-in", () => {
       }),
     );
 
-    const res = await reply;
+    await approveExactRequest(ws, inbox, "write-new-1");
+    const res = await inbox.next();
     expect(res).toMatchObject({
       type: "workspace.writeFile.result",
       requestId: "write-new-1",
