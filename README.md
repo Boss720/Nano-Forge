@@ -1,5 +1,9 @@
 # NanoForge
 
+<img width="1920" height="1080" alt="nanoforge-console-home" src="https://github.com/user-attachments/assets/f053b952-a838-44ba-adfb-4193192ffbd0" />
+<img width="1920" height="1080" alt="nanoforge-swarm-control-plane" src="https://github.com/user-attachments/assets/98b43c03-0763-4934-9cf2-6e5653436efd" />
+
+
 NanoForge is an independently developed, local-first coding workbench candidate for NanoGPT users. It combines a React/Vite browser UI with an optional loopback agent host, shared TypeScript protocol/core packages, and a programmatic SDK.
 
 ## Current status
