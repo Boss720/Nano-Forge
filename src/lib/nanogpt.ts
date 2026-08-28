@@ -65,7 +65,7 @@ export async function validateKey(
   try {
     const res = await fetch(`${baseUrl}/models`, { headers: headers(apiKey) });
     if (res.status === 401 || res.status === 403) {
-      return { ok: false, error: "Key rejected (401). Check the key on nano-gpt.com → API Keys." };
+      return { ok: false, error: `Key rejected (${res.status}). Check the key on nano-gpt.com → API Keys.` };
     }
     if (isX402Response(res.status)) {
       // Accountless mode: surface the per-request price quote, if any.

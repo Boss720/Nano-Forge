@@ -22,6 +22,7 @@
     "test:core": "vitest run --config packages/core/vitest.config.ts",
     "test:sdk": "vitest run --config packages/sdk/vitest.config.ts",
     "test:e2e": "vitest run tests/e2e",
+    "test:m0": "vitest run src/lib/__tests__/nanogpt.test.ts src/hooks/__tests__/useConnectionManager.m0.test.tsx tests/e2e/m0_contract_smoke.test.ts",
     "typecheck": "turbo run typecheck",
     "typecheck:all": "turbo run typecheck",
     "typecheck:protocol": "tsc -p packages/protocol/tsconfig.json",

@@ -32,6 +32,9 @@ jobs:
       - name: Dependency Audit Scan
         run: pnpm audit --audit-level=high
 
+      - name: M0 Contract Freeze
+        run: pnpm run test:m0
+
       - name: Lint
         run: pnpm run lint
 

@@ -78,6 +78,29 @@ describe("fetchModels pricing", () => {
     expect(models[0].outputPrice).toBe(8);
     expect(models[0].priceEstimated).toBe(true);
   });
+
+  it("maps a valid /models catalog row without requiring live credentials", async () => {
+    stubModelsResponse([
+      {
+        id: "openai/gpt-5.4-mini",
+        name: "GPT-5.4 Mini",
+        pricing: { prompt: "0.000002", completion: "0.000008" },
+        context_length: 128_000,
+      },
+    ]);
+    const models = await fetchModels("http://example.test", "key");
+    expect(models).toHaveLength(1);
+    expect(models[0]).toMatchObject({
+      id: "openai/gpt-5.4-mini",
+      name: "GPT-5.4 Mini",
+      provider: "openai",
+      inputPrice: 2,
+      outputPrice: 8,
+      contextK: 128,
+      live: true,
+    });
+    expect(models[0].priceEstimated).toBeUndefined();
+  });
 });
 
 /** SSE body that streams one delta plus a usage frame, then terminates. */
@@ -332,5 +355,35 @@ describe("validateKey x402 surfacing", () => {
     expect(res.error).toContain("402");
     expect(res.error).toContain("0.01 USDC on Base");
     expect(res.x402).toMatchObject({ amount: "0.01", currency: "USDC" });
+  });
+});
+
+describe("validateKey status matrix", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("returns ok on 200 without needing a real key", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ data: [] }), { status: 200 })));
+    const res = await validateKey("http://example.test", "fake-key");
+    expect(res).toEqual({ ok: true });
+  });
+
+  it.each([401, 403] as const)("distinguishes auth failures for %s", async (status) => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("denied", { status })));
+    const res = await validateKey("http://example.test", "fake-key");
+    expect(res.ok).toBe(false);
+    expect(res.error).toContain(`Key rejected (${status})`);
+    expect(res.x402).toBeUndefined();
+  });
+
+  it("reports transport failures as network/CORS blocked", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new TypeError("fetch failed");
+      }),
+    );
+    const res = await validateKey("http://example.test", "fake-key");
+    expect(res.ok).toBe(false);
+    expect(res.error).toContain("Network/CORS blocked the request");
   });
 });
