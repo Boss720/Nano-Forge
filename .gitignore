@@ -71,6 +71,8 @@ temp_*.db
 .agents/
 
 # Temporary Scratch and Debug Files
+linerider/
+screenshots/
 *.pyc
 __pycache__/
 *.swp
