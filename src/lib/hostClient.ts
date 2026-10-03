@@ -593,6 +593,16 @@ export class HostAuthError extends Error {
   }
 }
 
+/** Socket closed with 4401 due to origin mismatch against host allowedOrigins. */
+export class HostOriginMismatchError extends HostAuthError {
+  constructor(reason?: string) {
+    super(reason ?? "origin not permitted by host");
+    this.name = "HostOriginMismatchError";
+    this.message =
+      "Origin mismatch: The UI origin is not permitted by the local agent host. Please launch NanoForge from the authorized launcher origin (e.g. http://127.0.0.1:4183) or configure allowedOrigins on the host.";
+  }
+}
+
 /** Socket closed for a non-auth reason before/between requests. */
 export class HostConnectionError extends Error {
   readonly code?: number;
@@ -601,6 +611,23 @@ export class HostConnectionError extends Error {
     this.name = "HostConnectionError";
     this.code = code;
   }
+}
+
+/**
+ * Calculates a bounded exponential backoff delay with jitter.
+ * Defaults: 500ms -> 1000ms -> 2000ms -> 4000ms -> up to 10000ms max with 25% jitter.
+ */
+export function calculateBackoffDelay(
+  attempt: number,
+  baseMs = 500,
+  maxMs = 10000,
+  jitterFactor = 0.25,
+  randomFn: () => number = Math.random
+): number {
+  const boundedAttempt = Math.max(0, Math.min(attempt, 30));
+  const exponential = Math.min(maxMs, baseMs * Math.pow(2, boundedAttempt));
+  const jitter = exponential * jitterFactor * (typeof randomFn === "function" ? randomFn() : Math.random());
+  return Math.min(maxMs, Math.round(exponential + jitter));
 }
 
 /* ------------------------------------------------------------------ */
@@ -631,6 +658,12 @@ export interface HostClientOptions {
   WebSocketImpl?: WebSocketFactory;
   /** Bounds failed workspace requests so a missing host reply cannot hang the UI. */
   requestTimeoutMs?: number;
+  /** Maximum reconnect attempts when using backoff (default: 5). */
+  maxReconnectAttempts?: number;
+  /** Initial backoff delay in ms (default: 500ms). */
+  initialBackoffMs?: number;
+  /** Maximum backoff delay in ms (default: 10000ms). */
+  maxBackoffMs?: number;
 }
 
 /** Safe browser-facing result of a future host workspace picker/select flow. */
@@ -941,6 +974,9 @@ export class HostClient {
   private closed = false;
   private readonly requestTimeoutMs: number;
   private workspaceGeneration: number | null = null;
+  public readonly maxReconnectAttempts: number;
+  public readonly initialBackoffMs: number;
+  public readonly maxBackoffMs: number;
 
   constructor(opts: HostClientOptions) {
     if (opts.websocketUrl) {
@@ -954,6 +990,49 @@ export class HostClient {
       opts.WebSocketImpl ??
       ((url: string) => new WebSocket(url) as unknown as WebSocketLike);
     this.requestTimeoutMs = opts.requestTimeoutMs ?? 15_000;
+    this.maxReconnectAttempts = opts.maxReconnectAttempts ?? 5;
+    this.initialBackoffMs = opts.initialBackoffMs ?? 500;
+    this.maxBackoffMs = opts.maxBackoffMs ?? 10_000;
+  }
+
+  /** Calculate backoff delay with jitter for a given attempt index */
+  calculateBackoff(attempt: number, randomFn?: () => number): number {
+    return calculateBackoffDelay(attempt, this.initialBackoffMs, this.maxBackoffMs, 0.25, randomFn);
+  }
+
+  /** Connect with bounded exponential backoff with jitter on transient failures */
+  async connectWithRetry(options?: {
+    maxAttempts?: number;
+    initialDelayMs?: number;
+    maxDelayMs?: number;
+    onRetry?: (attempt: number, delayMs: number) => void;
+  }): Promise<void> {
+    const maxAttempts = options?.maxAttempts ?? this.maxReconnectAttempts;
+    const initialDelayMs = options?.initialDelayMs ?? this.initialBackoffMs;
+    const maxDelayMs = options?.maxDelayMs ?? this.maxBackoffMs;
+
+    let lastError: Error | null = null;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        await this.connect();
+        return;
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        if (
+          err instanceof HostOriginMismatchError ||
+          (err instanceof HostAuthError && !(err instanceof HostOriginMismatchError)) ||
+          this.closed
+        ) {
+          throw err;
+        }
+        if (attempt < maxAttempts - 1) {
+          const delay = calculateBackoffDelay(attempt, initialDelayMs, maxDelayMs);
+          options?.onRetry?.(attempt + 1, delay);
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        }
+      }
+    }
+    throw lastError ?? new HostConnectionError("Failed to connect to host after retries");
   }
 
   /** Open the socket. Resolves on `open`; rejects HostAuthError on a 4401 close. */
@@ -1041,6 +1120,18 @@ export class HostClient {
       const workspace = (m as WorkspaceReadyMessage).workspace;
       this.workspaceGeneration = workspace.generation;
       return workspace;
+    });
+  }
+
+  /** Generation-verified workspace check */
+  verifyWorkspaceGeneration(expectedGeneration: number): Promise<HostWorkspaceDescriptor> {
+    return this.describeWorkspace().then((descriptor) => {
+      if (descriptor.generation !== expectedGeneration) {
+        throw new HostConnectionError(
+          `Workspace generation mismatch: expected generation ${expectedGeneration}, got ${descriptor.generation}`
+        );
+      }
+      return descriptor;
     });
   }
 
@@ -1265,8 +1356,14 @@ export class HostClient {
   }
 
   private handleClose(code: number, reason?: string): void {
-    const err =
-      code === AUTH_CLOSE_CODE
+    const isOriginMismatch =
+      code === AUTH_CLOSE_CODE &&
+      typeof reason === "string" &&
+      reason.toLowerCase().includes("origin");
+
+    const err = isOriginMismatch
+      ? new HostOriginMismatchError(reason)
+      : code === AUTH_CLOSE_CODE
         ? new HostAuthError(reason)
         : new HostConnectionError(
             `agent host socket closed (${code}${reason ? `: ${reason}` : ""})`,
@@ -1279,7 +1376,11 @@ export class HostClient {
     this.failPending(err);
     if (code === AUTH_CLOSE_CODE) {
       for (const handler of this.subscribers) {
-        handler({ type: "error", code: "unauthorized", message: err.message });
+        handler({
+          type: "error",
+          code: isOriginMismatch ? "origin_mismatch" : "unauthorized",
+          message: err.message,
+        });
       }
     }
   }

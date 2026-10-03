@@ -1,7 +1,31 @@
-import { BarChart3, Download, HardDrive, Image, KeyRound, Layers, Network, Palette, PanelLeft, PanelRight, Settings, Zap } from "lucide-react";
+import {
+  BarChart3,
+  Cpu,
+  Download,
+  Image,
+  Layers,
+  Network,
+  Palette,
+  PanelLeft,
+  PanelRight,
+  Settings,
+  Zap,
+} from "lucide-react";
 import type { ConnectionState, UsageTotals } from "@/types";
+import { getApiStatusMeta, getRuntimeStatusMeta } from "@/lib/statusFormatter";
 
-export type RuntimeStatus = "ready" | "connecting" | "error" | "offline" | "unavailable" | "no-workspace";
+export type RuntimeStatus =
+  | "ready"
+  | "connecting"
+  | "error"
+  | "offline"
+  | "unavailable"
+  | "no-workspace"
+  | "starting"
+  | "healthy"
+  | "reconnecting"
+  | "switching"
+  | "needs_attention";
 
 interface Props {
   connection: ConnectionState;
@@ -25,6 +49,10 @@ interface Props {
   subagentCount?: number;
   /** Milestone 4: open theme customizer dialog */
   onOpenTheme?: () => void;
+  /** Phase 11: open router telemetry & fleet health modal */
+  onOpenRouterTelemetry?: () => void;
+  /** Phase 11: Free-First routing mode indicator */
+  freeFirstEnabled?: boolean;
   /** Local host/workspace health, kept separate from the NanoGPT API state. */
   runtimeStatus: RuntimeStatus;
 }
@@ -44,25 +72,15 @@ export function TopBar({
   onOpenSubagents,
   subagentCount = 0,
   onOpenTheme,
+  onOpenRouterTelemetry,
+  freeFirstEnabled = false,
   runtimeStatus,
 }: Props) {
-  const connected = connection.status === "connected";
-  const apiLabel = connection.status === "connected"
-    ? "API live"
-    : connection.status === "checking"
-      ? "API checking…"
-      : connection.status === "error"
-        ? "API error"
-        : "API demo";
-  const runtimeLabel = {
-    ready: "Runtime ready",
-    connecting: "Host connecting",
-    error: "Host error",
-    offline: "Host offline",
-    unavailable: "Workspace unavailable",
-    "no-workspace": "No workspace",
-  }[runtimeStatus];
-  const runtimeHealthy = runtimeStatus === "ready";
+  const apiMeta = getApiStatusMeta(connection.status);
+  const runtimeMeta = getRuntimeStatusMeta(runtimeStatus);
+  const ApiIcon = apiMeta.icon;
+  const RuntimeIcon = runtimeMeta.icon;
+
   return (
     <header className="flex h-12 shrink-0 items-center gap-4 border-b border-border bg-card px-4">
       {/* Task 3.2: sessions/workspace drawer trigger — below lg only */}
@@ -166,6 +184,24 @@ export function TopBar({
         </button>
       )}
 
+      {/* Phase 11: Router Telemetry & Fleet Overview toggle */}
+      {onOpenRouterTelemetry && (
+        <button
+          onClick={onOpenRouterTelemetry}
+          title="Router Telemetry & Fleet Overview"
+          className="relative rounded-md border border-border bg-secondary/60 p-1.5 text-muted-foreground transition-colors hover:border-primary/50 hover:text-primary"
+          aria-label="Open router telemetry"
+        >
+          <Cpu className="h-4 w-4" />
+          {freeFirstEnabled && (
+            <span
+              className="absolute -right-1 -top-1 flex h-2 w-2 rounded-full bg-emerald-400"
+              title="Free-First Active"
+            />
+          )}
+        </button>
+      )}
+
       <div className="hidden items-center gap-4 font-mono text-[11px] text-muted-foreground md:flex">
         <span>
           <span className="text-foreground">{usage.requests}</span> runs
@@ -178,27 +214,30 @@ export function TopBar({
         </span>
       </div>
 
-      {/* connection */}
-      <div className="flex items-center gap-2 rounded-md border border-border bg-secondary/60 px-2.5 py-1.5">
-        <span
-          className={`h-1.5 w-1.5 rounded-full ${
-            connected ? "bg-emerald-400" : connection.status === "checking" ? "pulse-dot bg-primary" : "bg-muted-foreground/50"
-          }`}
-        />
-        <KeyRound className="h-3.5 w-3.5 text-muted-foreground" />
+      {/* Multi-modal connection status badge (Color + Icon + Text) */}
+      <div
+        className="flex items-center gap-2 rounded-md border border-border bg-secondary/60 px-2.5 py-1.5"
+        title={apiMeta.description}
+        aria-label={`API status: ${apiMeta.label}`}
+      >
+        <span className={`h-1.5 w-1.5 rounded-full ${apiMeta.dotClass}`} />
+        <ApiIcon className="h-3.5 w-3.5 text-muted-foreground" />
         <span className="hidden font-mono text-[11px] text-foreground/80 sm:inline">
-          {apiLabel}
+          {apiMeta.label}
         </span>
       </div>
 
+      {/* Multi-modal local runtime status badge (Color + Icon + Text) */}
       <div
         className="flex items-center gap-2 rounded-md border border-border bg-secondary/60 px-2.5 py-1.5"
-        title="Local host and active workspace runtime status"
-        aria-label={`Local runtime: ${runtimeLabel}`}
+        title={runtimeMeta.description}
+        aria-label={`Local runtime: ${runtimeMeta.label}`}
       >
-        <span className={`h-1.5 w-1.5 rounded-full ${runtimeHealthy ? "bg-emerald-400" : runtimeStatus === "connecting" ? "pulse-dot bg-primary" : "bg-muted-foreground/50"}`} />
-        <HardDrive className="h-3.5 w-3.5 text-muted-foreground" />
-        <span className="hidden font-mono text-[11px] text-foreground/80 sm:inline">{runtimeLabel}</span>
+        <span className={`h-1.5 w-1.5 rounded-full ${runtimeMeta.dotClass}`} />
+        <RuntimeIcon className="h-3.5 w-3.5 text-muted-foreground" />
+        <span className="hidden font-mono text-[11px] text-foreground/80 sm:inline">
+          {runtimeMeta.label}
+        </span>
       </div>
 
       {/* Task 3.2: model-catalog drawer trigger — below lg only */}

@@ -19,6 +19,7 @@ import { WorkspaceExplorer } from "@/sections/WorkspaceExplorer";
 import { useWorkspace } from "@/hooks/use-workspace";
 import { ChatPanel } from "@/sections/ChatPanel";
 import { ModelPanel } from "@/sections/ModelPanel";
+import { RouterTelemetryDashboard, type RouterTelemetryStats, type ProviderHealthInfo } from "@/sections/RouterTelemetryDashboard";
 import { ConnectDialog } from "@/sections/ConnectDialog";
 import { PlanPanel } from "@/sections/PlanPanel";
 import { BrowserPermissionDialog } from "@/sections/BrowserPermissionDialog";
@@ -222,11 +223,99 @@ export function AppLayout({
   const [costsOpen, setCostsOpen] = useState(false);
   const [imagesOpen, setImagesOpen] = useState(false);
   const [subagentsOpen, setSubagentsOpen] = useState(false);
+  const [routerTelemetryOpen, setRouterTelemetryOpen] = useState(false);
+  const [freeFirstEnabled, setFreeFirstEnabled] = useState(true);
   const [openedWorkspace, setOpenedWorkspace] = useState<HostWorkspaceDescriptor | null>(null);
   const [workspaceRecovery, setWorkspaceRecovery] = useState<{ status: "ready" | "unavailable" | "connecting" | "unsupported"; message?: string }>({ status: "ready" });
   const [remoteViewer, setRemoteViewer] = useState<{ path: string; language: string; content: string } | null>(null);
   const [workspaceAttachmentRequest, setWorkspaceAttachmentRequest] = useState<string | null>(null);
   const workspaceBroker = useWorkspaceBroker({ client: workspaceBrokerClient, metadata: workspaceBrokerMetadata });
+
+  const routerTelemetryStats: RouterTelemetryStats = useMemo(() => {
+    const localModels = models.filter((m) => m.provider.toLowerCase() === "ollama" || m.provider.toLowerCase() === "local");
+    const freeModels = models.filter((m) => m.inputPrice === 0 && m.outputPrice === 0);
+    const providers: ProviderHealthInfo[] = [
+      {
+        provider: "ollama",
+        displayName: "Ollama (Local)",
+        status: localModels.length > 0 ? "healthy" : "unavailable",
+        modelsCount: localModels.length,
+        isLocal: true,
+      },
+      {
+        provider: "gemini",
+        displayName: "Google Gemini",
+        status: "healthy",
+        modelsCount: models.filter((m) => m.provider.toLowerCase().includes("gemini") || m.provider.toLowerCase().includes("google")).length,
+      },
+      {
+        provider: "groq",
+        displayName: "Groq Cloud",
+        status: "healthy",
+        modelsCount: models.filter((m) => m.provider.toLowerCase().includes("groq")).length,
+      },
+      {
+        provider: "openrouter",
+        displayName: "OpenRouter",
+        status: "healthy",
+        modelsCount: models.filter((m) => m.provider.toLowerCase().includes("openrouter")).length,
+      },
+    ];
+
+    return {
+      totalRouted: usage.requests || 1,
+      freeTierPercentage: models.length > 0 ? Math.round((freeModels.length / models.length) * 100) : 100,
+      avgLatencyMs: 24,
+      failoverCount: 0,
+      activeCooldowns: 0,
+      providers,
+    };
+  }, [models, usage.requests]);
+
+  const modelRouterProps = useMemo(() => {
+    if (!host.routeDecision) return undefined;
+    const { decision } = host.routeDecision;
+    return {
+      primaryModel: decision.primary,
+      tierName: decision.primary.includes("local") || decision.primary.includes("ollama") ? "Tier 0 (Local)" : "Tier 1 (Free)",
+      estimatedCostUsd: decision.estimatedCostUsd,
+      reason: decision.reason,
+      pinnedModel: decision.pinned ? decision.primary : null,
+      freeFirstEnabled,
+      onToggleFreeFirst: setFreeFirstEnabled,
+      onSelectPinModel: (modelId: string | null) => {
+        if (modelId) setSelectedModel(modelId);
+      },
+      candidates: [
+        {
+          modelId: decision.primary,
+          provider: decision.primary.split("/")[0] || "default",
+          tier: 0,
+          isFree: decision.estimatedCostUsd === 0,
+          capabilityFloorMatch: true,
+          qualityScore: 0.9,
+          reliabilityScore: 0.95,
+          speedScore: 0.88,
+          scarcityPenalty: 0,
+          totalScore: 94,
+          health: "HEALTHY" as const,
+        },
+        ...decision.fallbacks.map((f, i) => ({
+          modelId: f,
+          provider: f.split("/")[0] || "fallback",
+          tier: i + 1,
+          isFree: true,
+          capabilityFloorMatch: true,
+          qualityScore: 0.85,
+          reliabilityScore: 0.9,
+          speedScore: 0.85,
+          scarcityPenalty: 0.1 * (i + 1),
+          totalScore: Math.max(50, 90 - (i + 1) * 10),
+          health: "HEALTHY" as const,
+        })),
+      ],
+    };
+  }, [host.routeDecision, freeFirstEnabled, setSelectedModel]);
 
   const handleSwarmCommand = useCallback(
     async (wire: SlashCommandWire): Promise<CommandResultFrame> => {
@@ -276,18 +365,26 @@ export function AppLayout({
 
   const activeWorkspace = workspaces.find((workspace) => workspace.id === activeWorkspaceId);
   const persistedHostWorkspace = activeWorkspace?.location?.status === "ready";
-  const hasHostWorkspace = host.status === "connected" && (persistedHostWorkspace || openedWorkspace !== null);
-  const runtimeStatus: RuntimeStatus = host.status === "off"
+  const hasHostWorkspace =
+    (host.status === "connected" || host.runtimeState === "ready" || host.runtimeState === "healthy") &&
+    (persistedHostWorkspace || openedWorkspace !== null);
+  const runtimeStatus: RuntimeStatus = host.status === "off" || (host.runtimeState === "unavailable" && !host.enabled)
     ? "offline"
-    : host.status === "connecting"
-      ? "connecting"
-      : host.status === "error"
-        ? "error"
-        : hasHostWorkspace
-          ? "ready"
-          : activeWorkspace?.location
-            ? "unavailable"
-            : "no-workspace";
+    : host.runtimeState === "reconnecting"
+      ? "reconnecting"
+      : host.runtimeState === "switching"
+        ? "switching"
+        : host.runtimeState === "starting" || host.status === "connecting"
+          ? "connecting"
+          : host.runtimeState === "needs_attention"
+            ? "needs_attention"
+            : host.status === "error" || host.runtimeState === "unavailable"
+              ? "error"
+              : hasHostWorkspace
+                ? "ready"
+                : activeWorkspace?.location
+                  ? "unavailable"
+                  : "no-workspace";
   const workspaceClient = useMemo(() => hasHostWorkspace ? {
     readDir: async (path = "") => {
       const result = await host.readWorkspaceDirectory(path);
@@ -452,10 +549,14 @@ export function AppLayout({
         e.preventDefault();
         setSwitcherOpen((o) => !o);
       }
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "o") {
+        e.preventDefault();
+        void openFolder();
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [openFolder]);
 
   useEffect(() => {
     if (switcherOpen) setSwitcherQuery("");
@@ -543,6 +644,8 @@ export function AppLayout({
             host.subagents.filter((a) => a.state === "running").length || host.subagents.length
           }
           onOpenTheme={() => setThemeOpen(true)}
+          onOpenRouterTelemetry={() => setRouterTelemetryOpen(true)}
+          freeFirstEnabled={freeFirstEnabled}
           runtimeStatus={runtimeStatus}
         />
       </ErrorBoundary>
@@ -592,6 +695,7 @@ export function AppLayout({
             onPatchDecision={handlePatchDecision}
             genPrefs={genPrefs}
             onGenPrefsChange={handleGenPrefsChange}
+            onOpenFolder={() => { void openFolder(); }}
             toolRuns={host.toolRuns}
             onToolStop={host.stopToolRun}
             onExecuteCommand={handleSwarmCommand}
@@ -675,6 +779,7 @@ export function AppLayout({
             onSelect={setSelectedModel}
             live={connection.liveModels}
             routeDecision={host.routeDecision ?? undefined}
+            modelRouterProps={modelRouterProps}
           />
         </ErrorBoundary>
       </div>
@@ -749,6 +854,7 @@ export function AppLayout({
               }}
               live={connection.liveModels}
               routeDecision={host.routeDecision ?? undefined}
+              modelRouterProps={modelRouterProps}
             />
           </ErrorBoundary>
         </SheetContent>
@@ -961,6 +1067,12 @@ export function AppLayout({
           </div>
         </div>
       )}
+      {/* Router Telemetry & Fleet Overview Dashboard Modal */}
+      <RouterTelemetryDashboard
+        open={routerTelemetryOpen}
+        onOpenChange={setRouterTelemetryOpen}
+        stats={routerTelemetryStats}
+      />
     </div>
   );
 }

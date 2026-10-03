@@ -3,6 +3,7 @@ import { Check, ExternalLink, Search } from "lucide-react";
 import type { NanoModel } from "@/types";
 import { cn } from "@/lib/utils";
 import { RouteDecisionCard, type RouteDecisionCardProps } from "./RouteDecisionCard";
+import { ModelRouterCard, type ModelRouterCardProps } from "./ModelRouterCard";
 
 interface Props {
   models: NanoModel[];
@@ -14,11 +15,13 @@ interface Props {
    * when no local host/router is active — the panel is unchanged without it.
    */
   routeDecision?: RouteDecisionCardProps;
+  /** Phase 11: Capability-floor model router details, candidates matrix, and handoff preview */
+  modelRouterProps?: ModelRouterCardProps;
   /** Layout overrides — e.g. `hidden lg:flex` inline, `h-full w-full border-l-0` in a drawer. */
   className?: string;
 }
 
-export function ModelPanel({ models, selected, onSelect, live, routeDecision, className }: Props) {
+export function ModelPanel({ models, selected, onSelect, live, routeDecision, modelRouterProps, className }: Props) {
   const [q, setQ] = useState("");
   const [provider, setProvider] = useState<string>("all");
 
@@ -54,12 +57,16 @@ export function ModelPanel({ models, selected, onSelect, live, routeDecision, cl
         </div>
       </div>
 
-      {/* Task 17: surfaced only while a host/router route decision exists. */}
-      {routeDecision && (
+      {/* Phase 11: Capability-floor router card with candidate matrix and handoff preview */}
+      {modelRouterProps ? (
+        <div className="px-2 pb-2">
+          <ModelRouterCard {...modelRouterProps} />
+        </div>
+      ) : routeDecision ? (
         <div className="px-2 pb-2">
           <RouteDecisionCard {...routeDecision} />
         </div>
-      )}
+      ) : null}
 
       <div className="scrollbar-thin flex gap-1 overflow-x-auto px-3 pb-2">
         {providers.map((p) => (

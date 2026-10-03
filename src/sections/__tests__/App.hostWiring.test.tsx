@@ -32,6 +32,38 @@ beforeAll(() => {
       dispatchEvent: () => false,
     }),
   });
+
+  class MockWebSocket {
+    static readonly CONNECTING = 0;
+    static readonly OPEN = 1;
+    static readonly CLOSING = 2;
+    static readonly CLOSED = 3;
+    readyState = 1;
+    url: string;
+    onopen: ((ev: unknown) => void) | null = null;
+    onmessage: ((ev: { data: unknown }) => void) | null = null;
+    onclose: ((ev: { code: number; reason?: string }) => void) | null = null;
+    onerror: ((ev: unknown) => void) | null = null;
+    constructor(url: string) {
+      this.url = url;
+      queueMicrotask(() => {
+        this.onopen?.({ type: "open" });
+      });
+    }
+    send(_data: string) {}
+    close(code = 1000, reason = "") {
+      this.readyState = 3;
+      this.onclose?.({ code, reason });
+    }
+    addEventListener() {}
+    removeEventListener() {}
+    dispatchEvent() {
+      return true;
+    }
+  }
+
+  (globalThis as unknown as { WebSocket: unknown }).WebSocket = MockWebSocket;
+  (window as unknown as { WebSocket: unknown }).WebSocket = MockWebSocket;
 });
 
 afterEach(cleanup);
@@ -133,7 +165,7 @@ describe("App host wiring", () => {
     ), { status: 200 }));
 
     render(<App />);
-    await user.click(screen.getByRole("button", { name: /open local folder/i }));
+    await user.click(screen.getAllByRole("button", { name: /open local folder/i })[0]);
 
     await waitFor(() => expect(screen.queryByRole("heading", { name: /recent folders/i })).not.toBeInTheDocument());
     expect(localStorage.getItem(STORAGE_KEY) ?? "").not.toContain("workspace-opaque");
@@ -159,7 +191,7 @@ describe("App host wiring", () => {
     const prompt = vi.spyOn(window, "prompt");
 
     render(<App />);
-    await user.click(screen.getByRole("button", { name: /open local folder/i }));
+    await user.click(screen.getAllByRole("button", { name: /open local folder/i })[0]);
 
     await waitFor(() => expect(fetcher).toHaveBeenCalledWith(
       `${window.location.origin}/workspace/choose`,
@@ -339,7 +371,7 @@ describe("App host wiring", () => {
     await user.click(settingsBtn);
 
     // Switch to Workspace tab
-    const workspaceTabBtn = screen.getAllByRole("button", { name: /^workspace$/i })[0];
+    const workspaceTabBtn = screen.getByTestId("tab-workspace");
     await user.click(workspaceTabBtn);
 
     const checkbox = screen.getByRole("checkbox", { name: /enable reviewed local writes/i });

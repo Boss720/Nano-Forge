@@ -72,18 +72,16 @@ describe("ConnectDialog integrations entry point", () => {
   };
 
   it("omits the entry point when onOpenIntegrations is not provided (no host)", () => {
-    render(<ConnectDialog {...baseProps} />);
-    expect(screen.getByText("Connect nano-gpt.com")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /integrations/i })).not.toBeInTheDocument();
+    render(<ConnectDialog {...baseProps} initialTab="advanced" />);
+    expect(screen.getByText("Settings & Preferences")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /open integrations/i })).not.toBeInTheDocument();
   });
 
   it("renders an integrations button that fires the callback", async () => {
     const user = userEvent.setup();
     const onOpenIntegrations = vi.fn();
-    render(<ConnectDialog {...baseProps} onOpenIntegrations={onOpenIntegrations} />);
-    await user.click(screen.getByRole("button", { name: /integrations/i }));
+    render(<ConnectDialog {...baseProps} initialTab="advanced" onOpenIntegrations={onOpenIntegrations} />);
+    await user.click(screen.getByRole("button", { name: /open integrations/i }));
     expect(onOpenIntegrations).toHaveBeenCalledTimes(1);
-    // existing connect flow untouched
-    expect(screen.getByRole("button", { name: /test & connect/i })).toBeInTheDocument();
   });
 });

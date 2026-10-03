@@ -42,4 +42,34 @@ describe("useWorkspaceBroker", () => {
 
     expect(client.activate).toHaveBeenCalledWith("workspace-opaque-1");
   });
+
+  it("handles non-retryable broker errors with clear diagnostic messages", async () => {
+    const accessDeniedClient = fakeClient({
+      choose: vi.fn(async () => {
+        throw new WorkspaceBrokerError("access denied", "access_denied");
+      }),
+    });
+    const { result } = renderHook(() => useWorkspaceBroker({ client: accessDeniedClient }));
+
+    await act(async () => {
+      await result.current.choose();
+    });
+
+    expect(result.current.state.status).toBe("unavailable");
+    expect(result.current.state.message).toContain("Access denied to the selected folder");
+
+    const rootTooBroadClient = fakeClient({
+      activate: vi.fn(async () => {
+        throw new WorkspaceBrokerError("root too broad", "root_too_broad");
+      }),
+    });
+    const { result: r2 } = renderHook(() => useWorkspaceBroker({ client: rootTooBroadClient }));
+
+    await act(async () => {
+      await r2.current.activate("root-id");
+    });
+
+    expect(r2.current.state.status).toBe("unavailable");
+    expect(r2.current.state.message).toContain("filesystem root or too broad");
+  });
 });
