@@ -81,6 +81,44 @@ export type SupervisorStrategy = z.infer<typeof supervisorStrategySchema>;
 export const messagePrioritySchema = z.enum(["high", "normal", "low"]);
 export type MessagePriority = z.infer<typeof messagePrioritySchema>;
 
+/**
+ * Model tiers for subagent specialization and economical model assignment.
+ * - "flash_lite": Tier 0/1 fast search, low token footprint
+ * - "flash": Tier 1/2 competent code implementation, test repair, domain tasks
+ * - "pro": Tier 3 deep reasoning, architecture, DAG decomposition
+ * - "inherit": Inherit parent agent's tier
+ */
+export const subagentModelTierSchema = z.enum(["flash_lite", "flash", "pro", "inherit"]);
+export type SubagentModelTier = z.infer<typeof subagentModelTierSchema>;
+
+export const ARCHETYPE_DEFAULT_TIERS: Record<SubagentArchetype, Exclude<SubagentModelTier, "inherit">> = {
+  explorer: "flash_lite",
+  qa: "flash",
+  implementer: "flash",
+  specialist: "flash",
+  verifier: "flash",
+  planner: "pro",
+  custom: "flash",
+};
+
+export const ARCHETYPE_CAPABILITY_FLOORS: Record<SubagentArchetype, number> = {
+  explorer: 0.1,
+  qa: 0.4,
+  implementer: 0.6,
+  specialist: 0.6,
+  verifier: 0.7,
+  planner: 0.85,
+  custom: 0.5,
+};
+
+export const TIER_DEFAULT_TOKEN_BUDGETS: Record<Exclude<SubagentModelTier, "inherit">, number> = {
+  flash_lite: 25_000,
+  flash: 100_000,
+  pro: 250_000,
+};
+
+export const MAX_CONCURRENT_PRO_SUBAGENTS = 2;
+
 /* ------------------------------------------------------------------ */
 /* 2. Error Codes & Protocol Constants                                */
 /* ------------------------------------------------------------------ */
@@ -94,8 +132,10 @@ export const SUBAGENT_ERROR_CODES = {
   ERR_SUBAGENT_NOT_FOUND: "ERR_SUBAGENT_NOT_FOUND",
   ERR_SUBAGENT_INVALID_STATE_TRANSITION: "ERR_SUBAGENT_INVALID_STATE_TRANSITION",
   ERR_SUBAGENT_CONCURRENCY_LIMIT_EXCEEDED: "ERR_SUBAGENT_CONCURRENCY_LIMIT_EXCEEDED",
+  ERR_SUBAGENT_PRO_CONCURRENCY_EXCEEDED: "ERR_SUBAGENT_PRO_CONCURRENCY_EXCEEDED",
   ERR_SUBAGENT_INSPECTION_FILE_NOT_FOUND: "ERR_SUBAGENT_INSPECTION_FILE_NOT_FOUND",
   ERR_SUBAGENT_INVALID_CONFIG: "ERR_SUBAGENT_INVALID_CONFIG",
+  ERR_SUBAGENT_FILE_COLLISION: "ERR_SUBAGENT_FILE_COLLISION",
 } as const;
 
 export type SubagentErrorCode = (typeof SUBAGENT_ERROR_CODES)[keyof typeof SUBAGENT_ERROR_CODES];
@@ -124,16 +164,29 @@ export const subagentConfigSchema = z.object({
   roles: z.array(z.string().min(1)).default([]),
   systemPrompt: z.string().max(65536).optional(),
   model: z.string().max(128).optional(),
+  modelTier: subagentModelTierSchema.optional(),
   workspaceIsolation: workspaceIsolationModeSchema.default("inherit"),
   allowedTools: z.array(z.string().min(1)).optional(),
   allowedToolKinds: z.array(z.string().min(1)).optional(),
   timeoutSeconds: z.number().int().positive().max(7200).default(600),
   budgetTokens: z.number().int().positive().optional(),
   skills: z.array(z.string().min(1)).default([]),
+  fileOwnership: z.array(z.string().min(1)).optional(),
   environmentVariables: z.record(z.string(), z.string()).optional(),
 });
 export type SubagentConfig = z.infer<typeof subagentConfigSchema>;
 export type SubagentDefinition = SubagentConfig;
+
+/**
+ * Routing metadata recorded when a subagent is dynamically assigned a model.
+ */
+export const subagentRoutingDecisionSchema = z.object({
+  modelId: z.string(),
+  providerId: z.string(),
+  score: z.number(),
+  explanation: z.string(),
+});
+export type SubagentRoutingDecision = z.infer<typeof subagentRoutingDecisionSchema>;
 
 /**
  * Detailed token consumption and runtime latency telemetry schema for subagents.
@@ -163,6 +216,9 @@ export const subagentInfoSchema = z.object({
   archetype: subagentArchetypeSchema,
   roles: z.array(z.string()),
   state: subagentStateSchema,
+  model: z.string().optional(),
+  modelTier: subagentModelTierSchema.optional(),
+  routingDecision: subagentRoutingDecisionSchema.optional(),
   workingDirectory: z.string(),
   worktreePath: z.string().optional(),
   isolationMode: workspaceIsolationModeSchema,
@@ -173,6 +229,7 @@ export const subagentInfoSchema = z.object({
   turnCount: z.number().int().nonnegative().default(0),
   telemetry: subagentTelemetrySchema.optional(),
   lastProgressSummary: z.string().optional(),
+  fileOwnership: z.array(z.string()).optional(),
   exitCode: z.number().int().optional(),
   error: z.string().optional(),
 });
@@ -283,7 +340,9 @@ export const invokeSubagentParamsSchema = z.object({
   timeoutSeconds: z.number().int().positive().max(7200).default(600),
   budgetTokens: z.number().int().positive().optional(),
   skills: z.array(z.string().min(1)).default([]),
+  fileOwnership: z.array(z.string().min(1)).optional(),
   model: z.string().max(128).optional(),
+  modelTier: subagentModelTierSchema.optional(),
 });
 export type InvokeSubagentParams = z.infer<typeof invokeSubagentParamsSchema>;
 
@@ -294,6 +353,8 @@ export const invokeSubagentResultSchema = z.object({
   workingDirectory: z.string(),
   state: subagentStateSchema,
   startedAt: z.string().datetime(),
+  model: z.string().optional(),
+  modelTier: subagentModelTierSchema.optional(),
 });
 export type InvokeSubagentResult = z.infer<typeof invokeSubagentResultSchema>;
 

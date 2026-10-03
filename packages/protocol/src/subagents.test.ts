@@ -33,10 +33,17 @@ import {
   MAX_SUBAGENT_HIERARCHY_DEPTH,
   MAX_CONCURRENT_SUBAGENTS,
   DEFAULT_SUBAGENT_TIMEOUT_SECONDS,
+  subagentModelTierSchema,
+  ARCHETYPE_DEFAULT_TIERS,
+  ARCHETYPE_CAPABILITY_FLOORS,
+  TIER_DEFAULT_TOKEN_BUDGETS,
+  MAX_CONCURRENT_PRO_SUBAGENTS,
+  subagentRoutingDecisionSchema,
   type SubagentState,
   type SubagentInfo,
   type SubagentMessage,
   type SubagentTelemetry,
+  type SubagentModelTier,
 } from "./subagents";
 
 
@@ -666,6 +673,78 @@ describe("Subagent Protocol & Schemas Suite", () => {
       expect(telem.p95TurnLatencyMs).toBe(0);
       expect(telem.totalDurationMs).toBe(0);
       expect(telem.toolDurationMs).toBe(0);
+    });
+
+    it("validates subagentModelTierSchema values and constants", () => {
+      expect(subagentModelTierSchema.parse("flash_lite")).toBe("flash_lite");
+      expect(subagentModelTierSchema.parse("flash")).toBe("flash");
+      expect(subagentModelTierSchema.parse("pro")).toBe("pro");
+      expect(subagentModelTierSchema.parse("inherit")).toBe("inherit");
+      expect(() => subagentModelTierSchema.parse("invalid_tier")).toThrow();
+
+      expect(ARCHETYPE_DEFAULT_TIERS.explorer).toBe("flash_lite");
+      expect(ARCHETYPE_DEFAULT_TIERS.planner).toBe("pro");
+      expect(ARCHETYPE_DEFAULT_TIERS.implementer).toBe("flash");
+
+      expect(ARCHETYPE_CAPABILITY_FLOORS.explorer).toBe(0.1);
+      expect(ARCHETYPE_CAPABILITY_FLOORS.planner).toBe(0.85);
+
+      expect(TIER_DEFAULT_TOKEN_BUDGETS.flash_lite).toBe(25_000);
+      expect(TIER_DEFAULT_TOKEN_BUDGETS.flash).toBe(100_000);
+      expect(TIER_DEFAULT_TOKEN_BUDGETS.pro).toBe(250_000);
+
+      expect(MAX_CONCURRENT_PRO_SUBAGENTS).toBe(2);
+
+      const decision = subagentRoutingDecisionSchema.parse({
+        modelId: "gemini-2.0-flash",
+        providerId: "google",
+        score: 95.5,
+        explanation: "Selected Gemini Flash | Score: 95.5",
+      });
+      expect(decision.modelId).toBe("gemini-2.0-flash");
+    });
+
+    it("validates fileOwnership in subagentConfigSchema, subagentInfoSchema, and invokeSubagentParamsSchema", () => {
+      expect(SUBAGENT_ERROR_CODES.ERR_SUBAGENT_FILE_COLLISION).toBe("ERR_SUBAGENT_FILE_COLLISION");
+
+      // Optional when omitted
+      const config = subagentConfigSchema.parse({
+        name: "test-agent",
+        archetype: "implementer",
+      });
+      expect(config.fileOwnership).toBeUndefined();
+
+      // Explicit file ownership array
+      const configWithFiles = subagentConfigSchema.parse({
+        name: "test-agent-2",
+        archetype: "implementer",
+        fileOwnership: ["packages/llm-router/**", "src/index.ts"],
+      });
+      expect(configWithFiles.fileOwnership).toEqual(["packages/llm-router/**", "src/index.ts"]);
+
+      // invokeSubagentParamsSchema
+      const invokeParams = invokeSubagentParamsSchema.parse({
+        archetype: "implementer",
+        prompt: "Refactor router",
+        fileOwnership: ["packages/llm-router/src/routing/**"],
+      });
+      expect(invokeParams.fileOwnership).toEqual(["packages/llm-router/src/routing/**"]);
+
+      // subagentInfoSchema
+      const info = subagentInfoSchema.parse({
+        id: sampleUuid1,
+        parentId: null,
+        name: "worker_1",
+        archetype: "implementer",
+        roles: ["worker"],
+        state: "running",
+        workingDirectory: "/test",
+        isolationMode: "inherit",
+        startedAt: sampleTimestamp,
+        lastHeartbeat: sampleTimestamp,
+        fileOwnership: ["packages/llm-router/**"],
+      });
+      expect(info.fileOwnership).toEqual(["packages/llm-router/**"]);
     });
   });
 });

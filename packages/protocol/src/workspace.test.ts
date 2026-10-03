@@ -9,6 +9,8 @@ import {
   workspaceReadySchema,
   workspaceErrorSchema,
   workspaceWriteRequestSchema,
+  isNonRetryableWorkspaceErrorCode,
+  isNonRetryableError,
 } from "./workspace";
 
 describe("workspace protocol", () => {
@@ -111,6 +113,37 @@ describe("workspace protocol", () => {
         websocketUrl: "wss://host.example.test:48123",
         generation: 2,
       }).success).toBe(false);
+    });
+  });
+
+  describe("non-retryable error classification", () => {
+    it("identifies non-retryable error codes", () => {
+      expect(isNonRetryableWorkspaceErrorCode("permission_denied")).toBe(true);
+      expect(isNonRetryableWorkspaceErrorCode("access_denied")).toBe(true);
+      expect(isNonRetryableWorkspaceErrorCode("root_too_broad")).toBe(true);
+      expect(isNonRetryableWorkspaceErrorCode("workspace_missing")).toBe(true);
+      expect(isNonRetryableWorkspaceErrorCode("workspace_moved")).toBe(true);
+      expect(isNonRetryableWorkspaceErrorCode("not_found")).toBe(true);
+      expect(isNonRetryableWorkspaceErrorCode("not_directory")).toBe(true);
+      expect(isNonRetryableWorkspaceErrorCode("invalid_path")).toBe(true);
+
+      expect(isNonRetryableWorkspaceErrorCode("stale_generation")).toBe(false);
+      expect(isNonRetryableWorkspaceErrorCode("reconnect_required")).toBe(false);
+      expect(isNonRetryableWorkspaceErrorCode("io_error")).toBe(false);
+    });
+
+    it("classifies error objects and strings with isNonRetryableError", () => {
+      expect(isNonRetryableError("permission_denied")).toBe(true);
+      expect(isNonRetryableError({ code: "root_too_broad" })).toBe(true);
+      expect(isNonRetryableError(new Error("EACCES: permission denied, scandir 'C:\\restricted'"))).toBe(true);
+      expect(isNonRetryableError(new Error("Selected folder root is too broad"))).toBe(true);
+      expect(isNonRetryableError(new Error("The workspace missing on disk"))).toBe(true);
+      expect(isNonRetryableError(new Error("Directory not found"))).toBe(true);
+
+      expect(isNonRetryableError("stale_generation")).toBe(false);
+      expect(isNonRetryableError(new Error("WebSocket network glitch"))).toBe(false);
+      expect(isNonRetryableError(null)).toBe(false);
+      expect(isNonRetryableError(123)).toBe(false);
     });
   });
 });
