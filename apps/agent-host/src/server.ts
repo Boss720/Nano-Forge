@@ -346,7 +346,10 @@ export async function createHost(options: HostOptions = {}): Promise<HostHandle>
     }
     const origin = req.headers.origin;
     if (!isAllowedOrigin(origin, options.allowedOrigins, options.allowNonBrowserClients)) {
-      socket.close(CLOSE_UNAUTHORIZED, "unauthorized origin");
+      logger.warn("host.origin_unauthorized", "Rejected WebSocket connection due to origin mismatch", {
+        origin: typeof origin === "string" ? origin.slice(0, 128) : "missing",
+      });
+      socket.close(CLOSE_UNAUTHORIZED, "unauthorized origin: origin mismatch");
       return;
     }
     const queryToken = new URL(req.url ?? "/agent", "http://127.0.0.1")
@@ -362,6 +365,7 @@ export async function createHost(options: HostOptions = {}): Promise<HostHandle>
     } else {
       attachAgentSession(socket, { hostId }, {
         ...options.session,
+        preApprovedWrites: options.session?.preApprovedWrites ?? options.session?.allowWorkspaceWrites,
         workspaceRoot,
         workspaceDescriptor: validatedWorkspace.descriptor,
         daemonManager,

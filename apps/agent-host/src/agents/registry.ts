@@ -70,6 +70,9 @@ export class SubagentRegistry {
       archetype: node.archetype,
       roles: node.roles,
       state: node.state,
+      model: node.model,
+      modelTier: node.modelTier,
+      routingDecision: node.routingDecision,
       workingDirectory: node.workingDirectory,
       worktreePath: node.worktreePath,
       isolationMode: node.isolationMode,
@@ -80,6 +83,7 @@ export class SubagentRegistry {
       turnCount: node.turnCount,
       telemetry: node.telemetry,
       lastProgressSummary: node.lastProgressSummary,
+      fileOwnership: node.fileOwnership ?? [],
       exitCode: node.exitCode,
       error: node.error,
     });

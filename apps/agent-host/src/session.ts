@@ -7,6 +7,7 @@
  * opts in to a reviewed write flow.
  */
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import type { WorkspaceDescriptor, WorkspaceErrorCode } from "@protocol/workspace";
 import type { ExecutionPlan } from "@protocol/plan";
 import type { ModelProfile } from "@protocol/routing";
@@ -36,7 +37,7 @@ import {
 import { loadPolicy } from "./policy/policy";
 import { OpenAICompatibleAdapter } from "./providers/openaiCompatible";
 import { InMemoryProviderRegistry } from "./providers/registry";
-import { RunCoordinator, bindRouter, type ApprovalGate, type ApprovalOutcome, type ApprovalRequest } from "./runs/coordinator";
+import { RunCoordinator, bindRouter } from "./runs/coordinator";
 import { RunEventLog, type RunEvent } from "./runs/events";
 import { runTerminalJob } from "./terminal/runner";
 import { PtyManager } from "./terminal/ptyManager";
@@ -54,6 +55,14 @@ import { WorkspaceFileError } from "./workspace/filesystem.js";
 import { SubagentSupervisor } from "./agents/supervisor.js";
 import { DaemonManager } from "./daemons/manager.js";
 import { SharedMemoryEngine } from "./agents/memory.js";
+import {
+  CapabilityBroker,
+  digestArguments,
+  type CapabilityBinding,
+  type CapabilityGrant as BrokerGrant,
+  type CapabilityAuditRecord,
+} from "./capabilities/broker.js";
+import { BrokerApprovalGate, type RunApprovalPresentation } from "./capabilities/runApprovalGate.js";
 
 export interface AgentSessionOptions {
   workspaceRoot?: string;
@@ -63,6 +72,11 @@ export interface AgentSessionOptions {
    * diff/approval workflow; enabling this is only for trusted embeddings.
    */
   allowWorkspaceWrites?: boolean;
+  /**
+   * When true, workspace writes are pre-approved and do not require an interactive
+   * capability approval handshake frame.
+   */
+  preApprovedWrites?: boolean;
   /** Provider configuration is read only in the privileged host process. */
   provider?: {
     id?: string;
@@ -82,66 +96,16 @@ export interface AgentSessionOptions {
 
 type Send = (message: HostMessage | TerminalServerMessage | CommandResultFrame) => void;
 
-class SocketApprovalGate implements ApprovalGate {
-  private readonly pending = new Map<string, (outcome: ApprovalOutcome) => void>();
-
-  constructor(private readonly send: Send, private readonly now: () => string) {}
-
-  requestApproval(request: ApprovalRequest): Promise<ApprovalOutcome> {
-    const requestId = request.runId + ":" + request.stepId + ":" + request.tool;
-    this.send({
-      type: "tool.approval_required",
-      requestId,
-      runId: request.runId,
-      request: request.request,
-      reason: request.reason,
-      at: this.now(),
-    });
-    return new Promise((resolve) => this.pending.set(requestId, resolve));
-  }
-
-  resolve(
-    requestId: string,
-    approved: boolean,
-    reason?: string,
-    runId?: string,
-    stepId?: string,
-  ): boolean {
-    let keyToResolve: string | undefined;
-    if (this.pending.has(requestId)) {
-      keyToResolve = requestId;
-    } else if (runId && stepId) {
-      const prefix = `${runId}:${stepId}`;
-      for (const key of this.pending.keys()) {
-        if (key === prefix || key.startsWith(prefix + ":")) {
-          keyToResolve = key;
-          break;
-        }
-      }
-    } else {
-      for (const key of this.pending.keys()) {
-        if (key === requestId || key.startsWith(requestId + ":")) {
-          keyToResolve = key;
-          break;
-        }
-      }
-    }
-
-    if (!keyToResolve) return false;
-    const resolve = this.pending.get(keyToResolve);
-    if (!resolve) return false;
-    this.pending.delete(keyToResolve);
-    resolve(approved ? { outcome: "granted" } : { outcome: "denied", ...(reason ? { reason } : {}) });
-    return true;
-  }
-
-  close(): void {
-    for (const resolve of this.pending.values()) {
-      resolve({ outcome: "denied", reason: "client disconnected" });
-    }
-    this.pending.clear();
-  }
-}
+type DeferredCapability = {
+  readonly requestId: string;
+  readonly token: string;
+  readonly binding: CapabilityBinding;
+  readonly grant: BrokerGrant;
+  readonly issuedAt: string;
+  readonly operation: string;
+  readonly execute: () => Promise<void>;
+  state: "pending" | "consumed" | "revoked";
+};
 
 const profileFor = (providerId: string, model: string): ModelProfile => ({
   id: model,
@@ -430,6 +394,24 @@ const parseCommandFrame = (raw: unknown): CommandExecuteFrame | null => {
   return result.success ? result.data : null;
 };
 
+const capabilityId = (value: string, prefix: string): string =>
+  /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value)
+    ? value
+    : `${prefix}-${digestArguments(value).slice(0, 24)}`;
+
+const capabilityErrorCode = (
+  reason: "allowed" | "binding_mismatch" | "expired" | "replayed" | "revoked" | "unknown_grant" | "invalid_request",
+): "invalid_request" | "denied" | "expired" | "stale_binding" | "already_used" => {
+  switch (reason) {
+    case "expired": return "expired";
+    case "replayed": return "already_used";
+    case "binding_mismatch": return "stale_binding";
+    case "unknown_grant":
+    case "invalid_request": return "invalid_request";
+    default: return "denied";
+  }
+};
+
 /** Attach a fully composed coordinator + workspace RPC session to one socket. */
 export function attachAgentSession(
   socket: WebSocket,
@@ -443,6 +425,9 @@ export function attachAgentSession(
   }
   const generation = workspace.generation;
   const now = () => new Date().toISOString();
+  const sessionId = `session-${randomUUID()}`;
+  const capabilityHostId = capabilityId(context.hostId, "host");
+  const capabilityWorkspaceId = capabilityId(workspace.id, "workspace");
   const send: Send = (message) => {
     const payload = JSON.stringify(message);
     if (socket.readyState === 1) socket.send(payload);
@@ -460,7 +445,72 @@ export function attachAgentSession(
   const profiles = [profileFor(providerId, model)];
   const eventLog = new RunEventLog();
   const auditStore = new AuditStore({ rootDir: path.join(workspaceRoot, ".nanoforge", "runs") });
-  const approvalGate = new SocketApprovalGate(send, now);
+  const brokerRequestIds = new Map<string, string>();
+  const capabilityAudit: CapabilityAuditRecord[] = [];
+  const capabilityBroker = new CapabilityBroker({
+    auditSink: (record) => {
+      capabilityAudit.push(record);
+      if (capabilityAudit.length > 256) capabilityAudit.shift();
+      try {
+        auditStore.recordCapabilityDecision({
+          at: new Date(record.at).toISOString(),
+          grantId: record.grantId,
+          ...(brokerRequestIds.has(record.grantId) ? { requestId: brokerRequestIds.get(record.grantId) } : {}),
+          decision: record.decision,
+          reasonCode: record.reason,
+          ...(record.remainingUses === undefined ? {} : { remainingUses: record.remainingUses }),
+          tokenDigest: `sha256:${record.tokenHash}`,
+          binding: {
+            hostId: record.binding.hostInstanceId,
+            sessionId: record.binding.clientSessionId,
+            workspaceId: record.binding.workspaceId,
+            runId: record.binding.runId,
+            stepId: record.binding.stepId,
+            toolId: record.binding.toolId,
+            argumentsDigest: `sha256:${record.binding.argsDigest}`,
+          },
+        });
+      } catch {
+        // Capability enforcement must not depend on audit I/O. The broker's
+        // bounded in-memory record remains available for host diagnostics.
+      }
+    },
+  });
+  const capabilityRequests = new Map<string, DeferredCapability>();
+  const runApprovalRequestIds = new Set<string>();
+  const approvalGate = new BrokerApprovalGate({
+    broker: capabilityBroker,
+    binding: {
+      hostInstanceId: capabilityHostId,
+      clientSessionId: sessionId,
+      workspaceId: capabilityWorkspaceId,
+      workspaceGeneration: generation,
+    },
+    scope: "execute",
+    present: (metadata: RunApprovalPresentation) => {
+      // Correlate the opaque gate request only after the broker has issued it;
+      // raw tool requests and grant tokens never enter the socket payload.
+      brokerRequestIds.set(metadata.grantId, metadata.requestId);
+      runApprovalRequestIds.add(metadata.requestId);
+      send({
+        type: "capability.approval_required",
+        requestId: metadata.requestId,
+        hostId: capabilityHostId,
+        sessionId,
+        workspaceId: capabilityWorkspaceId,
+        generation,
+        runId: metadata.runId,
+        stepId: metadata.stepId,
+        toolId: metadata.toolId,
+        argumentsDigest: `sha256:${metadata.requestDigest}`,
+        scope: "execute",
+        expiresAt: new Date(metadata.expiresAt).toISOString(),
+        uses: "single",
+        reason: `Approval required for ${metadata.toolId}`,
+        at: now(),
+      });
+    },
+  });
   const coordinator = new RunCoordinator({
     router: bindRouter(profiles),
     profiles,
@@ -551,6 +601,171 @@ export function attachAgentSession(
       at: now(),
     });
   };
+  const capabilityResult = (
+    requestId: string,
+    result: {
+      ok: boolean;
+      grant?: {
+        grantId: string;
+        hostId: string;
+        sessionId: string;
+        workspaceId: string;
+        generation: number;
+        runId: string;
+        stepId: string;
+        toolId: string;
+        argumentsDigest: string;
+        scope: "read" | "write" | "execute" | "network" | "browser" | "mcp" | "schedule";
+        issuedAt: string;
+        expiresAt: string;
+        uses: "single" | "multi";
+      };
+      errorCode?: "invalid_request" | "denied" | "expired" | "stale_binding" | "already_used";
+      errorMessage?: string;
+    },
+  ): void => {
+    send({ type: "capability.result", requestId, ...result, at: now() });
+  };
+
+  const requestCapability = (
+    requestId: string,
+    operation: string,
+    scope: "write" | "execute" | "schedule",
+    metadata: Readonly<Record<string, string | number | boolean>>,
+    execute: () => Promise<void>,
+  ): void => {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(requestId)) {
+      send({
+        type: "error",
+        code: "capability_invalid_request",
+        message: "Capability request identifier is invalid",
+        requestId,
+        at: now(),
+      });
+      return;
+    }
+    const existing = capabilityRequests.get(requestId);
+    if (existing || runApprovalRequestIds.has(requestId)) {
+      capabilityResult(requestId, {
+        ok: false,
+        errorCode: "invalid_request",
+        errorMessage: "Capability request is already pending or completed",
+      });
+      return;
+    }
+
+    const runId = `request-${digestArguments({ requestId, operation }).slice(0, 32)}`;
+    const stepId = `step-${digestArguments({ requestId, operation, sessionId }).slice(0, 32)}`;
+    const toolId = capabilityId(operation, "tool");
+    const binding: CapabilityBinding = {
+      hostInstanceId: capabilityHostId,
+      clientSessionId: sessionId,
+      workspaceId: capabilityWorkspaceId,
+      workspaceGeneration: generation,
+      runId,
+      stepId,
+      toolId,
+      argsDigest: digestArguments(metadata),
+      scope,
+    };
+    let grant: BrokerGrant;
+    try {
+      grant = capabilityBroker.issue({ binding, ttlMs: 60_000, maxUses: 1 });
+    } catch {
+      capabilityResult(requestId, {
+        ok: false,
+        errorCode: "invalid_request",
+        errorMessage: "Capability request could not be issued",
+      });
+      return;
+    }
+    capabilityRequests.set(requestId, {
+      requestId,
+      token: grant.token,
+      binding,
+      grant,
+      issuedAt: now(),
+      operation,
+      execute,
+      state: "pending",
+    });
+    brokerRequestIds.set(grant.grantId, requestId);
+    send({
+      type: "capability.approval_required",
+      requestId,
+      hostId: capabilityHostId,
+      sessionId,
+      workspaceId: capabilityWorkspaceId,
+      generation,
+      runId,
+      stepId,
+      toolId,
+      argumentsDigest: `sha256:${binding.argsDigest}`,
+      scope,
+      expiresAt: new Date(grant.expiresAt).toISOString(),
+      uses: "single",
+      reason: `Approval required for ${operation}`,
+      at: now(),
+    });
+  };
+
+  const resolveCapability = (requestId: string, approved: boolean, reason?: string): void => {
+    const request = capabilityRequests.get(requestId);
+    if (!request) {
+      capabilityResult(requestId, {
+        ok: false,
+        errorCode: "invalid_request",
+        errorMessage: "Unknown capability request",
+      });
+      return;
+    }
+    if (!approved) {
+      void reason;
+      if (request.state === "pending") {
+        request.state = "revoked";
+        capabilityBroker.revoke(request.token);
+      }
+      capabilityResult(requestId, {
+        ok: false,
+        errorCode: request.state === "consumed" ? "already_used" : "denied",
+        errorMessage: "Capability denied",
+      });
+      return;
+    }
+
+    const consumed = capabilityBroker.consume(request.token, request.binding);
+    if (!consumed.allowed) {
+      capabilityResult(requestId, {
+        ok: false,
+        errorCode: capabilityErrorCode(consumed.reason),
+        errorMessage: "Capability approval could not be applied",
+      });
+      return;
+    }
+    request.state = "consumed";
+    capabilityResult(requestId, {
+      ok: true,
+      grant: {
+        grantId: request.grant.grantId,
+        hostId: capabilityHostId,
+        sessionId,
+        workspaceId: capabilityWorkspaceId,
+        generation,
+        runId: request.binding.runId,
+        stepId: request.binding.stepId,
+        toolId: request.binding.toolId,
+        argumentsDigest: `sha256:${request.binding.argsDigest}`,
+        scope: request.binding.scope as "write" | "execute" | "schedule",
+        issuedAt: request.issuedAt,
+        expiresAt: new Date(request.grant.expiresAt).toISOString(),
+        uses: "single",
+      },
+    });
+    void request.execute().catch(() => {
+      // The deferred operation owns its stable error/result frame. Never leak
+      // raw operation payloads from this transport-level safety net.
+    });
+  };
   const dispatchWorkspace = async (message: ClientMessage): Promise<void> => {
     try {
       if (message.type === "workspace.describe") {
@@ -596,13 +811,40 @@ export function attachAgentSession(
           return;
         case "workspace.writeFile":
           if (!options.allowWorkspaceWrites) throw new WorkspaceRootError("write_not_approved", "workspace writes require an approved write workflow");
-          {
-            const result = await handleWriteFile(workspaceRoot, message.path, message.content, {
-              expectedSha256: message.expectedSha256,
-              expectedModified: message.expectedModified,
-            });
-            send({ type: "workspace.writeFile.result", requestId: message.requestId, path: message.path, generation, ...result });
+          if (options.preApprovedWrites) {
+            try {
+              const result = await handleWriteFile(workspaceRoot, message.path, message.content, {
+                expectedSha256: message.expectedSha256,
+                expectedModified: message.expectedModified,
+              });
+              send({ type: "workspace.writeFile.result", requestId: message.requestId, path: message.path, generation, ...result });
+            } catch (error) {
+              workspaceError(error, message.requestId);
+            }
+            return;
           }
+          requestCapability(
+            message.requestId,
+            "workspace.writeFile",
+            "write",
+            {
+              pathDigest: digestArguments(message.path),
+              contentDigest: digestArguments(message.content),
+              expectedSha256Digest: digestArguments(message.expectedSha256 ?? ""),
+              expectedModifiedDigest: digestArguments(message.expectedModified ?? ""),
+            },
+            async () => {
+              try {
+                const result = await handleWriteFile(workspaceRoot, message.path, message.content, {
+                  expectedSha256: message.expectedSha256,
+                  expectedModified: message.expectedModified,
+                });
+                send({ type: "workspace.writeFile.result", requestId: message.requestId, path: message.path, generation, ...result });
+              } catch (error) {
+                workspaceError(error, message.requestId);
+              }
+            },
+          );
           return;
         case "workspace.watch":
           if (message.enabled && !watcher) {
@@ -650,13 +892,14 @@ export function attachAgentSession(
               const tMsg = terminalResult.data;
               switch (tMsg.type) {
                 case "terminal.create":
-                  void ptyManager.createSession(tMsg).catch((err) => {
-                    send({
-                      type: "error",
-                      code: "terminal_error",
-                      message: err instanceof Error ? err.message : String(err),
-                      at: now(),
-                    });
+                  // Interactive PTYs are privileged and must be broker-granted.
+                  // Structured run terminal execution remains available through
+                  // RunCoordinator; this direct socket path fails closed.
+                  send({
+                    type: "error",
+                    code: "terminal_interactive_denied",
+                    message: "Direct interactive terminal creation is disabled by host policy",
+                    at: now(),
                   });
                   break;
                 case "terminal.input":
@@ -686,6 +929,20 @@ export function attachAgentSession(
     }
     switch (message.type) {
       case "ping": send({ type: "pong", at: now() }); break;
+      case "capability.approval":
+        if (capabilityRequests.has(message.requestId)) {
+          resolveCapability(message.requestId, message.approved, message.reason);
+        } else {
+          const resolved = approvalGate.resolve(message.requestId, message.approved, message.reason);
+          if (!resolved) {
+            capabilityResult(message.requestId, {
+              ok: false,
+              errorCode: "invalid_request",
+              errorMessage: "Unknown capability request",
+            });
+          }
+        }
+        break;
       case "plan.submit": {
         // The wire schema deliberately stays forward-compatible; the
         // coordinator performs the authoritative plan validation before a
@@ -789,7 +1046,9 @@ export function attachAgentSession(
         break;
       }
       case "approval.grant": {
-        const resolved = approvalGate.resolve(message.requestId, true, undefined, message.runId, message.stepId);
+        // Legacy frames may resolve only an exact broker-owned request ID;
+        // they never address direct deferred operations or prefix-match runs.
+        const resolved = approvalGate.resolve(message.requestId, true);
         send({
           type: "approval.grant.result",
           requestId: message.requestId,
@@ -801,7 +1060,7 @@ export function attachAgentSession(
         break;
       }
       case "approval.deny": {
-        const resolved = approvalGate.resolve(message.requestId, false, message.reason, message.runId, message.stepId);
+        const resolved = approvalGate.resolve(message.requestId, false, message.reason);
         send({
           type: "approval.deny.result",
           requestId: message.requestId,
@@ -823,57 +1082,103 @@ export function attachAgentSession(
         break;
       }
       case "subagent.invoke": {
-        try {
-          const result = await subagentSupervisor.spawnSubagent(message.params, message.parentId);
-          send({ type: "subagent.invoke.result", requestId: message.requestId, result });
-        } catch (err) {
-          send({ type: "error", code: "subagent_error", message: err instanceof Error ? err.message : String(err), at: now() });
-        }
+        requestCapability(
+          message.requestId,
+          "subagent.invoke",
+          "execute",
+          {
+            paramsDigest: digestArguments(message.params),
+            parentIdDigest: digestArguments(message.parentId ?? ""),
+          },
+          async () => {
+            try {
+              const result = await subagentSupervisor.spawnSubagent(message.params, message.parentId);
+              send({ type: "subagent.invoke.result", requestId: message.requestId, result });
+            } catch (err) {
+              send({ type: "error", code: "subagent_error", message: "Subagent invocation failed", requestId: message.requestId, at: now() });
+            }
+          },
+        );
         break;
       }
       case "subagent.manage": {
-        try {
-          const result = await subagentSupervisor.manageSubagents(message.params, message.callerId);
-          send({ type: "subagent.manage.result", requestId: message.requestId, result });
-        } catch (err) {
-          send({ type: "error", code: "subagent_error", message: err instanceof Error ? err.message : String(err), at: now() });
+        const mutates = message.params.action === "pause" || message.params.action === "resume" || message.params.action === "kill";
+        const execute = async (): Promise<void> => {
+          try {
+            const result = await subagentSupervisor.manageSubagents(message.params, message.callerId);
+            send({ type: "subagent.manage.result", requestId: message.requestId, result });
+          } catch {
+            send({ type: "error", code: "subagent_error", message: "Subagent management failed", requestId: message.requestId, at: now() });
+          }
+        };
+        if (mutates) {
+          requestCapability(message.requestId, "subagent.manage", "execute", {
+            paramsDigest: digestArguments(message.params),
+            callerIdDigest: digestArguments(message.callerId ?? ""),
+          }, execute);
+        } else {
+          void execute();
         }
         break;
       }
       case "subagent.sendMessage": {
-        try {
-          const result = await subagentSupervisor.sendMessage(message.params, message.senderId);
-          send({ type: "subagent.sendMessage.result", requestId: message.requestId, result });
-        } catch (err) {
-          send({ type: "error", code: "subagent_error", message: err instanceof Error ? err.message : String(err), at: now() });
-        }
+        requestCapability(message.requestId, "subagent.sendMessage", "execute", {
+          paramsDigest: digestArguments(message.params),
+          senderIdDigest: digestArguments(message.senderId),
+        }, async () => {
+          try {
+            const result = await subagentSupervisor.sendMessage(message.params, message.senderId);
+            send({ type: "subagent.sendMessage.result", requestId: message.requestId, result });
+          } catch {
+            send({ type: "error", code: "subagent_error", message: "Subagent message failed", requestId: message.requestId, at: now() });
+          }
+        });
         break;
       }
       case "subagent.define": {
-        try {
-          const result = await subagentSupervisor.defineSubagent(message.params);
-          send({ type: "subagent.define.result", requestId: message.requestId, result });
-        } catch (err) {
-          send({ type: "error", code: "subagent_error", message: err instanceof Error ? err.message : String(err), at: now() });
-        }
+        requestCapability(message.requestId, "subagent.define", "execute", {
+          paramsDigest: digestArguments(message.params),
+        }, async () => {
+          try {
+            const result = await subagentSupervisor.defineSubagent(message.params);
+            send({ type: "subagent.define.result", requestId: message.requestId, result });
+          } catch {
+            send({ type: "error", code: "subagent_error", message: "Subagent definition failed", requestId: message.requestId, at: now() });
+          }
+        });
         break;
       }
       case "task.manage": {
-        try {
-          const result = await daemonManager.manageTask(message.params);
-          send({ type: "task.manage.result", requestId: message.requestId, result });
-        } catch (err) {
-          send({ type: "error", code: "task_error", message: err instanceof Error ? err.message : String(err), at: now() });
+        const mutates = message.params.action === "kill" || message.params.action === "send_input";
+        const execute = async (): Promise<void> => {
+          try {
+            const result = await daemonManager.manageTask(message.params);
+            send({ type: "task.manage.result", requestId: message.requestId, result });
+          } catch {
+            send({ type: "error", code: "task_error", message: "Task management failed", requestId: message.requestId, at: now() });
+          }
+        };
+        if (mutates) {
+          requestCapability(message.requestId, "task.manage", "execute", {
+            paramsDigest: digestArguments(message.params),
+          }, execute);
+        } else {
+          void execute();
         }
         break;
       }
       case "schedule.create": {
-        try {
-          const result = await daemonManager.scheduleTask(message.params, message.creatorSubagentId);
-          send({ type: "schedule.create.result", requestId: message.requestId, result });
-        } catch (err) {
-          send({ type: "error", code: "schedule_error", message: err instanceof Error ? err.message : String(err), at: now() });
-        }
+        requestCapability(message.requestId, "schedule.create", "schedule", {
+          paramsDigest: digestArguments(message.params),
+          creatorSubagentIdDigest: digestArguments(message.creatorSubagentId ?? ""),
+        }, async () => {
+          try {
+            const result = await daemonManager.scheduleTask(message.params, message.creatorSubagentId);
+            send({ type: "schedule.create.result", requestId: message.requestId, result });
+          } catch {
+            send({ type: "error", code: "schedule_error", message: "Schedule creation failed", requestId: message.requestId, at: now() });
+          }
+        });
         break;
       }
       case "memory.set": {
@@ -881,7 +1186,7 @@ export function attachAgentSession(
           const result = memoryEngine.set(message.params, message.authorInfo);
           send({ type: "memory.set.result", requestId: message.requestId, result });
         } catch (err) {
-          send({ type: "error", code: "memory_error", message: err instanceof Error ? err.message : String(err), at: now() });
+          send({ type: "error", code: "memory_error", message: err instanceof Error ? err.message : "Memory update failed", requestId: message.requestId, at: now() });
         }
         break;
       }
@@ -890,7 +1195,7 @@ export function attachAgentSession(
           const result = memoryEngine.get(message.params);
           send({ type: "memory.get.result", requestId: message.requestId, result });
         } catch (err) {
-          send({ type: "error", code: "memory_error", message: err instanceof Error ? err.message : String(err), at: now() });
+          send({ type: "error", code: "memory_error", message: err instanceof Error ? err.message : String(err), requestId: message.requestId, at: now() });
         }
         break;
       }
@@ -899,7 +1204,7 @@ export function attachAgentSession(
           const result = memoryEngine.query(message.params);
           send({ type: "memory.query.result", requestId: message.requestId, result });
         } catch (err) {
-          send({ type: "error", code: "memory_error", message: err instanceof Error ? err.message : String(err), at: now() });
+          send({ type: "error", code: "memory_error", message: err instanceof Error ? err.message : String(err), requestId: message.requestId, at: now() });
         }
         break;
       }
@@ -908,7 +1213,7 @@ export function attachAgentSession(
           const result = memoryEngine.delete(message.params);
           send({ type: "memory.delete.result", requestId: message.requestId, result });
         } catch (err) {
-          send({ type: "error", code: "memory_error", message: err instanceof Error ? err.message : String(err), at: now() });
+          send({ type: "error", code: "memory_error", message: err instanceof Error ? err.message : "Memory deletion failed", requestId: message.requestId, at: now() });
         }
         break;
       }
@@ -922,7 +1227,11 @@ export function attachAgentSession(
         /* ignore */
       }
     }
-    approvalGate.close();
+    approvalGate.dispose("client disconnected");
+    for (const request of capabilityRequests.values()) {
+      if (request.state === "pending") capabilityBroker.revoke(request.token);
+    }
+    capabilityRequests.clear();
     void watcher?.close();
     auditStore.close();
     ptyManager.off("message", onTerminalMessage);

@@ -11,6 +11,8 @@ export default defineConfig({
   resolve: {
     alias: {
       "@protocol": path.resolve(__dirname, "../../packages/protocol/src"),
+      "@nanoforge/protocol": path.resolve(__dirname, "../../packages/protocol/src"),
+      "@nanoforge/llm-router": path.resolve(__dirname, "../../packages/llm-router/src"),
     },
   },
 });

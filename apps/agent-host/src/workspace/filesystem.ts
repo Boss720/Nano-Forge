@@ -26,6 +26,7 @@ export class WorkspaceFileError extends Error {
       | 'file_too_large'
       | 'binary_file'
       | 'write_conflict'
+      | 'write_not_approved'
       | 'invalid_search'
       | 'io_error',
     message: string,
@@ -131,7 +132,24 @@ export interface ReviewedWriteOptions {
   expectedSha256?: string;
   expectedModified?: string;
   maxBytes?: number;
+  /** Require a host-owned capability decision before writing. */
+  authorizationRequired?: boolean;
+  /** Receives only non-secret, workspace-relative write metadata. */
+  authorize?: ReviewedWriteAuthorizer;
 }
+
+export interface ReviewedWriteAuthorizationContext {
+  operation: 'workspace.write';
+  workspaceRelativePath: string;
+  contentSha256: string;
+  contentSize: number;
+  expectedSha256?: string;
+  expectedModified?: string;
+}
+
+export type ReviewedWriteAuthorizer = (
+  context: ReviewedWriteAuthorizationContext,
+) => boolean | Promise<boolean>;
 
 export async function handleWriteFile(
   workspaceRoot: string,
@@ -143,6 +161,32 @@ export async function handleWriteFile(
   const byteSize = Buffer.byteLength(content, 'utf8');
   if (byteSize > (options.maxBytes ?? MAX_WORKSPACE_FILE_BYTES)) {
     throw new WorkspaceFileError('file_too_large', 'File too large (exceeds 1MB write limit)');
+  }
+
+  if (options.authorizationRequired && !options.authorize) {
+    throw new WorkspaceFileError('write_not_approved', 'Write authorization is required');
+  }
+  if (options.authorize) {
+    const workspaceRelativePath = path
+      .relative(path.resolve(workspaceRoot), fullPath)
+      .split(path.sep)
+      .join('/');
+    let authorized = false;
+    try {
+      authorized = await options.authorize({
+        operation: 'workspace.write',
+        workspaceRelativePath,
+        contentSha256: sha256(content),
+        contentSize: byteSize,
+        expectedSha256: options.expectedSha256,
+        expectedModified: options.expectedModified,
+      });
+    } catch {
+      authorized = false;
+    }
+    if (!authorized) {
+      throw new WorkspaceFileError('write_not_approved', 'Write authorization denied');
+    }
   }
 
   let existing: { content: Buffer; modified: string; mode: number } | undefined;

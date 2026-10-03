@@ -1,4 +1,5 @@
 const SENSITIVE_DIRECTORY_NAMES = new Set([
+  '.git',
   '.aws',
   '.azure',
   '.docker',

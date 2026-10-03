@@ -19,6 +19,7 @@ export interface TurnMetricsInput {
   completionTokens: number;
   turnLatencyMs: number;
   toolLatencyMs?: number;
+  toolExecutions?: number;
   costPer1kInput?: number;
   costPer1kOutput?: number;
 }

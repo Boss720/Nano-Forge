@@ -36,12 +36,18 @@ import {
   type SubagentMessage,
   type SubagentLifecycleEvent,
   type SubagentTelemetry,
+  type SubagentModelTier,
+  type SubagentRoutingDecision,
+  ARCHETYPE_DEFAULT_TIERS,
+  ARCHETYPE_CAPABILITY_FLOORS,
+  TIER_DEFAULT_TOKEN_BUDGETS,
   createSubagentMessage,
 } from "@protocol/subagents";
 import type { z } from "zod";
 
 export type InvokeSubagentInput = z.input<typeof invokeSubagentParamsSchema>;
 export type SendMessageInput = z.input<typeof sendMessageParamsSchema>;
+import type { LLMRouter } from "@nanoforge/llm-router";
 import { sanitizePathString, isWithinWorkspace } from "../policy/policy.js";
 import { createWorktree, pruneWorktree } from "../workspace/gitWorktree.js";
 import { SubagentRegistry } from "./registry.js";
@@ -52,7 +58,27 @@ import { DaemonSupervisor } from "../daemons/supervisor.js";
 import { TaskScheduler } from "../daemons/scheduler.js";
 import { SharedMemoryEngine } from "./memory.js";
 import { TelemetryTracker, type TurnMetricsInput } from "./telemetry.js";
+import { FileOwnershipManager } from "./ownership.js";
 import type { EscalationDecision, EscalationRung, SubagentNode } from "./types.js";
+import { digestArguments } from "../capabilities/broker.js";
+
+export type SubagentMutationOperation = "spawn" | "kill" | "pause" | "resume" | "send_message" | "define";
+
+export interface SubagentMutationAuthorizationContext {
+  readonly operation: SubagentMutationOperation;
+  readonly actorId?: string;
+  readonly targetId?: string;
+  /** Digest only; request values (including prompts and message bodies) are never retained. */
+  readonly requestDigest: string;
+  readonly metadata: Readonly<Record<string, string | number | boolean>>;
+}
+
+export type AuthorizeSubagentMutation = (
+  context: SubagentMutationAuthorizationContext,
+) => boolean | Promise<boolean>;
+
+const safeSubagentId = (value: string | undefined): string | undefined =>
+  value && /^[A-Za-z0-9_-]{1,128}$/.test(value) ? value : undefined;
 
 export interface SubagentSupervisorOptions {
   workspaceRoot?: string;
@@ -64,6 +90,11 @@ export interface SubagentSupervisorOptions {
   scheduler?: TaskScheduler;
   memoryEngine?: SharedMemoryEngine;
   telemetryTracker?: TelemetryTracker;
+  ownershipManager?: FileOwnershipManager;
+  router?: LLMRouter;
+  /** When enabled, every side-effectful subagent operation requires this callback to grant it. */
+  enforceMutationAuthorization?: boolean;
+  authorizeMutation?: AuthorizeSubagentMutation;
 }
 
 export class SubagentSupervisor extends EventEmitter {
@@ -76,8 +107,12 @@ export class SubagentSupervisor extends EventEmitter {
   readonly scheduler: TaskScheduler;
   readonly memory: SharedMemoryEngine;
   readonly telemetry: TelemetryTracker;
+  readonly ownership: FileOwnershipManager;
+  readonly router?: LLMRouter;
   private readonly unsubDaemons?: () => void;
   private readonly unsubScheduler?: () => void;
+  private readonly enforceMutationAuthorization: boolean;
+  private readonly authorizeMutation?: AuthorizeSubagentMutation;
 
   constructor(options: SubagentSupervisorOptions = {}) {
     super();
@@ -91,6 +126,10 @@ export class SubagentSupervisor extends EventEmitter {
     this.scheduler = options.scheduler ?? new TaskScheduler();
     this.memory = options.memoryEngine ?? new SharedMemoryEngine({ workspaceRoot: this.workspaceRoot });
     this.telemetry = options.telemetryTracker ?? new TelemetryTracker();
+    this.ownership = options.ownershipManager ?? new FileOwnershipManager();
+    this.router = options.router;
+    this.enforceMutationAuthorization = options.enforceMutationAuthorization ?? false;
+    this.authorizeMutation = options.authorizeMutation;
 
     // Forward daemon output/completion to wakeups
     this.unsubDaemons = this.daemons.subscribe((event) => {
@@ -119,13 +158,36 @@ export class SubagentSupervisor extends EventEmitter {
     parentId?: string
   ): Promise<InvokeSubagentResult> {
     const params = invokeSubagentParamsSchema.parse(rawParams);
+    await this.requireMutationAuthorization("spawn", {
+      actorId: parentId,
+      request: params,
+      metadata: {
+        archetype: params.archetype,
+        isolation: params.workspaceIsolation ?? "inherit",
+      },
+    });
 
-    // 1. Validate hierarchy constraints (Depth <= 3, Active <= 8)
-    this.hierarchy.validateSpawn(parentId, this.registry);
+    const archetype = params.archetype;
+
+    // 0. Resolve model tier
+    let resolvedTier: Exclude<SubagentModelTier, "inherit">;
+    if (params.modelTier === "inherit") {
+      const parentNode = parentId ? this.registry.get(parentId) : undefined;
+      resolvedTier =
+        parentNode?.modelTier && parentNode.modelTier !== "inherit"
+          ? parentNode.modelTier
+          : "flash";
+    } else if (params.modelTier) {
+      resolvedTier = params.modelTier;
+    } else {
+      resolvedTier = ARCHETYPE_DEFAULT_TIERS[archetype] ?? "flash";
+    }
+
+    // 1. Validate hierarchy constraints (Depth <= 3, Active <= 8, Active Pro <= 2)
+    this.hierarchy.validateSpawn(parentId, this.registry, resolvedTier);
 
     const subagentId = randomUUID();
     const shortId = subagentId.slice(0, 8);
-    const archetype = params.archetype;
     let name: string;
     if (params.name && params.name.trim()) {
       const candidateName = params.name.trim();
@@ -139,7 +201,98 @@ export class SubagentSupervisor extends EventEmitter {
       name = `${archetype}_${shortId}`;
     }
 
+    // Resolve model and routing decision
+    let effectiveModel = params.model;
+    let routingDecision: SubagentRoutingDecision | undefined;
+
+    if (effectiveModel) {
+      routingDecision = {
+        modelId: effectiveModel,
+        providerId: "override",
+        score: 100,
+        explanation: `Explicit model override: ${effectiveModel}`,
+      };
+    } else if (this.router) {
+      const capabilityFloor =
+        resolvedTier === "flash_lite"
+          ? 0.1
+          : resolvedTier === "pro"
+          ? 0.85
+          : ARCHETYPE_CAPABILITY_FLOORS[archetype] ?? 0.6;
+      const complexityClass =
+        resolvedTier === "flash_lite"
+          ? "TRIVIAL"
+          : resolvedTier === "pro"
+          ? "CRITICAL"
+          : "STANDARD";
+
+      // Prefer local zero-cloud-cost models for flash_lite tier if available
+      const hasLocalModel = this.router.registry
+        .getAvailableModels()
+        .some((m) => m.providerId === "ollama" && m.estimatedQuality.coding >= capabilityFloor);
+      const requireLocal = resolvedTier === "flash_lite" && hasLocalModel;
+
+      try {
+        const routeResult = this.router.route(params.prompt, {
+          capabilityFloor,
+          complexityClass,
+          requireLocal,
+          allowPaidFallback: false,
+        });
+        effectiveModel = routeResult.selectedModel.modelId;
+        routingDecision = {
+          modelId: routeResult.selectedModel.modelId,
+          providerId: routeResult.selectedModel.providerId,
+          score: routeResult.score,
+          explanation: routeResult.explanation,
+        };
+      } catch {
+        effectiveModel =
+          resolvedTier === "flash_lite"
+            ? "gemini-2.0-flash-lite"
+            : resolvedTier === "pro"
+            ? "gemini-2.5-pro"
+            : "gemini-2.0-flash";
+        routingDecision = {
+          modelId: effectiveModel,
+          providerId: "fallback",
+          score: 50,
+          explanation: `Fallback default model for tier ${resolvedTier}`,
+        };
+      }
+    } else {
+      effectiveModel =
+        resolvedTier === "flash_lite"
+          ? "gemini-2.0-flash-lite"
+          : resolvedTier === "pro"
+          ? "gemini-2.5-pro"
+          : "gemini-2.0-flash";
+      routingDecision = {
+        modelId: effectiveModel,
+        providerId: "default",
+        score: 100,
+        explanation: `Default tier model for ${resolvedTier}`,
+      };
+    }
+
+    const effectiveBudgetTokens =
+      params.budgetTokens ?? TIER_DEFAULT_TOKEN_BUDGETS[resolvedTier];
+
     const isolationMode = params.workspaceIsolation ?? "inherit";
+    const fileOwnership = params.fileOwnership ?? [];
+
+    // Check file ownership collision against concurrent agents
+    const collisionCheck = this.ownership.checkCollision(
+      subagentId,
+      fileOwnership,
+      isolationMode
+    );
+    if (collisionCheck.hasCollision) {
+      throw new Error(
+        `${SUBAGENT_ERROR_CODES.ERR_SUBAGENT_FILE_COLLISION}: Cannot spawn subagent due to file ownership collision on pattern '${collisionCheck.conflictingPattern}' with active subagent '${collisionCheck.collidingSubagentId}'. To run concurrent subagents on overlapping files, isolate them into dedicated Git worktrees (workspaceIsolation: 'branch') or serialize execution.`
+      );
+    }
+
     const startedAt = new Date().toISOString();
 
     // 2. Setup assigned metadata folder in .agents/<name>_<shortId>/
@@ -166,13 +319,13 @@ export class SubagentSupervisor extends EventEmitter {
     // 3. Write initial agent scaffolding (BRIEFING.md, progress.md, DISPATCH.md)
     await fs.writeFile(
       path.join(absoluteMetadataDir, "DISPATCH.md"),
-      `## ${startedAt}\n\nAgent Name: ${name}\nArchetype: ${archetype}\nRoles: ${params.roles.join(", ")}\nParent ID: ${parentId ?? "root"}\n\nPrompt:\n${params.prompt}\n`,
+      `## ${startedAt}\n\nAgent Name: ${name}\nArchetype: ${archetype}\nModel Tier: ${resolvedTier}\nModel: ${effectiveModel}\nRoles: ${params.roles.join(", ")}\nParent ID: ${parentId ?? "root"}\n\nPrompt:\n${params.prompt}\n`,
       "utf8"
     );
 
     await fs.writeFile(
       path.join(absoluteMetadataDir, "BRIEFING.md"),
-      `# BRIEFING — ${startedAt}\n\n## Mission\n${params.prompt.slice(0, 200)}\n\n## 🔒 My Identity\n- Archetype: ${archetype}\n- Subagent ID: ${subagentId}\n- Parent ID: ${parentId ?? "none"}\n- Working Directory: ${metadataDirName}\n`,
+      `# BRIEFING — ${startedAt}\n\n## Mission\n${params.prompt.slice(0, 200)}\n\n## 🔒 My Identity\n- Archetype: ${archetype}\n- Model Tier: ${resolvedTier}\n- Model: ${effectiveModel}\n- Subagent ID: ${subagentId}\n- Parent ID: ${parentId ?? "none"}\n- Working Directory: ${metadataDirName}\n`,
       "utf8"
     );
 
@@ -213,7 +366,9 @@ export class SubagentSupervisor extends EventEmitter {
       archetype,
       roles: params.roles ?? [],
       systemPrompt: params.prompt,
-      model: params.model,
+      model: effectiveModel,
+      modelTier: resolvedTier,
+      routingDecision,
       workingDirectory: effectiveWorkingDir,
       metadataDir: metadataDirName,
       worktreePath,
@@ -221,7 +376,7 @@ export class SubagentSupervisor extends EventEmitter {
       isolationMode,
       allowedTools: params.allowedTools,
       allowedToolKinds: params.allowedToolKinds,
-      budgetTokens: params.budgetTokens,
+      budgetTokens: effectiveBudgetTokens,
       tokensUsed: 0,
       turnCount: 0,
       telemetry: initialTelemetry,
@@ -230,9 +385,11 @@ export class SubagentSupervisor extends EventEmitter {
       lastHeartbeat: startedAt,
       abortController: new AbortController(),
       skills: params.skills ?? [],
+      fileOwnership,
     };
 
     this.registry.register(node);
+    this.ownership.register(subagentId, fileOwnership, isolationMode);
 
     // 7. Emit wire lifecycle events
     const summary = this.registry.getSummary(subagentId)!;
@@ -251,6 +408,8 @@ export class SubagentSupervisor extends EventEmitter {
       workingDirectory: effectiveWorkingDir,
       state: "running",
       startedAt,
+      model: effectiveModel,
+      modelTier: resolvedTier,
     };
   }
 
@@ -295,10 +454,14 @@ export class SubagentSupervisor extends EventEmitter {
         if (!params.subagentId) {
           return { action: "kill", success: false, message: "Missing subagentId" };
         }
+        if (!(await this.isMutationAuthorized("kill", { actorId: callerId, targetId: params.subagentId, request: params }))) {
+          return { action: "kill", success: false, message: "Subagent mutation denied" };
+        }
         const killed = await this.hierarchy.killTree(params.subagentId, this.registry, {
           workspaceRoot: this.workspaceRoot,
           daemonSupervisor: this.daemons,
           scheduler: this.scheduler,
+          ownershipManager: this.ownership,
           reason: "Killed by manage_subagents request",
         });
 
@@ -320,6 +483,9 @@ export class SubagentSupervisor extends EventEmitter {
         if (!params.subagentId) {
           return { action: "pause", success: false, message: "Missing subagentId" };
         }
+        if (!(await this.isMutationAuthorized("pause", { actorId: callerId, targetId: params.subagentId, request: params }))) {
+          return { action: "pause", success: false, message: "Subagent mutation denied" };
+        }
         const node = this.registry.get(params.subagentId);
         if (!node) {
           return { action: "pause", success: false, message: `Subagent not found: ${params.subagentId}` };
@@ -339,6 +505,9 @@ export class SubagentSupervisor extends EventEmitter {
       case "resume": {
         if (!params.subagentId) {
           return { action: "resume", success: false, message: "Missing subagentId" };
+        }
+        if (!(await this.isMutationAuthorized("resume", { actorId: callerId, targetId: params.subagentId, request: params }))) {
+          return { action: "resume", success: false, message: "Subagent mutation denied" };
         }
         const node = this.registry.get(params.subagentId);
         if (!node) {
@@ -452,6 +621,11 @@ export class SubagentSupervisor extends EventEmitter {
    */
   async sendMessage(rawParams: SendMessageInput, senderId: string): Promise<SendMessageResult> {
     const params = sendMessageParamsSchema.parse(rawParams);
+    await this.requireMutationAuthorization("send_message", {
+      actorId: senderId,
+      targetId: params.recipientId,
+      request: params,
+    });
     const sender = this.registry.get(senderId);
     const recipient = this.registry.get(params.recipientId);
 
@@ -499,7 +673,36 @@ export class SubagentSupervisor extends EventEmitter {
    * Registers a dynamic custom subagent template.
    */
   async defineSubagent(params: DefineSubagentParams): Promise<DefineSubagentResult> {
+    await this.requireMutationAuthorization("define", { request: params, metadata: { name: params.name } });
     return this.registry.registerTemplate(params);
+  }
+
+  private async requireMutationAuthorization(
+    operation: SubagentMutationOperation,
+    input: { actorId?: string; targetId?: string; request: unknown; metadata?: Record<string, string | number | boolean> },
+  ): Promise<void> {
+    if (!(await this.isMutationAuthorized(operation, input))) {
+      throw new Error("Subagent mutation denied");
+    }
+  }
+
+  private async isMutationAuthorized(
+    operation: SubagentMutationOperation,
+    input: { actorId?: string; targetId?: string; request: unknown; metadata?: Record<string, string | number | boolean> },
+  ): Promise<boolean> {
+    if (!this.enforceMutationAuthorization) return true;
+    const context: SubagentMutationAuthorizationContext = Object.freeze({
+      operation,
+      ...(safeSubagentId(input.actorId) ? { actorId: safeSubagentId(input.actorId) } : {}),
+      ...(safeSubagentId(input.targetId) ? { targetId: safeSubagentId(input.targetId) } : {}),
+      requestDigest: digestArguments(input.request),
+      metadata: Object.freeze(input.metadata ?? {}),
+    });
+    try {
+      return this.authorizeMutation ? Boolean(await this.authorizeMutation(context)) : false;
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -636,6 +839,16 @@ export class SubagentSupervisor extends EventEmitter {
 
         case "replace": {
           try {
+            // Determine tier escalation: flash_lite -> flash -> pro
+            let nextTier: SubagentModelTier = "flash";
+            if (node.modelTier === "flash_lite") {
+              nextTier = "flash";
+            } else if (node.modelTier === "flash") {
+              nextTier = "pro";
+            } else if (node.modelTier === "pro") {
+              nextTier = "pro";
+            }
+
             // Request partial handoff, kill stalled node, spawn fresh clone
             const cloneResult = await this.spawnSubagent(
               {
@@ -644,9 +857,9 @@ export class SubagentSupervisor extends EventEmitter {
                 roles: node.roles,
                 prompt: `[REPLACEMENT CONTEXT: Previous instance failed with "${error}"]\n\nOriginal prompt:\n${node.systemPrompt ?? ""}`,
                 workspaceIsolation: node.isolationMode,
-                budgetTokens: node.budgetTokens,
+                budgetTokens: node.budgetTokens ? Math.round(node.budgetTokens * 1.5) : undefined,
                 skills: node.skills,
-                model: node.model,
+                modelTier: nextTier,
               },
               node.parentId ?? undefined
             );
@@ -656,6 +869,7 @@ export class SubagentSupervisor extends EventEmitter {
               workspaceRoot: this.workspaceRoot,
               daemonSupervisor: this.daemons,
               scheduler: this.scheduler,
+              ownershipManager: this.ownership,
               reason: `Replaced by fresh instance ${cloneResult.subagentId}`,
             });
 
@@ -780,6 +994,7 @@ export class SubagentSupervisor extends EventEmitter {
     this.unsubScheduler?.();
     this.scheduler.dispose();
     this.memory.dispose();
+    this.ownership.clear();
     this.mailbox.clear();
     this.removeAllListeners();
   }

@@ -8,13 +8,16 @@
  */
 import {
   MAX_CONCURRENT_SUBAGENTS,
+  MAX_CONCURRENT_PRO_SUBAGENTS,
   MAX_SUBAGENT_HIERARCHY_DEPTH,
   SUBAGENT_ERROR_CODES,
+  type SubagentModelTier,
 } from "@protocol/subagents";
 import { pruneWorktree } from "../workspace/gitWorktree.js";
 import type { SubagentRegistry } from "./registry.js";
 import type { DaemonSupervisor } from "../daemons/supervisor.js";
 import type { TaskScheduler } from "../daemons/scheduler.js";
+import type { FileOwnershipManager } from "./ownership.js";
 
 export class HierarchyManager {
   /**
@@ -41,9 +44,14 @@ export class HierarchyManager {
   /**
    * Validates whether a new subagent can be spawned under `parentId`:
    * - Enforces SEC-SUB-05 (Depth <= 3)
-   * - Enforces Concurrency Limit (Active <= 8)
+   * - Enforces Global Concurrency Limit (Active <= 8)
+   * - Enforces Pro Tier Concurrency Limit (Active Pro <= 2)
    */
-  validateSpawn(parentId: string | null | undefined, registry: SubagentRegistry): void {
+  validateSpawn(
+    parentId: string | null | undefined,
+    registry: SubagentRegistry,
+    proposedTier?: SubagentModelTier
+  ): void {
     // 1. Check concurrency limit
     const activeNodes = registry.getActive();
     if (activeNodes.length >= MAX_CONCURRENT_SUBAGENTS) {
@@ -52,7 +60,17 @@ export class HierarchyManager {
       );
     }
 
-    // 2. Check depth limit
+    // 2. Check pro tier concurrency limit
+    if (proposedTier === "pro") {
+      const activeProCount = activeNodes.filter((n) => n.modelTier === "pro").length;
+      if (activeProCount >= MAX_CONCURRENT_PRO_SUBAGENTS) {
+        throw new Error(
+          `${SUBAGENT_ERROR_CODES.ERR_SUBAGENT_PRO_CONCURRENCY_EXCEEDED}: Cannot spawn pro tier subagent. Active pro subagents (${activeProCount}) reached maximum tier concurrency (${MAX_CONCURRENT_PRO_SUBAGENTS}).`
+        );
+      }
+    }
+
+    // 3. Check depth limit
     if (parentId) {
       const parentDepth = this.getDepth(parentId, registry);
       const proposedDepth = parentDepth + 1;
@@ -96,6 +114,7 @@ export class HierarchyManager {
       workspaceRoot?: string;
       daemonSupervisor?: DaemonSupervisor;
       scheduler?: TaskScheduler;
+      ownershipManager?: FileOwnershipManager;
       reason?: string;
     }
   ): Promise<string[]> {
@@ -106,7 +125,12 @@ export class HierarchyManager {
       const node = registry.get(id);
       if (!node) continue;
 
-      // 1. Abort turn controller
+      // 1. Release file ownership locks
+      if (options?.ownershipManager) {
+        options.ownershipManager.release(id);
+      }
+
+      // 2. Abort turn controller
       try {
         node.abortController.abort(options?.reason ?? "Cascading killTree executed");
       } catch {

@@ -59,6 +59,50 @@ describe("SubagentSupervisor & Lifecycle Management", () => {
     expect(events).toContain("subagent.tree_updated");
   });
 
+  it("denies mutation before any subagent state or files are created when enforcement is enabled", async () => {
+    const guarded = new SubagentSupervisor({
+      workspaceRoot: tmpRoot,
+      enforceMutationAuthorization: true,
+      authorizeMutation: () => false,
+    });
+
+    await expect(guarded.spawnSubagent({
+      archetype: "implementer",
+      prompt: "sensitive task text",
+    })).rejects.toThrow("Subagent mutation denied");
+    expect(guarded.registry.getAll()).toHaveLength(0);
+    const listing = await guarded.manageSubagents({ action: "list" });
+    expect(listing.success).toBe(true);
+    await expect(fs.access(path.join(tmpRoot, ".agents"))).rejects.toThrow();
+    await guarded.dispose();
+  });
+
+  it("passes a redacted authorization context for a valid spawn", async () => {
+    const contexts: unknown[] = [];
+    const guarded = new SubagentSupervisor({
+      workspaceRoot: tmpRoot,
+      enforceMutationAuthorization: true,
+      authorizeMutation: (context) => {
+        contexts.push(context);
+        return true;
+      },
+    });
+
+    const spawned = await guarded.spawnSubagent({
+      archetype: "implementer",
+      name: "safe_name",
+      prompt: "do not expose this prompt",
+    });
+    expect(spawned.subagentId).toBeDefined();
+    expect(contexts).toHaveLength(1);
+    const context = contexts[0] as { operation: string; metadata: Record<string, unknown> };
+    expect(context.operation).toBe("spawn");
+    expect(context.metadata).not.toHaveProperty("prompt");
+    expect(JSON.stringify(context)).not.toContain("do not expose this prompt");
+    expect(guarded.registry.getAll()).toHaveLength(1);
+    await guarded.dispose();
+  });
+
   it("enforces token budget limits and triggers escalation on breach (SEC-SUB-04)", async () => {
     const events: string[] = [];
     supervisor.subscribe((e) => events.push(e.type));

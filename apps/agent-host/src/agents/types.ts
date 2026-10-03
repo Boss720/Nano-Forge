@@ -10,6 +10,8 @@ import type {
   SubagentMessage,
   SubagentLifecycleEvent,
   SubagentTelemetry,
+  SubagentModelTier,
+  SubagentRoutingDecision,
 } from "@protocol/subagents";
 
 export interface SubagentNode {
@@ -20,6 +22,8 @@ export interface SubagentNode {
   roles: string[];
   systemPrompt?: string;
   model?: string;
+  modelTier?: SubagentModelTier;
+  routingDecision?: SubagentRoutingDecision;
   workingDirectory: string;
   metadataDir: string;
   worktreePath?: string;
@@ -41,6 +45,7 @@ export interface SubagentNode {
   handoffArtifact?: string;
   abortController: AbortController;
   skills: string[];
+  fileOwnership?: string[];
   environmentVariables?: Record<string, string>;
 }
 

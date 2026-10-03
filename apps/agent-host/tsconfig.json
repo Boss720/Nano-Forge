@@ -13,12 +13,15 @@
       "@protocol": ["../../packages/protocol/src/index.ts"],
       "@nanoforge/protocol/*": ["../../packages/protocol/src/*"],
       "@nanoforge/protocol": ["../../packages/protocol/src/index.ts"],
+      "@nanoforge/llm-router/*": ["../../packages/llm-router/src/*"],
+      "@nanoforge/llm-router": ["../../packages/llm-router/src/index.ts"],
       "@nanoforge/core/*": ["../../packages/core/src/*"],
       "@nanoforge/core": ["../../packages/core/src/index.ts"]
     }
   },
   "references": [
-    { "path": "../../packages/protocol" }
+    { "path": "../../packages/protocol" },
+    { "path": "../../packages/llm-router" }
   ],
   "include": ["src/**/*", "test/**/*"]
 }

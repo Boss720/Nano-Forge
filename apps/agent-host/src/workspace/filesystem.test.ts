@@ -101,6 +101,49 @@ describe('workspace filesystem', () => {
   });
 
   describe('handleWriteFile', () => {
+    it('denies capability-enabled writes without authorization', async () => {
+      await expect(handleWriteFile(tmpDir, 'README.md', '# Unauthorized', {
+        authorizationRequired: true,
+      })).rejects.toMatchObject({ code: 'write_not_approved' });
+      expect(await fs.readFile(path.join(tmpDir, 'README.md'), 'utf8')).toBe('# Hello');
+    });
+
+    it('rejects a denied authorizer without mutating the target', async () => {
+      const authorize = vi.fn(() => false);
+      await expect(handleWriteFile(tmpDir, 'README.md', '# Denied', {
+        authorizationRequired: true,
+        authorize,
+      })).rejects.toMatchObject({ code: 'write_not_approved' });
+      expect(authorize).toHaveBeenCalledWith({
+        operation: 'workspace.write',
+        workspaceRelativePath: 'README.md',
+        contentSha256: createHash('sha256').update('# Denied').digest('hex'),
+        contentSize: Buffer.byteLength('# Denied'),
+        expectedSha256: undefined,
+        expectedModified: undefined,
+      });
+      expect(await fs.readFile(path.join(tmpDir, 'README.md'), 'utf8')).toBe('# Hello');
+    });
+
+    it('passes non-secret write metadata to a granted authorizer and preserves conflict safety', async () => {
+      const previous = createHash('sha256').update('# Hello').digest('hex');
+      const authorize = vi.fn(({ workspaceRelativePath, contentSha256, contentSize, expectedSha256, expectedModified }) => {
+        expect(workspaceRelativePath).toBe('README.md');
+        expect(contentSha256).toBe(createHash('sha256').update('# Authorized').digest('hex'));
+        expect(contentSize).toBe(Buffer.byteLength('# Authorized'));
+        expect(expectedSha256).toBe(previous);
+        expect(expectedModified).toBeUndefined();
+        return true;
+      });
+      const result = await handleWriteFile(tmpDir, 'README.md', '# Authorized', {
+        authorizationRequired: true,
+        authorize,
+        expectedSha256: previous,
+      });
+      expect(result.success).toBe(true);
+      expect(await fs.readFile(path.join(tmpDir, 'README.md'), 'utf8')).toBe('# Authorized');
+    });
+
     it('creates parent directories and writes file', async () => {
       const result = await handleWriteFile(tmpDir, 'nested/dir/new.js', 'const x = 1;');
       expect(result.success).toBe(true);
