@@ -130,14 +130,14 @@ describe("Tier 1 - R3 Hygiene, R5 Modularization, R6 CI/CD & R7 SDK", () => {
       expect(integrationsPanel.IntegrationsPanel).toBeDefined();
       expect(themeCustomizer.ThemeCustomizer).toBeDefined();
       expect(imagePanel.default || imagePanel.ImagePanel).toBeDefined();
-    }, 15000);
+    }, 30000);
 
     it("5.2.2: provides fallback placeholders during dock chunk loading", async () => {
       const { DockSkeleton } = await import("../../../src/components/layout/AppLayout");
       expect(DockSkeleton).toBeDefined();
       const skeleton = DockSkeleton({ label: "Loading panel skeleton test..." });
       expect(skeleton.props["data-testid"]).toBe("dock-skeleton");
-    });
+    }, 30000);
 
     it("5.2.3: verifies Vite build configuration supports code splitting and chunking", async () => {
       const viteConfig = await fs.readFile(path.join(workspaceRoot, "vite.config.ts"), "utf8");

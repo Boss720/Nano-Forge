@@ -183,6 +183,23 @@ describe("Tier 1 - R2 Reliability, Lifecycle & R4 Telemetry", () => {
   /* F2.3: Async Daemon Handling & Uncaught Protection (R2 §23)             */
   /* ====================================================================== */
   describe("F2.3: Async Daemon Handling", () => {
+    async function waitForTaskCompletion(
+      supervisor: DaemonSupervisor,
+      taskId: string,
+      timeoutMs = 2000,
+      intervalMs = 50
+    ) {
+      const start = Date.now();
+      while (Date.now() - start < timeoutMs) {
+        const task = supervisor.getTask(taskId);
+        if (task && ["completed", "failed"].includes(task.status)) {
+          return task;
+        }
+        await new Promise((r) => setTimeout(r, intervalMs));
+      }
+      return supervisor.getTask(taskId);
+    }
+
     it("2.3.1: captures unexpected child process exits without unhandled promise rejections", async () => {
       const supervisor = new DaemonSupervisor();
       const task = await supervisor.spawnTask({
@@ -191,9 +208,8 @@ describe("Tier 1 - R2 Reliability, Lifecycle & R4 Telemetry", () => {
         cwd: process.cwd(),
       });
 
-      // Wait for process exit
-      await new Promise((r) => setTimeout(r, 400));
-      const updated = supervisor.getTask(task.taskId);
+      // Adaptive polling loop waiting up to 2000ms (checking every 50ms)
+      const updated = await waitForTaskCompletion(supervisor, task.taskId);
       expect(["completed", "failed"]).toContain(updated?.status);
       expect(updated?.exitCode).toBe(42);
       await supervisor.killAll();
@@ -207,8 +223,7 @@ describe("Tier 1 - R2 Reliability, Lifecycle & R4 Telemetry", () => {
         cwd: process.cwd(),
       });
 
-      await new Promise((r) => setTimeout(r, 400));
-      const updated = supervisor.getTask(task.taskId);
+      const updated = await waitForTaskCompletion(supervisor, task.taskId);
       expect(["completed", "failed"]).toContain(updated?.status);
       expect(updated?.exitCode).toBe(1);
       expect(updated?.recentLogs).toContain("Fatal crash log");
@@ -223,8 +238,7 @@ describe("Tier 1 - R2 Reliability, Lifecycle & R4 Telemetry", () => {
         cwd: process.cwd(),
       });
 
-      await new Promise((r) => setTimeout(r, 400));
-      const updated = supervisor.getTask(task.taskId);
+      const updated = await waitForTaskCompletion(supervisor, task.taskId);
       expect(["completed", "failed"]).toContain(updated?.status);
       expect(updated?.recentLogs).toContain("Process bootstrap exception");
       await supervisor.killAll();
@@ -238,7 +252,7 @@ describe("Tier 1 - R2 Reliability, Lifecycle & R4 Telemetry", () => {
         cwd: process.cwd(),
       });
 
-      await new Promise((r) => setTimeout(r, 400));
+      await waitForTaskCompletion(supervisor, task.taskId);
       // Attempting to send input to an already terminated process
       const res = await supervisor.sendInput(task.taskId, "late input\n");
       expect(res.success).toBe(false);
@@ -250,13 +264,13 @@ describe("Tier 1 - R2 Reliability, Lifecycle & R4 Telemetry", () => {
       const events: any[] = [];
       supervisor.subscribe((ev) => events.push(ev));
 
-      await supervisor.spawnTask({
+      const task = await supervisor.spawnTask({
         command: "node",
         args: ["-e", "process.exit(7)"],
         cwd: process.cwd(),
       });
 
-      await new Promise((r) => setTimeout(r, 400));
+      await waitForTaskCompletion(supervisor, task.taskId);
       const completionEv = events.find((e) => e.type === "task.completed");
       expect(completionEv).toBeDefined();
       expect(completionEv.exitCode).toBe(7);
@@ -455,7 +469,15 @@ describe("Tier 1 - R2 Reliability, Lifecycle & R4 Telemetry", () => {
         cwd: process.cwd(),
       });
 
-      await new Promise((r) => setTimeout(r, 400));
+      // Wait for daemon output adaptively
+      const start = Date.now();
+      while (Date.now() - start < 2000) {
+        const cur = supervisor.getTask(task.taskId);
+        if (cur && (["completed", "failed"].includes(cur.status) || (cur.recentLogs?.length ?? 0) >= 4000)) {
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 50));
+      }
       const updated = supervisor.getTask(task.taskId);
       expect(updated?.recentLogs?.length).toBeGreaterThan(4000);
       // Ring buffer limit is 2 * 1024 * 1024 (2MB)
