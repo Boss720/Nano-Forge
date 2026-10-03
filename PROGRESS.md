@@ -1,5 +1,88 @@
 # NanoForge Hardening & Production Readiness Progress Tracking (Phases 0–7)
 
+## Active Initiative: P0.1 Host Capability Broker
+
+**Status:** IN PROGRESS — Wave 0 baseline and broker seam
+**Plan:** `docs/plans/2026-08-27-nanogpt-ecosystem-alignment-plan.md` (P0.1 / section 4.4)
+**Objective:** Establish one fail-closed, auditable authorization seam for host-privileged actions. This wave deliberately begins with the broker contract, grant binding, and the direct PTY bypass; browser, MCP, workspace-write, and daemon routes follow after the seam is integrated.
+
+| Lane | Owner | Exclusive files | Intended proof |
+| :--- | :--- | :--- | :--- |
+| A — Broker core | capability worker | `apps/agent-host/src/capabilities/**` | Broker unit/adversarial tests and host typecheck |
+| B — Protocol grant contract | protocol worker | `apps/agent-host/src/protocol.ts`, `apps/agent-host/src/protocol.capabilities.test.ts` | Schema tests and host typecheck |
+| C — PTY bypass closure | terminal worker | `apps/agent-host/src/session.ts`, `apps/agent-host/src/session.terminal-capability.test.ts` | Crafted `terminal.create` denied without a broker-backed user grant |
+| D — Integration and verification | root | `PROGRESS.md`, integration-only follow-up files | Combined diff review, full host/root gates |
+
+**Wave 0 acceptance:** A grant is bound to host/session/workspace generation/run-step/normalized argument digest and expiry; direct terminal creation fails closed; broker decisions are audit-ready. Re-enabling a user-owned interactive terminal requires a separately designed, visible broker-mediated grant and is not implemented in this wave. Existing uncommitted workspace/QoL work is user-owned and out of scope.
+
+**Baseline note:** The checkout is on `gem` with pre-existing uncommitted workspace/QoL changes. P0.1 work will be isolated to the allowlists above and no existing changes will be discarded.
+
+**Wave 0 result (2026-08-27):**
+
+- Added a fail-closed `CapabilityBroker` with opaque random tokens retained only as SHA-256 hashes, strict binding checks, expiry, revoke, and single/multi-use enforcement. Its injected audit records include binding metadata and a token hash, never the raw grant token.
+- Added strict protocol schemas for capability approval requests, decisions, grants, and results. The wire contract contains opaque bindings and an arguments digest, not a canonical path, secret, executable, or raw argument payload.
+- Closed the direct WebSocket PTY creation bypass: `terminal.create` now returns `terminal_interactive_denied` without allocating a PTY. Structured `RunCoordinator` execution is unchanged.
+- Independent focused proof: `pnpm typecheck:host` passed; direct Vitest invocation passed **3 files / 11 tests**. Full `pnpm lint` and `pnpm typecheck` passed (**6/6 Turbo tasks**, host task cache miss). Scoped `git diff --check` passed.
+- A package-script host-suite invocation incorrectly forwarded focused file arguments and ran the entire host suite, which reported **52 files / 764 tests passed** but emitted an unrelated worker-exit warning. It is not counted as a clean whole-suite gate; the direct focused invocation is the accepted proof for this incremental wave.
+- Next ownership: wire the broker into workspace write, browser, MCP, daemon/scheduler, subagent mutation, and the future visible interactive-terminal grant flow; add end-to-end adversarial frame tests per privileged kind.
+
+**Wave 1 — brokerable privileged-operation seams (IN PROGRESS):**
+
+| Lane | Owner | Exclusive files | Intended proof |
+| :--- | :--- | :--- | :--- |
+| A — Reviewed workspace writes | workspace worker | `apps/agent-host/src/workspace/filesystem.ts`, `apps/agent-host/src/workspace/filesystem.test.ts` | Mutating writes require an injected broker-compatible authorization seam |
+| B — Daemon and schedule mutation | daemon worker | `apps/agent-host/src/daemons/manager.ts`, `apps/agent-host/src/daemons/manager.test.ts` | Task/schedule create and control actions accept only an injected authorization seam |
+| C — Subagent mutation | subagent worker | `apps/agent-host/src/agents/supervisor.ts`, `apps/agent-host/src/agents/supervisor.test.ts` | Agent-spawn and mutation paths receive a broker-compatible authorization seam |
+| D — Host integration | root | `apps/agent-host/src/session.ts`, `apps/agent-host/src/session.capability-integration.test.ts`, `PROGRESS.md` | Adversarial WebSocket frames fail closed without a matching grant |
+
+**Wave 1 acceptance:** Privileged mutation seams deny when no session-supplied authorization callback grants the exact operation. Root will bind the callbacks to `CapabilityBroker` and verify frame-level failures after the lanes return. Browser/MCP have no currently composed session entrypoint and remain explicitly unavailable until a governed route is introduced.
+
+**Wave 1 result (2026-08-27):**
+
+- Reviewed writes can require an authorizer that receives only a normalized relative path, content digest/size, and expected-version metadata. Denial occurs before filesystem mutation.
+- Daemon/schedule and subagent mutation seams now support fail-closed authorization with redacted operation metadata; list/status/inspect remain read-only.
+- Corrected the client capability approval contract: the client may approve or deny a request but cannot submit a grant or binding. The host remains the grant issuer.
+- Independent focused proof: direct Vitest invocation passed **6 files / 51 tests**; `pnpm typecheck:host` passed; scoped `git diff --check` passed.
+
+**Wave 2 — session-owned approval and consumption (IN PROGRESS):**
+
+| Lane | Owner | Exclusive files | Intended proof |
+| :--- | :--- | :--- | :--- |
+| A — WebSocket capability handshake | session worker | `apps/agent-host/src/session.ts`, `apps/agent-host/src/session.capability-integration.test.ts` | Direct mutation frames are deferred until host-issued, binding-matched capability approval is consumed |
+| B — Integration and verification | root | `PROGRESS.md` and integration-only follow-ups | Combined diff review, focused adversarial suite, host/root gates |
+
+**Wave 2 acceptance:** A direct workspace-write, subagent-mutation, daemon-control, or schedule frame must receive a host approval request and cannot produce a side effect until the matching client decision is processed by the host-owned broker. The grant token stays host-local; expiry/replay/mismatched binding fail closed and record an audit-ready broker decision.
+
+**Wave 2 result (2026-08-27):**
+
+- Added a per-session host-owned capability broker, opaque session binding, bounded decision sink, and deferred-operation registry. Grant tokens never cross the protocol; browser decisions contain only a request ID and boolean.
+- Direct workspace writes, subagent mutation, daemon task mutation, schedule creation, memory mutation, and direct interactive PTY requests no longer execute from a raw browser frame. Read-only subagent/task operations remain immediate.
+- The host sends redacted `capability.approval_required` metadata, consumes the exact single-use server-held token on a matching decision, and rejects unknown, denied, revoked, expired, or replayed requests without side effects.
+- Independent focused proof: **7 files / 54 tests** passed; `pnpm typecheck:host` passed; scoped `git diff --check` passed. Whole-workspace `pnpm lint` and `pnpm typecheck` passed (**6/6 Turbo tasks**, host task cache miss).
+- Limitation: direct-session capability decision records are bounded in host memory because the existing audit store is run-scoped. Durable, redacted non-run authorization audit records remain required before P0.1 can be called complete. Browser/MCP remain unavailable rather than brokered; structured `RunCoordinator` terminal execution is still on its legacy approval gate and needs the same broker binding.
+- Next ownership: persist broker decisions in the audit ledger; bind RunCoordinator tool approval to the broker; add governed browser/MCP session routes only with an allowlisted capability contract; run a clean full suite without the known host-worker warning.
+
+**Wave 3 — durable audit and run-tool broker adapter (IN PROGRESS):**
+
+| Lane | Owner | Exclusive files | Intended proof |
+| :--- | :--- | :--- | :--- |
+| A — Capability audit ledger | audit worker | `apps/agent-host/src/audit/store.ts`, `apps/agent-host/src/audit/store.test.ts` | Append-only, redacted, non-run capability decisions persist without canonical paths or raw tokens |
+| B — Run approval adapter | capability worker | `apps/agent-host/src/capabilities/runApprovalGate.ts`, `apps/agent-host/src/capabilities/runApprovalGate.test.ts` | Run/step/tool approval is broker-issued, exact-binding, single-use, and presenter-safe |
+| C — Session composition | root | `apps/agent-host/src/session.ts`, `apps/agent-host/src/session.capability-integration.test.ts`, `PROGRESS.md` | Host composes durable audit and broker-backed RunCoordinator approval gates |
+
+**Wave 3 acceptance:** Capability decisions append to a redacted durable ledger. Structured `RunCoordinator` terminal approvals bind to the same broker model as direct session mutations; an approval answer cannot authorize a different run, step, tool, or arguments digest.
+
+**Wave 3 result (2026-08-27):**
+
+- Added an append-only SQLite `capability_decisions` ledger. It persists opaque IDs, safe bindings, digests, decision/reason, and remaining-use counts, rejects raw request material, and redacts known secret values before storage.
+- Added `BrokerApprovalGate`, which implements the existing RunCoordinator approval interface using a host-local, single-use grant bound to host/session/workspace/generation/run/step/tool/request digest.
+- Replaced the session’s legacy structured-run approval composition. Structured tool requests now emit only `capability.approval_required` metadata; exact capability decisions consume the gate. Legacy approval frames cannot prefix-match or authorize a direct deferred operation.
+- The broker audit sink now persists allow/deny/revoke decisions to the capability ledger. It maps only safe host/session/workspace/run/step/tool/argument-digest values and never stores the token or raw tool request.
+- Independent focused proof: **4 files / 23 tests** passed, including a local streamed tool-call fixture that remained blocked until a matching capability decision and then verified its durable audit row. `pnpm typecheck:host` and scoped `git diff --check` passed.
+- P0.1 remains in progress: existing browser/MCP modules have no governed session entrypoint and remain unavailable; full clean host/root suite evidence is still required before completion.
+
+---
+
 ## Active Initiative: Seamless Local Directory Operation
 
 **Status:** IN PROGRESS — Wave 1 control-plane foundation
@@ -273,3 +356,29 @@ Prior implementation waves (Wave 1 Workspace/Chat migration, Swarm slash command
 - Added the packaged launcher UI origins (`http://localhost:4183` and `http://127.0.0.1:4183`) to the agent-host WebSocket allowlist.
 - Rebuilt and restarted the launcher with a fresh token after the prior token was consumed.
 - Live browser verification: selecting the first `skills` entry under Recent folders changed the runtime indicator to `Runtime ready`; no 4401 unauthorized-origin error remained.
+## 2026-08-26 — QoL and user-friendly product plan
+
+- Added `docs/plans/2026-08-26-qol-and-user-friendly-app-plan.md`, a seven-module delivery plan for onboarding, recovery, folders, agent clarity, explorer productivity, accessibility, and trustworthy product communication.
+- The plan orders runtime recovery before UI polish and ends with packaged Windows user-journey proof.
+
+## 2026-08-27 — NanoGPT ecosystem alignment audit
+
+- Objective: produce an evidence-based, implementation-ready NanoGPT alignment plan covering the model catalog, run/cost tracking, workspace tools, slash commands, artifact review, browser/scheduling controls, memory, agent controls, privacy/security, and partner presentation.
+- Branch/repository: `gem` at `C:\Users\Hp\Documents\kimi\Workspaces\kpkoj\nano-forge`.
+- Scope: read-only product-code audit; preserve the existing dirty worktree. Coordinator-owned outputs are this progress entry and `docs/plans/2026-08-27-nanogpt-ecosystem-alignment-plan.md`.
+- Wave 1 lanes: code/feature inventory; trust-boundary and architecture audit; NanoGPT mission/product/privacy/ecosystem research and collaboration analysis.
+- Wave 1 completed with three read-only lanes: feature/runtime truth; trust boundary/architecture; NanoGPT primary-source product/privacy/ecosystem research. No worker edited repository files.
+- Coordinator reconciliation confirmed the primary product gaps: unaudited direct PTY capability; host/browser NanoGPT split; unauthoritative local cost estimates; browser-visible workspace paths; incomplete non-swarm slash actions; uncomposed browser/MCP; volatile non-executing schedules; volatile memory; state-only/simulated agent execution.
+- Fresh gates: `pnpm lint` passed; `pnpm typecheck` passed 6/6 Turbo tasks; `pnpm test -- --run` passed 84 files / 761 tests; `pnpm test:e2e` passed 13 files / 233 tests; `pnpm build` passed with large-chunk warnings (892.45 kB main, 403.16 kB cost dashboard).
+- Live production-preview proof at `http://127.0.0.1:4173`: model catalog, workspaces/chats/files, run trace, Apply/Reject diff, cost dashboard, and Swarm Control Plane were mounted. Runtime truth was `API demo`, `Host offline`, offline catalog, approximate local cost, and zero live agents; no live NanoGPT-host-workspace vertical slice was claimed.
+- Deliverable: `docs/plans/2026-08-27-nanogpt-ecosystem-alignment-plan.md` with required audit/gaps/priorities/specifications/collaboration sections, detailed demo script, technical-overview outline, sources, timelines, acceptance gates, and explicit placeholders.
+- Status: COMPLETED for analysis and planning. Implementation, live credentialed NanoGPT proof, clean-machine packaging/signing, and NanoGPT contract/branding decisions remain future work.
+
+## 2026-08-28 — M0 Harness & Contract Freeze
+
+- M0 commit: `931cd10 test(m0): freeze browser and host contracts`.
+- Added the root agent guide, derived project overview, frozen M0 spec/template/model-routing record, and usage log. The recorded exact routing slugs are `openai/gpt-5.4-nano`, `openai/gpt-5.4-mini`, `qwen/qwen3-coder-next`, and `openai/gpt-5.6-sol`.
+- Added credential-free contracts for the browser `/models` catalog and 401/403/402/network paths, direct chat SSE behaviour, safe base-URL-only connection persistence, and host one-use-token/malformed-frame/schema-envelope rejection.
+- Independent review approved the amended M0 commit. Focused gate: `pnpm run test:m0` passed in the isolated worktree (3 files, 29 tests).
+- Fresh clean-worktree gate evidence is now complete: `pnpm lint`, `pnpm typecheck`, `pnpm test:all`, `pnpm test:e2e`, and `pnpm build` all exited 0. The suites reported 759 host, 388 protocol, 95 core, 13 SDK, and 182 E2E tests passing. Build warnings are limited to existing chunk-size/code-splitting advisories. M0 is complete; main-checkout dependency linking remains an environment issue, not a reason to rerun or alter the committed M0 change.
+- M1 explorer pass completed and its frozen spec is staged in isolated worktree `C:\Users\Hp\Desktop\nano-forge-m1-shell`. Two economical worker attempts were blocked by the Codex usage limit before edits; no M1 implementation changes were made. Resume with the existing `codex/m1-shell` lane when worker capacity is available.

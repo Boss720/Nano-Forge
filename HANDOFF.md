@@ -75,3 +75,11 @@ npm test
 # 4. Execute production typechecking and bundle build
 npm run build
 ```
+
+## M0 Harness & Contract Freeze — 2026-08-28
+
+- Merged commit: `931cd10 test(m0): freeze browser and host contracts`.
+- The new `pnpm run test:m0` is credential-free and covers NanoGPT `/models` and SSE contracts, safe connection persistence, and host WebSocket one-use-token plus malformed/schema-invalid envelope rejection.
+- Reviewer verdict: **APPROVE** after the 403-status and narrow-test-slice fixes; evidence was 3 files / 29 tests passed and a clean diff check in the isolated worktree.
+- Fresh clean-worktree validation is complete: `pnpm lint`, `pnpm typecheck`, `pnpm test:all`, `pnpm test:e2e`, and `pnpm build` all exited 0. Move to M1 only through its own explorer/spec/worker/reviewer cycle; preserve the dirty main checkout and the loopback/browser-key constraints.
+- M1 exploration and spec freeze are complete in `C:\Users\Hp\Desktop\nano-forge-m1-shell`; worker dispatch is currently blocked by the Codex usage limit, with no implementation changes made.
