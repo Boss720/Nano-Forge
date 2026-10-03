@@ -25,7 +25,10 @@ const ROOT_DIR = path.resolve(__dirname, '..');
 const RELEASE_DIR = path.join(ROOT_DIR, 'release');
 const SCRIPTS_DIR = path.join(ROOT_DIR, 'scripts');
 
+import esbuild from 'esbuild';
+
 const LAUNCHER_SRC = path.join(SCRIPTS_DIR, 'nanoforge-launcher.cjs');
+const LAUNCHER_BUNDLE = path.join(RELEASE_DIR, 'nanoforge-launcher.bundled.cjs');
 const SEA_CONFIG = path.join(RELEASE_DIR, 'sea-config.json');
 const SEA_BLOB = path.join(RELEASE_DIR, 'nanoforge.blob');
 const OUTPUT_EXE = path.join(RELEASE_DIR, 'NanoForge.exe');
@@ -61,10 +64,23 @@ async function buildExe() {
   }
   log(`Launcher source: ${LAUNCHER_SRC} (${(fs.statSync(LAUNCHER_SRC).size / 1024).toFixed(1)} KB)`);
 
+  // Step 0: Bundle launcher and sidecar dependencies into a single CJS bundle
+  log('Step 0: Bundling launcher and dependencies with esbuild...');
+  await esbuild.build({
+    entryPoints: [LAUNCHER_SRC],
+    outfile: LAUNCHER_BUNDLE,
+    bundle: true,
+    platform: 'node',
+    target: 'node20',
+    format: 'cjs',
+    minify: false,
+  });
+  log(`Bundled launcher: ${LAUNCHER_BUNDLE} (${(fs.statSync(LAUNCHER_BUNDLE).size / 1024).toFixed(1)} KB)`);
+
   // Step 1: Generate SEA config
   log('Step 1: Generating SEA configuration...');
   const seaConfig = {
-    main: LAUNCHER_SRC,
+    main: LAUNCHER_BUNDLE,
     output: SEA_BLOB,
     disableExperimentalSEAWarning: true,
     useSnapshot: false,
@@ -132,9 +148,10 @@ async function buildExe() {
 
   // Cleanup temp files
   try {
-    fs.unlinkSync(SEA_CONFIG);
-    fs.unlinkSync(SEA_BLOB);
-    log('Cleaned up temp files (sea-config.json, nanoforge.blob)');
+    if (fs.existsSync(SEA_CONFIG)) fs.unlinkSync(SEA_CONFIG);
+    if (fs.existsSync(SEA_BLOB)) fs.unlinkSync(SEA_BLOB);
+    if (fs.existsSync(LAUNCHER_BUNDLE)) fs.unlinkSync(LAUNCHER_BUNDLE);
+    log('Cleaned up temp files (sea-config.json, nanoforge.blob, nanoforge-launcher.bundled.cjs)');
   } catch { /* ignore */ }
 
   return { success: true, path: OUTPUT_EXE, size: finalSize };
