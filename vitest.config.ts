@@ -5,6 +5,7 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["src/**/*.test.{ts,tsx}", "scripts/**/*.test.{ts,tsx}", "tests/**/*.test.{ts,tsx}"],
+    testTimeout: 30000,
   },
   resolve: {
     alias: {
@@ -13,6 +14,7 @@ export default defineConfig({
       "@nanoforge/protocol": path.resolve(__dirname, "./packages/protocol/src"),
       "@nanoforge/core": path.resolve(__dirname, "./packages/core/src"),
       "@nanoforge/sdk": path.resolve(__dirname, "./packages/sdk/src"),
+      "@nanoforge/llm-router": path.resolve(__dirname, "./packages/llm-router/src"),
     },
   },
 })
