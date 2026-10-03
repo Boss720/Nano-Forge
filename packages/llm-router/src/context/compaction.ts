@@ -231,7 +231,7 @@ export class ContextCompactor {
    */
   compact(input: RawContextInput, budget: SlidingTokenBudget): CompactedContextResult {
     let compactionOccurred = false;
-    let initialTokens = 0;
+    const initialTokens = 0;
     const sectionsIncluded: string[] = [];
     const blocks: string[] = [];
 
